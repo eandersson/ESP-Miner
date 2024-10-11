@@ -36,7 +36,7 @@ jobs:
         with:
           esp_idf_version: v5.3.1
           target: esp32s3
-          command: nvs_partition_gen.py generate config-${{ matrix.build_type }}.cvs config.bin 0x6000
+          command: /opt/esp/idf/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate config-${{ matrix.build_type }}.cvs config.bin 0x6000
           path: '.'
       - uses: actions/setup-python@v4
         with:
@@ -45,8 +45,8 @@ jobs:
       - run: pip install esptool
       - name: "Create factory/merged image"
         run: "./merge_bin.sh ./esp-miner-merged.bin"
-      - name: upload esp-miner-factory-${{ matrix.build_type }}-${{GITHUB_REF/refs\/tags\//}}.bin
+      - name: upload esp-miner-factory-${{ matrix.build_type }}.bin
         uses: actions/upload-artifact@v3
         with:
-          name: esp-miner-factory.bin
+          name: esp-miner-factory-${{ matrix.build_type }}.bin
           path: ./esp-miner-merged.bin
