@@ -1,4 +1,4 @@
-name: build-target
+name: Build & Release Firmware
 on:
   push:
     tags:

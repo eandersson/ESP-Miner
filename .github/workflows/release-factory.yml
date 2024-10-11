@@ -1,4 +1,4 @@
-name: build-target
+name: Build & Release Factory Images
 on:
   push:
 
@@ -45,7 +45,7 @@ jobs:
       - run: pip install esptool
       - name: "Create factory/merged image"
         run: "./merge_bin.sh ./esp-miner-merged.bin"
-      - name: upload esp-miner-factory-${{ matrix.build_type }}-:{{GITHUB_REF/refs\/tags\//}}.bin
+      - name: upload esp-miner-factory-${{ matrix.build_type }}-${{GITHUB_REF/refs\/tags\//}}.bin
         uses: actions/upload-artifact@v3
         with:
           name: esp-miner-factory.bin

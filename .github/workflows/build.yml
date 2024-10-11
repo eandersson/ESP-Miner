@@ -1,4 +1,4 @@
-name: build-target
+name: Build Firmware
 on: [push, pull_request]
 jobs:
   build:
