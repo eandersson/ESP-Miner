@@ -46,7 +46,13 @@ jobs:
       with:
         name: www.bin
         path: ./build/www.bin
-    - name: Release
+    - name: Release www.bin
       uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: www.bin
+        files: ./build/www.bin
+    - name: Release esp-miner.bin
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: ./build/esp-miner.bin
