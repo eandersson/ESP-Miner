@@ -44,9 +44,9 @@ jobs:
           cache: 'pip'
       - run: pip install esptool
       - name: "Create factory/merged image"
-        run: "./merge_bin.sh ./esp-miner-merged.bin"
-      - name: upload esp-miner-factory-${{ matrix.build_type }}.bin
-        uses: actions/upload-artifact@v3
+        run: "./merge_bin.sh -c config.bin ./esp-miner-factory-${{ matrix.build_type }}.bin"
+      - name: Release esp-miner.bin
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: esp-miner-factory-${{ matrix.build_type }}.bin
-          path: ./esp-miner-merged.bin
+          files: "./build/esp-miner-factory-${{ matrix.build_type }}.bin"
