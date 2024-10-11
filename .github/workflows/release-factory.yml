@@ -1,0 +1,52 @@
+name: build-target
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: "Factory ${{ matrix.build_type }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: ["202", "204"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+      - name: Build web dist
+        working-directory: ./main/http_server/axe-os
+        run: |
+          npm ci
+          npm run build
+      - name: esp-idf build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32s3
+          command: GITHUB_ACTIONS="true" idf.py build
+          path: '.'
+      - name: esp-idf build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32s3
+          command: GITHUB_ACTIONS="true" nvs_partition_gen.py generate config-${{ matrix.build_type }}.cvs config.bin 0x6000
+          path: '.'
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - run: pip install esptool
+      - name: "Create factory/merged image"
+        run: "./merge_bin.sh ./esp-miner-merged.bin"
+      - name: upload esp-miner-factory-${{ matrix.build_type }}-:${GITHUB_REF/refs\/tags\//}.bin
+        uses: actions/upload-artifact@v3
+        with:
+          name: esp-miner-factory.bin
+          path: ./esp-miner-merged.bin
