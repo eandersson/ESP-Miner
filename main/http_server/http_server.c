@@ -198,7 +198,7 @@ static esp_err_t PATCH_update_swarm(httpd_req_t * req)
     // Set CORS headers
     if (set_cors_headers(req) != ESP_OK) {
         httpd_resp_send_500(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     int total_len = req->content_len;
@@ -231,7 +231,7 @@ static esp_err_t handle_options_request(httpd_req_t * req)
     // Set CORS headers for OPTIONS request
     if (set_cors_headers(req) != ESP_OK) {
         httpd_resp_send_500(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     // Send a blank response for OPTIONS request
@@ -245,7 +245,7 @@ static esp_err_t PATCH_update_settings(httpd_req_t * req)
     // Set CORS headers
     if (set_cors_headers(req) != ESP_OK) {
         httpd_resp_send_500(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     int total_len = req->content_len;
@@ -358,7 +358,7 @@ static esp_err_t GET_swarm(httpd_req_t * req)
     // Set CORS headers
     if (set_cors_headers(req) != ESP_OK) {
         httpd_resp_send_500(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char * swarm_config = nvs_config_get_string(NVS_CONFIG_SWARM, "[]");
@@ -375,7 +375,7 @@ static esp_err_t GET_system_info(httpd_req_t * req)
     // Set CORS headers
     if (set_cors_headers(req) != ESP_OK) {
         httpd_resp_send_500(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
 
