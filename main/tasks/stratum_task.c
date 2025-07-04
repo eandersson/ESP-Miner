@@ -308,10 +308,14 @@ void stratum_task(void * pvParameters)
                 break;
             }
 
-            double response_time_ms = STRATUM_V1_get_response_time_ms(stratum_api_v1_message.message_id);
-            if (response_time_ms >= 0) {
-                ESP_LOGI(TAG, "Stratum response time: %.2f ms", response_time_ms);
-                GLOBAL_STATE->SYSTEM_MODULE.response_time = response_time_ms;
+            int64_t request_id = stratum_api_v1_message.message_id;
+            if (request_id >= 0)
+            {
+                double response_time_ms = STRATUM_V1_get_response_time_ms(request_id);
+                ESP_LOGI(TAG, "Stratum response time: %.2f ms (ID: %" PRId64 ")", response_time_ms, request_id);
+                if (response_time_ms >= 0) {
+                    GLOBAL_STATE->SYSTEM_MODULE.response_time = response_time_ms;
+                }
             }
 
             STRATUM_V1_parse(&stratum_api_v1_message, line);
