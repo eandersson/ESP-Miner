@@ -134,37 +134,58 @@ static esp_err_t ip_in_private_range(uint32_t address) {
     return ESP_FAIL;
 }
 
-static uint32_t extract_origin_ip_addr(char *origin)
+static char* extract_origin(const char *origin)
 {
-    char ip_str[16];
+    const char *prefix = "http://";
+    const char *ip_start = strstr(origin, prefix);
+    if (!ip_start) {
+        return NULL;
+    }
+
+    ip_start += strlen(prefix);
+
+    const char *ip_end = strchr(ip_start, '/');
+    size_t ip_len = ip_end ? (size_t)(ip_end - ip_start) : strlen(ip_start);
+
+    char *ip_str = malloc(ip_len + 1);
+    if (!ip_str) {
+        return NULL;
+    }
+
+    strncpy(ip_str, ip_start, ip_len);
+    ip_str[ip_len] = '\0';
+
+    return ip_str;
+}
+
+static uint32_t extract_ip_addr(const char *ip_str)
+{
     uint32_t origin_ip_addr = 0;
 
-    // Find the start of the IP address in the Origin header
-    const char *prefix = "http://";
-    char *ip_start = strstr(origin, prefix);
-    if (ip_start) {
-        ip_start += strlen(prefix); // Move past "http://"
-
-        // Extract the IP address portion (up to the next '/')
-        char *ip_end = strchr(ip_start, '/');
-        size_t ip_len = ip_end ? (size_t)(ip_end - ip_start) : strlen(ip_start);
-        if (ip_len < sizeof(ip_str)) {
-            strncpy(ip_str, ip_start, ip_len);
-            ip_str[ip_len] = '\0'; // Null-terminate the string
-
-            // Convert the IP address string to uint32_t
-            origin_ip_addr = inet_addr(ip_str);
-            if (origin_ip_addr == INADDR_NONE) {
-                ESP_LOGW(CORS_TAG, "Invalid IP address: %s", ip_str);
-            } else {
-                ESP_LOGD(CORS_TAG, "Extracted IP address %lu", origin_ip_addr);
-            }
-        } else {
-            ESP_LOGW(CORS_TAG, "IP address string is too long: %s", ip_start);
-        }
+    // Convert the IP address string to uint32_t
+    origin_ip_addr = inet_addr(ip_str);
+    if (origin_ip_addr == INADDR_NONE) {
+        ESP_LOGW(CORS_TAG, "Invalid IP address: %s", ip_str);
+    } else {
+        ESP_LOGD(CORS_TAG, "Extracted IP address %lu", origin_ip_addr);
     }
 
     return origin_ip_addr;
+}
+
+esp_err_t is_valid_hostname(const char *origin)
+{
+    char *hostname = nvs_config_get_string(NVS_CONFIG_HOSTNAME, CONFIG_LWIP_LOCAL_HOSTNAME);
+    if (!hostname) {
+        return ESP_FAIL;
+    }
+
+    char mdns_fqdn[128];
+    snprintf(mdns_fqdn, sizeof(mdns_fqdn), "%s.local", hostname);
+
+    bool match = strcasecmp(hostname, origin) == 0 || strcasecmp(mdns_fqdn, origin) == 0;
+    free(hostname);
+    return match ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t is_network_allowed(httpd_req_t * req)
@@ -197,7 +218,16 @@ esp_err_t is_network_allowed(httpd_req_t * req)
     uint32_t origin_ip_addr;
     if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) == ESP_OK) {
         ESP_LOGD(CORS_TAG, "Origin header: %s", origin);
-        origin_ip_addr = extract_origin_ip_addr(origin);
+
+        const char *host = extract_origin(origin);
+        origin_ip_addr = extract_ip_addr(host);
+        if (origin_ip_addr == INADDR_NONE)
+        {
+            if (is_valid_hostname(host) == ESP_OK)
+            {
+                return ESP_OK;
+            }
+        }
     } else {
         ESP_LOGD(CORS_TAG, "No origin header found.");
         origin_ip_addr = request_ip_addr;

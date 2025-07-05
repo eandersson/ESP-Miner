@@ -9,6 +9,7 @@
 #include "lwip/err.h"
 #include "lwip/lwip_napt.h"
 #include "lwip/sys.h"
+#include "mdns.h"
 #include "nvs_flash.h"
 #include "esp_wifi_types_generic.h"
 
@@ -388,6 +389,9 @@ void wifi_init(void * pvParameters)
         } else {
             ESP_LOGI(TAG, "ESP_WIFI setting hostname to: %s", hostname);
         }
+
+        ESP_ERROR_CHECK( mdns_init() );
+        ESP_ERROR_CHECK( mdns_hostname_set(hostname) );
 
         free(hostname);
 
