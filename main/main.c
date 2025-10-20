@@ -21,10 +21,20 @@
 #include "device_config.h"
 #include "connect.h"
 #include "asic_reset.h"
+#include "esp_sntp.h"
 
 static GlobalState GLOBAL_STATE;
 
 static const char * TAG = "bitaxe";
+
+void init_sntp(void)
+{
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+
+    sntp_setservername(0, "time.erikslund.net");
+
+    sntp_init();
+}
 
 void app_main(void)
 {
@@ -65,6 +75,8 @@ void app_main(void)
 
     // init AP and connect to wifi
     wifi_init(&GLOBAL_STATE);
+
+    init_sntp();
 
     SYSTEM_init_peripherals(&GLOBAL_STATE);
 
