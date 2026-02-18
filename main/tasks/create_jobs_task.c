@@ -17,6 +17,36 @@ static const char *TAG = "create_jobs_task";
 
 static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification, uint64_t extranonce_2, uint32_t difficulty);
 
+static bool is_prime_uint64(uint64_t n)
+{
+    if (n < 2) return false;
+    if (n == 2 || n == 3) return true;
+    if (n % 2 == 0) return false;
+
+    for (uint64_t i = 3; i <= (uint64_t)sqrt((double)n); i += 2) {
+        if (n % i == 0)
+            return false;
+    }
+    return true;
+}
+
+static uint64_t next_prime_uint64(uint64_t current)
+{
+    if (current < 2)
+        return 2;
+
+    uint64_t candidate = current + 1;
+
+    if (candidate % 2 == 0)
+        candidate++;
+
+    while (!is_prime_uint64(candidate)) {
+        candidate += 2;
+    }
+
+    return candidate;
+}
+
 void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
@@ -31,12 +61,12 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t difficulty = GLOBAL_STATE->pool_difficulty;
     mining_notify *current_mining_notification = NULL;
-    uint64_t extranonce_2 = 0;
+    uint64_t extranonce_2 = 2;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready!");
-    
+
     while (1) {
         uint64_t start_time = esp_timer_get_time();
         mining_notify *new_mining_notification = (mining_notify *)queue_dequeue_timeout(&GLOBAL_STATE->stratum_queue, timeout_ms);
@@ -63,7 +93,7 @@ void create_jobs_task(void *pvParameters)
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
             }
 
-            extranonce_2 = 0;
+            extranonce_2 = 2;
 
             if (!current_mining_notification->clean_jobs) {
                 continue;
@@ -77,7 +107,7 @@ void create_jobs_task(void *pvParameters)
 
         // Generate and send job (either new work or incremented extranonce_2)
         generate_work(GLOBAL_STATE, current_mining_notification, extranonce_2, difficulty);
-        extranonce_2++;
+        extranonce_2 = next_prime_uint64(extranonce_2);
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
