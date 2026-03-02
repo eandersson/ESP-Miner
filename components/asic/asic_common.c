@@ -127,7 +127,7 @@ esp_err_t receive_work(uint8_t * buffer, int buffer_size)
     return ESP_OK;
 }
 
-void get_difficulty_mask(uint16_t difficulty, uint8_t *job_difficulty_mask)
+void get_difficulty_mask(uint32_t difficulty, uint8_t *job_difficulty_mask)
 {
     // The mask must be a power of 2 so there are no holes
     // Correct:   {0b00000000, 0b00000000, 0b11111111, 0b11111111}

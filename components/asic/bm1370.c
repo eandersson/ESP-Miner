@@ -158,7 +158,7 @@ void BM1370_send_hash_frequency(float target_freq)
     ESP_LOGI(TAG, "Setting Frequency to %g MHz (%g)", target_freq, frequency);
 }
 
-uint8_t BM1370_init(float frequency, uint16_t asic_count, uint16_t difficulty)
+uint8_t BM1370_init(float frequency, uint16_t asic_count, uint32_t difficulty)
 {
     // set version mask
     for (int i = 0; i < 3; i++) {
