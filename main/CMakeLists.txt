@@ -69,6 +69,7 @@ PRIV_REQUIRES
     "esp_timer"
     "esp_wifi"
     "cjson"
+    "mbedtls"
     "nvs_flash"
     "spiffs"
     "vfs"

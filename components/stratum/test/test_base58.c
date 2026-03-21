@@ -3,7 +3,7 @@
 #include "unity.h"
 #include "libbase58.h"
 #include "utils.h"
-#include "mbedtls/sha256.h"
+#include "mbedtls/private/sha256.h"
 
 // Wrapper for SHA256 to match libbase58's expected signature
 static bool my_sha256(void *digest, const void *data, size_t datasz) {

@@ -6,7 +6,7 @@ SRCS
     "coinbase_decoder.c"
     "segwit_addr.c"
     "base58.c"
-                    
+
 INCLUDE_DIRS
     "include"
 

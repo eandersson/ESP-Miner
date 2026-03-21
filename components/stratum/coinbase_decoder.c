@@ -6,7 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include "mbedtls/sha256.h"
+#include "mbedtls/private/sha256.h"
 
 #define BIP110_SIGNAL_BIT 4
 #define BIP110_SIGNAL_EXPIRY_BLOCK 965664

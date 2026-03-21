@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <math.h>
 
-#include "mbedtls/sha256.h"
+#include "mbedtls/private/sha256.h"
 
 #define HASH_CNT_LSB 0x100000000uLL // 2^32 hashes for difficulty 1
 
