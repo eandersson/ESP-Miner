@@ -68,7 +68,7 @@ PRIV_REQUIRES
     "esp_psram"
     "esp_timer"
     "esp_wifi"
-    "json"
+    "cjson"
     "nvs_flash"
     "spiffs"
     "vfs"
