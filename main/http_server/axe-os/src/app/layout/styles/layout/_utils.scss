@@ -1,10 +1,20 @@
 .card {
-    background: var(--color-bg-card);
-    border: 1px solid var(--card-border);
+    background:
+        linear-gradient(90deg, rgba(var(--lichen-rgb), 0.22), transparent 32%) top / 100% 1px no-repeat,
+        var(--surface-fill);
+    border: 1px solid var(--surface-border);
     padding: 1.5rem;
     margin-bottom: 1rem;
     box-shadow: var(--card-shadow);
-    border-radius: $borderRadius;
+    border-radius: var(--radius-card);
+    backdrop-filter: blur(var(--surface-blur));
+    transition:
+        border-color $transitionDuration,
+        box-shadow $transitionDuration;
+
+    &:hover {
+        border-color: rgba(var(--lichen-rgb), 0.28);
+    }
 
     &.chart {
         padding: 10px;
@@ -62,6 +72,6 @@
 
 .text-monospace {
     line-break: anywhere;
-    font-family: monospace;
+    font-family: var(--font-mono);
     font-size: medium;
 }

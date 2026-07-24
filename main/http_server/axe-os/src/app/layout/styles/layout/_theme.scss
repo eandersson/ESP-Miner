@@ -1,78 +1,112 @@
 :root, .theme-dark {
-    /* Theme color variables for Dark Theme (Default) */
-    --color-bg-content: #070D17;
-    --color-bg-card: #0B1219;
-    --color-border-content: #454d59;
-    --card-border: #1A2632;
-    --surface-border: #192730;
-    --color-text-main: rgba(255, 255, 255, 0.87);
-    --color-text-secondary: rgba(255, 255, 255, 0.6);
-    --color-mask-bg: rgba(0, 0, 0, 0.4);
-    --color-overlay-select-bg: #0B1219;
-    --color-overlay-select-border: #1A2632;
+    /* Erikslund "Nordic twilight" source tokens */
+    --lichen: #b8c9a5;
+    --lichen-deep: #8ea27e;
+    --turquoise: #0e7c7b;
+    --turquoise-deep: #0a5a5a;
+    --turquoise-dark: #06403f;
+    --birch: #f4f1e8;
+    --birch-warm: #e8e3d2;
+    --ink: #0b1f1e;
+    --ink-soft: #1a3331;
 
-    /* Theme Settings & Sizing Defaults */
-    --color-bg-hover: rgba(255, 255, 255, 0.05);
-    --border-radius: 2px;
-    --font-family: 'Nippo-Regular';
+    --lichen-rgb: 184, 201, 165;
+    --birch-rgb: 244, 241, 232;
+    --ink-rgb: 11, 31, 30;
+    --turquoise-rgb: 14, 124, 123;
+    --turquoise-dark-rgb: 6, 64, 63;
 
-    /* Layout & Sizing */
-    font-size: 14px;
+    /* Native twilight surface roles */
+    --color-bg-content: var(--turquoise-dark);
+    --color-bg-card: rgba(var(--ink-rgb), 0.82);
+    --color-border-content: rgba(var(--lichen-rgb), 0.2);
+    --card-border: rgba(var(--lichen-rgb), 0.15);
+    --surface-border: rgba(var(--lichen-rgb), 0.15);
+    --surface-fill: rgba(var(--birch-rgb), 0.04);
+    --color-text-main: var(--birch);
+    --color-text-secondary: rgba(var(--birch-rgb), 0.7);
+    --color-mask-bg: rgba(var(--ink-rgb), 0.78);
+    --color-overlay-select-bg: var(--ink-soft);
+    --color-overlay-select-border: rgba(var(--lichen-rgb), 0.2);
+    --color-bg-hover: rgba(var(--birch-rgb), 0.07);
+    --ambient-primary: rgba(var(--turquoise-rgb), 0.24);
+    --ambient-secondary: rgba(var(--lichen-rgb), 0.1);
+
+    /* Typography, shape, and elevation */
+    --font-display: "Cormorant Garamond", Georgia, serif;
+    --font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+    --border-radius: 12px;
+    --radius-card: 16px;
+    --radius-pill: 999px;
+    --surface-blur: 12px;
     --topbar-height: 5.5rem;
     --sidebar-width: 12rem;
     --transition-duration: 0.2s;
-    --card-shadow: 0 2px 1px -1px rgba(0, 0, 0, 0.2), 0 1px 1px 0 rgba(0, 0, 0, 0.14), 0 1px 3px 0 rgba(0, 0, 0, 0.12);
+    --card-shadow: 0 18px 55px rgba(var(--ink-rgb), 0.25);
 
-    /* Branding Source Variables (Reactive via JS) */
-    --color-primary: #F80421;
-    --color-primary-text: #ffffff;
-    --color-primary-hover: oklch(from var(--color-primary) calc(l - 0.08) c h);
+    /* Primary remains customizable; lichen is the brand-native default. */
+    --color-primary: var(--lichen);
+    --color-primary-text: var(--ink);
+    --color-primary-hover: oklch(from var(--color-primary) calc(l + 0.07) c h);
+    --focus-ring: 0 0 0 0.2rem rgba(var(--lichen-rgb), 0.24);
+    --slider-bg: rgba(var(--birch-rgb), 0.16);
 
-    /* Dynamic Theme variables calculated from --color-primary */
-    --focus-ring: 0 0 0 0.2rem oklch(from var(--color-primary) l c h / 0.2);
-    --slider-bg: #dee2e6;
+    /* Message severity styles */
+    --color-message-warn-bg: #473d20;
+    --color-message-warn-text: #f8e8ad;
+    --color-message-warn-border: #806d32;
+    --color-message-error-bg: #482628;
+    --color-message-error-text: #ffd8d5;
+    --color-message-error-border: #8e4a4f;
+    --color-message-info-bg: rgba(var(--turquoise-rgb), 0.22);
+    --color-message-info-text: var(--birch);
+    --color-message-info-border: var(--turquoise);
+    --color-message-success-bg: rgba(var(--lichen-rgb), 0.16);
+    --color-message-success-text: var(--birch);
+    --color-message-success-border: var(--lichen-deep);
 
-    /* Custom Message severity styles */
-    --color-message-warn-bg: #ffecb3;
-    --color-message-warn-text: #614a00;
-    --color-message-warn-border: #ffe082;
-    --color-message-error-bg: #ffcdd2;
-    --color-message-error-text: #73000c;
-    --color-message-error-border: #ef9a9a;
-    --color-message-info-bg: #b3e5fc;
-    --color-message-info-text: #01579b;
-    --color-message-info-border: #81d4fa;
-    --color-message-success-bg: #c8e6c9;
-    --color-message-success-text: #256029;
-    --color-message-success-border: #a5d6a7;
+    font-size: 14px;
 }
 
 .theme-light {
-    /* Theme color variables for Light Theme */
-    --color-bg-content: #243447;
-    --color-bg-card: #1a2632;
-    --color-border-content: #454d59;
-    --card-border: #2f4562;
-    --surface-border: #2f4562;
-    --color-text-main: rgba(255, 255, 255, 0.9);
-    --color-text-secondary: rgba(255, 255, 255, 0.7);
-    --color-mask-bg: rgba(0, 0, 0, 0.2);
-    --color-overlay-select-bg: #1a2632;
-    --color-overlay-select-border: #2f4562;
-    --color-bg-hover: rgba(255, 255, 255, 0.05);
+    /* Forest: a brighter dark variant using the same native palette. */
+    --color-bg-content: var(--turquoise-deep);
+    --color-bg-card: rgba(var(--ink-rgb), 0.7);
+    --color-border-content: rgba(var(--lichen-rgb), 0.24);
+    --card-border: rgba(var(--lichen-rgb), 0.2);
+    --surface-border: rgba(var(--lichen-rgb), 0.2);
+    --surface-fill: rgba(var(--birch-rgb), 0.06);
+    --color-text-main: var(--birch);
+    --color-text-secondary: rgba(var(--birch-rgb), 0.76);
+    --color-mask-bg: rgba(var(--ink-rgb), 0.62);
+    --color-overlay-select-bg: #123f3d;
+    --color-overlay-select-border: rgba(var(--lichen-rgb), 0.24);
+    --color-bg-hover: rgba(var(--birch-rgb), 0.09);
+    --ambient-primary: rgba(var(--lichen-rgb), 0.12);
+    --ambient-secondary: rgba(var(--turquoise-dark-rgb), 0.24);
 }
 
 .theme-white {
-    /* Theme color variables for White Theme */
-    --color-bg-content: #f8fafc;
-    --color-bg-card: #f1f5f9;
-    --color-border-content: #e2e8f0;
-    --card-border: #e2e8f0;
-    --surface-border: #cbd5e1;
-    --color-text-main: #0f172a;
-    --color-text-secondary: #64748b;
-    --color-mask-bg: rgba(0, 0, 0, 0.2);
-    --color-overlay-select-bg: #f1f5f9;
-    --color-overlay-select-border: #e2e8f0;
-    --color-bg-hover: rgba(0, 0, 0, 0.04);
+    /* Birch: the light counterpart, with accents and surfaces kept on-brand. */
+    --color-bg-content: var(--birch);
+    --color-bg-card: rgba(255, 253, 247, 0.86);
+    --color-border-content: rgba(var(--turquoise-dark-rgb), 0.18);
+    --card-border: rgba(var(--turquoise-dark-rgb), 0.14);
+    --surface-border: rgba(var(--turquoise-dark-rgb), 0.14);
+    --surface-fill: rgba(255, 255, 255, 0.64);
+    --color-text-main: var(--ink);
+    --color-text-secondary: #3d6b63;
+    --color-mask-bg: rgba(var(--ink-rgb), 0.32);
+    --color-overlay-select-bg: #fffdf7;
+    --color-overlay-select-border: rgba(var(--turquoise-dark-rgb), 0.18);
+    --color-bg-hover: rgba(var(--turquoise-dark-rgb), 0.07);
+    --ambient-primary: rgba(var(--turquoise-rgb), 0.12);
+    --ambient-secondary: rgba(var(--lichen-rgb), 0.3);
+    --card-shadow: 0 18px 48px rgba(var(--turquoise-dark-rgb), 0.12);
+    --slider-bg: rgba(var(--ink-rgb), 0.15);
+    --focus-ring: 0 0 0 0.2rem rgba(var(--turquoise-rgb), 0.2);
+
+    --color-message-info-text: var(--ink);
+    --color-message-success-text: var(--ink);
 }

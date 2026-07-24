@@ -6,14 +6,23 @@
     top: 0;
     width: 100%;
     padding: 0 2rem;
-    background-color: var(--color-bg-card);
+    background:
+        linear-gradient(90deg, rgba(var(--lichen-rgb), 0.22), transparent 38%) bottom / 100% 1px no-repeat,
+        var(--surface-fill);
+    border-bottom: 1px solid var(--surface-border);
+    backdrop-filter: blur(var(--surface-blur));
     transition: left $transitionDuration;
     display: flex;
     align-items: center;
-    box-shadow:
-        0px 3px 5px rgba(0, 0, 0, 0.02),
-        0px 0px 2px rgba(0, 0, 0, 0.05),
-        0px 1px 4px rgba(0, 0, 0, 0.08);
+    box-shadow: 0 10px 36px rgba(var(--ink-rgb), 0.18);
+
+    > a {
+        color: var(--color-text-main);
+
+        &:hover {
+            color: var(--lichen);
+        }
+    }
 
     @media screen and (max-width: 575px) {
         justify-content: space-between;

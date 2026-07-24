@@ -15,7 +15,7 @@ export interface ThemeSettings {
 export class ThemeService {
   private readonly mockSettings: ThemeSettings = {
     colorScheme: 'dark',
-    primaryColor: '#F80421'
+    primaryColor: '#B8C9A5'
   };
 
   private themeSettingsSubject = new BehaviorSubject<ThemeSettings>(this.mockSettings);
