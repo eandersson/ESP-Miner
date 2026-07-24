@@ -4,6 +4,7 @@
 #include "mining.h"
 #include "stratum_api.h"
 #include "utils.h"
+#include "psa/crypto.h"
 
 void free_bm_job(bm_job *job)
 {
@@ -38,18 +39,28 @@ void calculate_coinbase_tx_hash_bin(const uint8_t *prefix, size_t prefix_len,
                                     const uint8_t *suffix, size_t suffix_len,
                                     uint8_t dest[32])
 {
-    size_t total_len = prefix_len + ep_len + e2_len + suffix_len;
-    uint8_t *buf = malloc(total_len);
-    if (!buf) return;
+    // Hash the four coinbase segments directly. Extended-channel work is
+    // regenerated frequently, so avoiding a temporary allocation here reduces
+    // heap churn and ensures allocation pressure cannot turn an interval into
+    // invalid work with an uninitialized coinbase hash.
+    uint8_t first_hash[32];
+    size_t first_hash_len = 0;
+    psa_hash_operation_t operation = PSA_HASH_OPERATION_INIT;
+    psa_status_t status = psa_hash_setup(&operation, PSA_ALG_SHA_256);
+    if (status == PSA_SUCCESS) status = psa_hash_update(&operation, prefix, prefix_len);
+    if (status == PSA_SUCCESS) status = psa_hash_update(&operation, extranonce_prefix, ep_len);
+    if (status == PSA_SUCCESS) status = psa_hash_update(&operation, extranonce_2, e2_len);
+    if (status == PSA_SUCCESS) status = psa_hash_update(&operation, suffix, suffix_len);
+    if (status == PSA_SUCCESS) {
+        status = psa_hash_finish(&operation, first_hash, sizeof(first_hash), &first_hash_len);
+    }
+    psa_hash_abort(&operation);
 
-    size_t offset = 0;
-    memcpy(buf + offset, prefix, prefix_len);   offset += prefix_len;
-    memcpy(buf + offset, extranonce_prefix, ep_len); offset += ep_len;
-    memcpy(buf + offset, extranonce_2, e2_len); offset += e2_len;
-    memcpy(buf + offset, suffix, suffix_len);
-
-    double_sha256_bin(buf, total_len, dest);
-    free(buf);
+    if (status != PSA_SUCCESS || first_hash_len != sizeof(first_hash)) {
+        memset(dest, 0, 32);
+        return;
+    }
+    sha256_bin(first_hash, sizeof(first_hash), dest);
 }
 
 void calculate_merkle_root_hash(const uint8_t coinbase_tx_hash[32], const uint8_t merkle_branches[][32], const int num_merkle_branches, uint8_t dest[32])

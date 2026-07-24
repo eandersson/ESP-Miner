@@ -26,6 +26,36 @@ TEST_CASE("Check coinbase tx construction", "[mining]")
     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected_coinbase_tx_hash, coinbase_tx_hash, 32);
 }
 
+TEST_CASE("Binary coinbase segments hash identically", "[mining]")
+{
+    const char *coinbase_1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020862062f503253482f04b8864e5008";
+    const char *coinbase_2 = "072f736c7573682f000000000100f2052a010000001976a914d23fcdf86f7e756a64a7a9688ef9903327048ed988ac00000000";
+    const char *extranonce_prefix = "e9695791";
+    const char *extranonce_2 = "99999999";
+
+    uint8_t expected[32];
+    calculate_coinbase_tx_hash(coinbase_1, coinbase_2, extranonce_prefix, extranonce_2, expected);
+
+    uint8_t prefix_bin[strlen(coinbase_1) / 2];
+    uint8_t suffix_bin[strlen(coinbase_2) / 2];
+    uint8_t extranonce_prefix_bin[strlen(extranonce_prefix) / 2];
+    uint8_t extranonce_2_bin[strlen(extranonce_2) / 2];
+    hex2bin(coinbase_1, prefix_bin, sizeof(prefix_bin));
+    hex2bin(coinbase_2, suffix_bin, sizeof(suffix_bin));
+    hex2bin(extranonce_prefix, extranonce_prefix_bin, sizeof(extranonce_prefix_bin));
+    hex2bin(extranonce_2, extranonce_2_bin, sizeof(extranonce_2_bin));
+
+    uint8_t actual[32];
+    calculate_coinbase_tx_hash_bin(
+        prefix_bin, sizeof(prefix_bin),
+        extranonce_prefix_bin, sizeof(extranonce_prefix_bin),
+        extranonce_2_bin, sizeof(extranonce_2_bin),
+        suffix_bin, sizeof(suffix_bin),
+        actual);
+
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, actual, sizeof(expected));
+}
+
 // Values calculated from esp-miner/components/stratum/test/verifiers/merklecalc.py
 TEST_CASE("Validate merkle root calculation", "[mining]")
 {

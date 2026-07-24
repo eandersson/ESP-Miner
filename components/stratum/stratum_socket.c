@@ -5,10 +5,47 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "stratum_socket";
+static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int stratum_socket_write_all(esp_transport_handle_t transport, const void *buffer,
+                             size_t len, int timeout_ms)
+{
+    if (transport == NULL || buffer == NULL || len > INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+
+    const char *bytes = (const char *)buffer;
+    size_t written = 0;
+
+    pthread_mutex_lock(&write_lock);
+    while (written < len) {
+        int ret = esp_transport_write(transport, bytes + written,
+                                      (int)(len - written), timeout_ms);
+        if (ret <= 0) {
+            if (ret == 0) {
+                errno = ETIMEDOUT;
+            }
+            ESP_LOGE(TAG, "Pool write failed after %zu/%zu bytes (ret=%d, errno=%d)",
+                     written, len, ret, errno);
+            pthread_mutex_unlock(&write_lock);
+            return -1;
+        }
+        written += ret;
+    }
+    pthread_mutex_unlock(&write_lock);
+
+    return (int)written;
+}
 
 esp_err_t stratum_socket_resolve(const char *hostname, uint16_t port, stratum_connection_info_t *conn_info)
 {

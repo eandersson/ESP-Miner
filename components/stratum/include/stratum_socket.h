@@ -1,6 +1,7 @@
 #ifndef STRATUM_SOCKET_H_
 #define STRATUM_SOCKET_H_
 
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "esp_transport.h"
@@ -26,5 +27,13 @@ esp_err_t stratum_socket_resolve(const char *hostname, uint16_t port, stratum_co
 // Apply the common pool-socket options (timeouts, TCP_NODELAY, keepalive) used
 // by both the SV1 and SV2 stratum tasks.
 void stratum_socket_set_options(esp_transport_handle_t transport);
+
+// Serialize writes to the pool connection and keep writing until the complete
+// message has been accepted by the transport. esp_transport_write() is allowed
+// to return a short positive write; treating that as success can truncate a V1
+// JSON request or an encrypted V2 frame.
+// Returns len on success and -1 on failure.
+int stratum_socket_write_all(esp_transport_handle_t transport, const void *buffer,
+                             size_t len, int timeout_ms);
 
 #endif /* STRATUM_SOCKET_H_ */

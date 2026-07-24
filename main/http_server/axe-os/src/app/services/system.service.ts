@@ -163,7 +163,7 @@ export class SystemApiService {
         actualFrequency: 485,
         version: "v2.12.0",
         axeOSVersion: "v2.12.0",
-        idfVersion: "v5.5.1",
+        idfVersion: "v6.0.2",
         resetReason: "Power-on reset",
         boardVersion: "602",
         display: "SSD1306 (128x32)",

@@ -1,7 +1,9 @@
 #include "sv2_noise.h"
 #include "sv2_protocol.h"
+#include "stratum_socket.h"
 #include "utils.h"
 
+#include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -38,6 +40,7 @@ struct sv2_noise_ctx {
     uint64_t recv_nonce;
     bool handshake_complete;
     secp256k1_context *secp_ctx;
+    pthread_mutex_t send_lock;
 };
 
 // --- Transport helpers ---
@@ -58,8 +61,8 @@ static int noise_recv_exact(esp_transport_handle_t transport, uint8_t *buf, int 
 
 static int noise_send_all(esp_transport_handle_t transport, const uint8_t *buf, int len)
 {
-    int ret = esp_transport_write(transport, (const char *)buf, len, TRANSPORT_TIMEOUT_MS);
-    if (ret < 0) {
+    int ret = stratum_socket_write_all(transport, buf, len, TRANSPORT_TIMEOUT_MS);
+    if (ret != len) {
         ESP_LOGE(TAG, "send failed: ret=%d", ret);
         return -1;
     }
@@ -238,8 +241,14 @@ sv2_noise_ctx_t *sv2_noise_create(void)
     sv2_noise_ctx_t *ctx = calloc(1, sizeof(sv2_noise_ctx_t));
     if (!ctx) return NULL;
 
+    if (pthread_mutex_init(&ctx->send_lock, NULL) != 0) {
+        free(ctx);
+        return NULL;
+    }
+
     ctx->secp_ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
     if (!ctx->secp_ctx) {
+        pthread_mutex_destroy(&ctx->send_lock);
         free(ctx);
         return NULL;
     }
@@ -250,6 +259,7 @@ sv2_noise_ctx_t *sv2_noise_create(void)
     if (!secp256k1_context_randomize(ctx->secp_ctx, seed)) {
         ESP_LOGE(TAG, "Failed to randomize secp256k1 context");
         secp256k1_context_destroy(ctx->secp_ctx);
+        pthread_mutex_destroy(&ctx->send_lock);
         free(ctx);
         return NULL;
     }
@@ -269,6 +279,7 @@ void sv2_noise_destroy(sv2_noise_ctx_t *ctx)
     if (ctx->secp_ctx) {
         secp256k1_context_destroy(ctx->secp_ctx);
     }
+    pthread_mutex_destroy(&ctx->send_lock);
     free(ctx);
 }
 
@@ -547,6 +558,11 @@ int sv2_noise_send(sv2_noise_ctx_t *ctx, esp_transport_handle_t transport,
         return -1;
     }
 
+    // A share can be submitted by the ASIC result task while the connection
+    // task is also sending a protocol frame. Protect both the monotonically
+    // increasing Noise nonce and the corresponding wire order.
+    pthread_mutex_lock(&ctx->send_lock);
+
     int payload_len = frame_len - SV2_FRAME_HEADER_SIZE;
 
     // Header-only frame: encrypt (6 -> 22 bytes) and send directly off the stack.
@@ -554,9 +570,12 @@ int sv2_noise_send(sv2_noise_ctx_t *ctx, esp_transport_handle_t transport,
         uint8_t enc_hdr[22];
         if (noise_encrypt(ctx->send_key, ctx->send_nonce++, NULL, 0,
                           frame, SV2_FRAME_HEADER_SIZE, enc_hdr) != 0) {
+            pthread_mutex_unlock(&ctx->send_lock);
             return -1;
         }
-        return noise_send_all(transport, enc_hdr, 22);
+        int ret = noise_send_all(transport, enc_hdr, 22);
+        pthread_mutex_unlock(&ctx->send_lock);
+        return ret;
     }
 
     // Build the encrypted header and payload contiguously and send them in a
@@ -566,12 +585,16 @@ int sv2_noise_send(sv2_noise_ctx_t *ctx, esp_transport_handle_t transport,
     // reads the 22-byte header first and then the payload, is unaffected.
     int total_len = 22 + payload_len + 16;
     uint8_t *out = malloc(total_len);
-    if (!out) return -1;
+    if (!out) {
+        pthread_mutex_unlock(&ctx->send_lock);
+        return -1;
+    }
 
     // Encrypt header (nonce N) into out[0..21]
     if (noise_encrypt(ctx->send_key, ctx->send_nonce++, NULL, 0,
                       frame, SV2_FRAME_HEADER_SIZE, out) != 0) {
         free(out);
+        pthread_mutex_unlock(&ctx->send_lock);
         return -1;
     }
 
@@ -579,11 +602,13 @@ int sv2_noise_send(sv2_noise_ctx_t *ctx, esp_transport_handle_t transport,
     if (noise_encrypt(ctx->send_key, ctx->send_nonce++, NULL, 0,
                       frame + SV2_FRAME_HEADER_SIZE, payload_len, out + 22) != 0) {
         free(out);
+        pthread_mutex_unlock(&ctx->send_lock);
         return -1;
     }
 
     int ret = noise_send_all(transport, out, total_len);
     free(out);
+    pthread_mutex_unlock(&ctx->send_lock);
     return ret;
 }
 

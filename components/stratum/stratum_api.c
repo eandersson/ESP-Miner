@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include <inttypes.h>
+#include "stratum_socket.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -657,7 +658,7 @@ int STRATUM_V1_subscribe(esp_transport_handle_t transport, int send_uid, const c
         send_uid, model, version);
     debug_stratum_tx(subscribe_msg);
 
-    return esp_transport_write(transport, subscribe_msg, strlen(subscribe_msg), TRANSPORT_TIMEOUT_MS);
+    return stratum_socket_write_all(transport, subscribe_msg, strlen(subscribe_msg), TRANSPORT_TIMEOUT_MS);
 }
 
 int STRATUM_V1_suggest_difficulty(esp_transport_handle_t transport, int send_uid, uint32_t difficulty)
@@ -668,7 +669,7 @@ int STRATUM_V1_suggest_difficulty(esp_transport_handle_t transport, int send_uid
         send_uid, difficulty);
     debug_stratum_tx(difficulty_msg);
 
-    return esp_transport_write(transport, difficulty_msg, strlen(difficulty_msg), TRANSPORT_TIMEOUT_MS);
+    return stratum_socket_write_all(transport, difficulty_msg, strlen(difficulty_msg), TRANSPORT_TIMEOUT_MS);
 }
 
 int STRATUM_V1_extranonce_subscribe(esp_transport_handle_t transport, int send_uid)
@@ -679,7 +680,7 @@ int STRATUM_V1_extranonce_subscribe(esp_transport_handle_t transport, int send_u
         send_uid);
     debug_stratum_tx(extranonce_msg);
 
-    return esp_transport_write(transport, extranonce_msg, strlen(extranonce_msg), TRANSPORT_TIMEOUT_MS);
+    return stratum_socket_write_all(transport, extranonce_msg, strlen(extranonce_msg), TRANSPORT_TIMEOUT_MS);
 }
 
 int STRATUM_V1_authorize(esp_transport_handle_t transport, int send_uid, const char * username, const char * pass)
@@ -690,7 +691,7 @@ int STRATUM_V1_authorize(esp_transport_handle_t transport, int send_uid, const c
         send_uid, username, pass);
     debug_stratum_tx(authorize_msg);
 
-    return esp_transport_write(transport, authorize_msg, strlen(authorize_msg), TRANSPORT_TIMEOUT_MS);
+    return stratum_socket_write_all(transport, authorize_msg, strlen(authorize_msg), TRANSPORT_TIMEOUT_MS);
 }
 
 int STRATUM_V1_pong(esp_transport_handle_t transport, int message_id)
@@ -701,7 +702,7 @@ int STRATUM_V1_pong(esp_transport_handle_t transport, int message_id)
         message_id);
     debug_stratum_tx(pong_msg);
     
-    return esp_transport_write(transport, pong_msg, strlen(pong_msg), TRANSPORT_TIMEOUT_MS);
+    return stratum_socket_write_all(transport, pong_msg, strlen(pong_msg), TRANSPORT_TIMEOUT_MS);
 }
 
 int STRATUM_V1_send_version(esp_transport_handle_t transport, int message_id)
@@ -714,7 +715,7 @@ int STRATUM_V1_send_version(esp_transport_handle_t transport, int message_id)
         message_id, version);
     debug_stratum_tx(version_msg);
     
-    return esp_transport_write(transport, version_msg, strlen(version_msg), TRANSPORT_TIMEOUT_MS);
+    return stratum_socket_write_all(transport, version_msg, strlen(version_msg), TRANSPORT_TIMEOUT_MS);
 }
 
 /// @param transport Transport to write to
@@ -735,7 +736,7 @@ int STRATUM_V1_submit_share(esp_transport_handle_t transport, int send_uid, cons
         "{\"id\":%d,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%08lx\",\"%08lx\",\"%08lx\"]}\n",
         send_uid, username, job_id, extranonce_2, ntime, nonce, version_bits);
 
-    int ret = esp_transport_write(transport, submit_msg, strlen(submit_msg), TRANSPORT_TIMEOUT_MS);
+    int ret = stratum_socket_write_all(transport, submit_msg, strlen(submit_msg), TRANSPORT_TIMEOUT_MS);
 
     uint64_t now = esp_timer_get_time();
     if (out_sent_time_us) {
@@ -757,5 +758,5 @@ int STRATUM_V1_configure_version_rolling(esp_transport_handle_t transport, int s
         send_uid);
     debug_stratum_tx(configure_msg);
 
-    return esp_transport_write(transport, configure_msg, strlen(configure_msg), TRANSPORT_TIMEOUT_MS);
+    return stratum_socket_write_all(transport, configure_msg, strlen(configure_msg), TRANSPORT_TIMEOUT_MS);
 }
