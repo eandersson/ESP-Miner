@@ -1,5 +1,6 @@
 #include "bm1366.h"
 
+#include "asic_result_task.h"
 #include "crc.h"
 #include "global_state.h"
 #include "mining.h"
@@ -83,7 +84,7 @@ static int address_interval;
 /// @param header
 /// @param data
 /// @param len
-static void _send_BM1366(uint8_t header, uint8_t * data, uint8_t data_len, bool debug)
+static bool _send_BM1366(uint8_t header, const uint8_t * data, uint8_t data_len, bool debug)
 {
     packet_type_t packet_type = (header & TYPE_JOB) ? JOB_PACKET : CMD_PACKET;
     uint8_t total_length = (packet_type == JOB_PACKET) ? (data_len + 6) : (data_len + 5);
@@ -112,15 +113,14 @@ static void _send_BM1366(uint8_t header, uint8_t * data, uint8_t data_len, bool 
         buf[4 + data_len] = crc5(buf + 2, data_len + 2);
     }
 
-    // send serial data
-    SERIAL_send(buf, total_length, debug);
+    return SERIAL_send(buf, total_length, debug);
 }
 
-static void _send_simple(uint8_t * data, uint8_t total_length)
+static bool _send_simple(const uint8_t * data, uint8_t total_length)
 {
     uint8_t buf[total_length];
     memcpy(buf, data, total_length);
-    SERIAL_send(buf, total_length, BM1366_SERIALTX_DEBUG);
+    return SERIAL_send(buf, total_length, BM1366_SERIALTX_DEBUG);
 }
 
 static void _send_chain_inactive(void)
@@ -302,11 +302,17 @@ int BM1366_set_max_baud(void)
 
 static uint8_t id = 0;
 
-void BM1366_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job)
+bool BM1366_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
+                      uint32_t expected_generation)
 {
-    BM1366_job job;
-    id = (id + 8) % 128;
-    job.job_id = id;
+    if (GLOBAL_STATE == NULL || next_bm_job == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs == NULL ||
+        GLOBAL_STATE->valid_jobs == NULL) {
+        ESP_LOGE(TAG, "Cannot send job before job tracking is initialized");
+        return false;
+    }
+
+    BM1366_job job = {0};
     job.num_midstates = 0x01;
     memcpy(&job.starting_nonce, &next_bm_job->starting_nonce, 4);
     memcpy(&job.nbits, &next_bm_job->target, 4);
@@ -315,29 +321,55 @@ void BM1366_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job)
     memcpy(job.prev_block_hash, next_bm_job->prev_block_hash, 32);
     memcpy(&job.version, &next_bm_job->version, 4);
 
-    // Hold valid_jobs_lock across the free + reassignment so the result task
-    // (which snapshots active_jobs[job_id] under the same lock) can never observe
-    // or copy a slot we are freeing/replacing here. valid_jobs is set inside the
-    // same critical section so validity and the pointer stay consistent.
+    // Invalidate the reused slot before TX, then publish metadata only after the
+    // UART accepted the complete packet. Holding the lock across this short
+    // enqueue makes send/publication atomic with clean-job invalidation.
     pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
-    if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] != NULL) {
-        free_bm_job(GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id]);
+    if (ASIC_result_task_get_job_generation() != expected_generation) {
+        pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
+        ESP_LOGW(TAG, "Discarding job from stale generation %lu",
+                 (unsigned long)expected_generation);
+        return false;
     }
-    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
-    GLOBAL_STATE->valid_jobs[job.job_id] = 1;
+    const uint8_t next_id = (id + 8) % 128;
+    job.job_id = next_id;
+    bm_job *replaced_job =
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id];
+    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = NULL;
+    GLOBAL_STATE->valid_jobs[job.job_id] = 0;
+
+    bool sent = _send_BM1366((TYPE_JOB | GROUP_SINGLE | CMD_WRITE),
+                             (const uint8_t *)&job, sizeof(job),
+                             BM1366_DEBUG_WORK);
+    if (sent) {
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
+        GLOBAL_STATE->valid_jobs[job.job_id] = 1;
+        id = next_id;
+    }
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
+
+    if (replaced_job != NULL && replaced_job != next_bm_job) {
+        free_bm_job(replaced_job);
+    }
+
+    if (!sent) {
+        ESP_LOGE(TAG, "Failed to send job 0x%02X; slot remains invalid",
+                 job.job_id);
+        return false;
+    }
 
     //debug sent jobs - this can get crazy if the interval is short
     #if BM1366_DEBUG_JOBS
     ESP_LOGI(TAG, "Send Job: %02X", job.job_id);
     #endif
 
-    _send_BM1366((TYPE_JOB | GROUP_SINGLE | CMD_WRITE), (uint8_t *)&job, sizeof(BM1366_job), BM1366_DEBUG_WORK);
+    return true;
 }
 
 task_result * BM1366_process_work(GlobalState * GLOBAL_STATE)
 {
     bm1366_asic_result_t asic_result = {0};
+    (void)GLOBAL_STATE;
 
     memset(&result, 0, sizeof(task_result));
 
@@ -364,19 +396,9 @@ task_result * BM1366_process_work(GlobalState * GLOBAL_STATE)
     uint8_t small_core_id = asic_result.job.id & 0x07; // BM1366 has 8 small cores, so it should be coded on 3 bits
     uint32_t version_bits = (ntohs(asic_result.job.version) << 13); // shift the 16 bit value left 13
 
-    // Read active_jobs[job_id] under the lock
-    pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
-    if (GLOBAL_STATE->valid_jobs[job_id] == 0 || GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id] == NULL) {
-        pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
-        ESP_LOGW(TAG, "Invalid job nonce found, 0x%02X", job_id);
-        return NULL;
-    }
-    uint32_t rolled_version = GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id]->version | version_bits;
-    pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
-
     result.job_id = job_id;
     result.nonce = asic_result.job.nonce;
-    result.rolled_version = rolled_version;
+    result.version_bits = version_bits;
     result.asic_nr = asic_nr;
     result.core_id = core_id;
     result.small_core_id = small_core_id;

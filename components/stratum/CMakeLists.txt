@@ -12,6 +12,7 @@ INCLUDE_DIRS
     "include"
 
 REQUIRES
+    "espressif__cjson"
     "mbedtls"
     "app_update"
     "esp_timer"

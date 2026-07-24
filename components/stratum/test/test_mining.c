@@ -151,6 +151,38 @@ TEST_CASE("Validate version mask incrementing", "[mining]")
     TEST_ASSERT_EQUAL_UINT32(0x20000404, rolled_version);
 }
 
+TEST_CASE("Version mask increment carries across sparse mask gaps", "[mining]")
+{
+    const uint32_t mask = 0x00000016;  // packed bits at positions 1, 2, and 4
+    const uint32_t value = 0xa0000006; // packed value 3, plus unmasked bits
+
+    TEST_ASSERT_EQUAL_UINT32(0xa0000010,
+                             increment_bitmask(value, mask));
+}
+
+TEST_CASE("Version mask increment wraps a full-width mask", "[mining]")
+{
+    TEST_ASSERT_EQUAL_UINT32(0, increment_bitmask(UINT32_MAX, UINT32_MAX));
+}
+
+TEST_CASE("Version mask increment leaves a zero mask unchanged", "[mining]")
+{
+    TEST_ASSERT_EQUAL_UINT32(0xa5a55a5a,
+                             increment_bitmask(0xa5a55a5a, 0));
+}
+
+TEST_CASE("Version mask helpers report distinct work cardinality", "[mining]")
+{
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_midstate_count(0));
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_midstate_count(0x00002000));
+    TEST_ASSERT_EQUAL_UINT32(4, version_mask_midstate_count(0x00006000));
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_value_count(0));
+    TEST_ASSERT_EQUAL_UINT32(2, version_mask_value_count(0x00002000));
+    TEST_ASSERT_EQUAL_UINT32(4, version_mask_value_count(0x00006000));
+    TEST_ASSERT_EQUAL_UINT32(65536,
+                             version_mask_value_count(0x1fffe000));
+}
+
 // Values calculated from esp-miner/components/stratum/test/verifiers/bm1397.py
 // TEST_CASE("Validate bm job construction 2", "[mining]")
 // {

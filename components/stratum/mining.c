@@ -8,6 +8,9 @@
 
 void free_bm_job(bm_job *job)
 {
+    if (job == NULL) {
+        return;
+    }
     free(job->jobid);
     free(job->extranonce2);
     free(job);
@@ -102,7 +105,7 @@ void construct_bm_job(mining_notify *params, const uint8_t merkle_root[32], cons
     midstate_sha256_bin(midstate_data, 64, midstate); // make the midstate hash
     reverse_32bit_words(midstate, new_job->midstate); // reverse the midstate words for the BM job packet
 
-    if (version_mask != 0)
+    if (version_mask_midstate_count(version_mask) == 4)
     {
         uint32_t rolled_version = increment_bitmask(new_job->version, version_mask);
         memcpy(midstate_data, &rolled_version, 4);
@@ -176,20 +179,52 @@ double test_nonce_value(const bm_job *job, const uint32_t nonce, const uint32_t 
 
 uint32_t increment_bitmask(const uint32_t value, const uint32_t mask)
 {
-    // if mask is zero, just return the original value
-    if (mask == 0)
+    if (mask == 0) {
         return value;
+    }
 
-    uint32_t carry = (value & mask) + (mask & -mask);      // increment the least significant bit of the mask
-    uint32_t overflow = carry & ~mask;                     // find overflowed bits that are not in the mask
-    uint32_t new_value = (value & ~mask) | (carry & mask); // set bits according to the mask
+    uint32_t new_value = value & ~mask;
+    bool carry = true;
 
-    // Handle carry propagation
-    if (overflow > 0)
-    {
-        uint32_t carry_mask = (overflow << 1);                // shift left to get the mask where carry should be propagated
-        new_value = increment_bitmask(new_value, carry_mask); // recursively handle carry propagation
+    // Treat the selected bit positions as a packed little-endian counter.
+    // This carries across gaps in sparse masks, preserves every unmasked bit,
+    // and naturally wraps to zero within the mask.
+    for (uint32_t bit = 1; bit != 0; bit <<= 1) {
+        if ((mask & bit) == 0) {
+            continue;
+        }
+
+        bool bit_is_set = (value & bit) != 0;
+        if (carry) {
+            bit_is_set = !bit_is_set;
+            carry = !bit_is_set;
+        }
+        if (bit_is_set) {
+            new_value |= bit;
+        }
     }
 
     return new_value;
+}
+
+size_t version_mask_midstate_count(uint32_t version_mask)
+{
+    // Work packet formats have established one- and four-midstate encodings.
+    // A zero- or one-bit mask cannot supply four distinct versions.
+    return version_mask != 0 &&
+                   (version_mask & (version_mask - 1)) != 0
+               ? 4
+               : 1;
+}
+
+size_t version_mask_value_count(uint32_t version_mask)
+{
+    unsigned int bit_count = 0;
+    for (uint32_t mask = version_mask; mask != 0; mask >>= 1) {
+        bit_count += mask & 1U;
+    }
+    if (bit_count >= sizeof(size_t) * CHAR_BIT) {
+        return SIZE_MAX;
+    }
+    return (size_t)1U << bit_count;
 }

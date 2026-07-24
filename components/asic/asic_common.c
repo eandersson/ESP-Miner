@@ -16,6 +16,10 @@ static const char * TAG = "common";
 static char asic_chain_error[96];
 static asic_rx_stream_t work_rx_stream;
 
+static esp_err_t receive_stream_frame(asic_rx_stream_t *stream, uint8_t *buffer,
+                                      size_t frame_size, uint32_t timeout_ms,
+                                      uint64_t *out_timestamp_us);
+
 static void format_asic_indices(char *buffer, size_t buffer_size, int first_index, int end_index)
 {
     size_t offset = 0;
@@ -84,42 +88,46 @@ int _next_power_of_two(int num)
 int count_asic_chips(uint16_t asic_count, uint16_t chip_id, int chip_id_response_length)
 {
     uint8_t buffer[11] = {0};
+    asic_rx_stream_t chip_id_stream;
 
     clear_asic_chain_error();
+    if (chip_id_response_length < 3 ||
+        chip_id_response_length > (int)sizeof(buffer)) {
+        ESP_LOGE(TAG, "Invalid CHIP_ID response length: %d",
+                 chip_id_response_length);
+        return 0;
+    }
+    asic_rx_stream_reset(&chip_id_stream);
 
     int chip_counter = 0;
     while (true) {
-        int received = SERIAL_rx(buffer, chip_id_response_length, 1000);
-        if (received == 0) break;
-
-        if (received == -1) {
-            ESP_LOGE(TAG, "Error reading CHIP_ID");
+        esp_err_t receive_result = receive_stream_frame(
+            &chip_id_stream, buffer, chip_id_response_length, 1000, NULL);
+        if (receive_result == ESP_ERR_TIMEOUT) {
             break;
         }
-
-        if (received != chip_id_response_length) {
-            ESP_LOGE(TAG, "Invalid CHIP_ID response length: expected %d, got %d", chip_id_response_length, received);
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
+        if (receive_result != ESP_OK) {
+            ESP_LOGE(TAG, "Error reading CHIP_ID");
             break;
         }
 
         uint16_t received_preamble = (buffer[0] << 8) | buffer[1];
         if (received_preamble != PREAMBLE) {
             ESP_LOGW(TAG, "Preamble mismatch: expected 0x%04x, got 0x%04x", PREAMBLE, received_preamble);
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
+            ESP_LOG_BUFFER_HEX(TAG, buffer, chip_id_response_length);
             continue;
         }
 
         uint16_t received_chip_id = (buffer[2] << 8) | buffer[3];
         if (received_chip_id != chip_id) {
             ESP_LOGW(TAG, "CHIP_ID response mismatch: expected 0x%04x, got 0x%04x", chip_id, received_chip_id);
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
+            ESP_LOG_BUFFER_HEX(TAG, buffer, chip_id_response_length);
             continue;
         }
 
-        if (crc5(buffer + 2, received - 2) != 0) {
+        if (crc5(buffer + 2, chip_id_response_length - 2) != 0) {
             ESP_LOGW(TAG, "Checksum failed on CHIP_ID response");
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
+            ESP_LOG_BUFFER_HEX(TAG, buffer, chip_id_response_length);
             continue;
         }
 
@@ -204,6 +212,67 @@ bool asic_rx_stream_push(asic_rx_stream_t *stream, uint8_t byte, uint8_t *frame,
     return false;
 }
 
+static esp_err_t receive_stream_frame(asic_rx_stream_t *stream, uint8_t *buffer,
+                                      size_t frame_size, uint32_t timeout_ms,
+                                      uint64_t *out_timestamp_us)
+{
+    if (stream == NULL || buffer == NULL || frame_size < 3 ||
+        frame_size > ASIC_RX_FRAME_MAX_SIZE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+    uint32_t discarded_before = stream->discarded_bytes;
+    uint8_t rx_chunk[ASIC_RX_FRAME_MAX_SIZE];
+
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) {
+            break;
+        }
+
+        // Read enough bytes to complete the current candidate frame. In the
+        // normal case this turns one UART-driver call per byte into one call
+        // per ASIC response without consuming bytes past the first frame.
+        size_t wanted = frame_size > stream->length
+                            ? frame_size - stream->length
+                            : 1;
+        uint32_t remaining_ms_32 = (uint32_t)((remaining_us + 999) / 1000);
+        uint16_t remaining_ms = remaining_ms_32 > UINT16_MAX
+                                    ? UINT16_MAX
+                                    : (uint16_t)remaining_ms_32;
+        int received = SERIAL_rx(rx_chunk, (uint16_t)wanted, remaining_ms);
+
+        if (received < 0) {
+            stream->uart_errors++;
+            ESP_LOGE(TAG, "UART error in serial RX");
+            return ESP_FAIL;
+        }
+        if (received == 0) {
+            break;
+        }
+
+        for (int i = 0; i < received; i++) {
+            if (!asic_rx_stream_push(stream, rx_chunk[i], buffer, frame_size)) {
+                continue;
+            }
+
+            if (out_timestamp_us != NULL) {
+                *out_timestamp_us = esp_timer_get_time();
+            }
+            uint32_t discarded = stream->discarded_bytes - discarded_before;
+            if (discarded > 0) {
+                ESP_LOGD(TAG, "ASIC RX resynchronized after discarding %lu byte(s)",
+                         (unsigned long)discarded);
+            }
+            return ESP_OK;
+        }
+    }
+
+    stream->timeouts++;
+    return ESP_ERR_TIMEOUT;
+}
+
 void reset_work_rx_parser(void)
 {
     asic_rx_stream_reset(&work_rx_stream);
@@ -229,43 +298,13 @@ esp_err_t receive_work(uint8_t * buffer, int buffer_size, uint64_t *out_timestam
         return ESP_FAIL;
     }
 
-    int64_t deadline_us = esp_timer_get_time() + (ASIC_RX_TIMEOUT_MS * 1000);
-    uint32_t discarded_before = work_rx_stream.discarded_bytes;
-
-    while (esp_timer_get_time() < deadline_us) {
-        int64_t remaining_us = deadline_us - esp_timer_get_time();
-        if (remaining_us <= 0) {
-            break;
-        }
-        uint16_t remaining_ms = (uint16_t)((remaining_us + 999) / 1000);
-        uint8_t byte;
-        int received = SERIAL_rx(&byte, 1, remaining_ms);
-
-        if (received < 0) {
-            work_rx_stream.uart_errors++;
-            ESP_LOGE(TAG, "UART error in serial RX");
-            return ESP_FAIL;
-        }
-        if (received == 0) {
-            break;
-        }
-
-        if (asic_rx_stream_push(&work_rx_stream, byte, buffer, buffer_size)) {
-            if (out_timestamp_us) {
-                *out_timestamp_us = esp_timer_get_time();
-            }
-            uint32_t discarded = work_rx_stream.discarded_bytes - discarded_before;
-            if (discarded > 0) {
-                ESP_LOGW(TAG, "ASIC RX resynchronized after discarding %lu byte(s)",
-                         (unsigned long)discarded);
-            }
-            return ESP_OK;
-        }
+    esp_err_t result = receive_stream_frame(
+        &work_rx_stream, buffer, (size_t)buffer_size, ASIC_RX_TIMEOUT_MS,
+        out_timestamp_us);
+    if (result == ESP_ERR_TIMEOUT) {
+        ESP_LOGD(TAG, "UART timeout in serial RX");
     }
-
-    work_rx_stream.timeouts++;
-    ESP_LOGD(TAG, "UART timeout in serial RX");
-    return ESP_FAIL;
+    return result == ESP_OK ? ESP_OK : ESP_FAIL;
 }
 
 void get_difficulty_mask(double difficulty, uint8_t *job_difficulty_mask)

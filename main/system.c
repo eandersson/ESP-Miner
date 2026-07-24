@@ -32,6 +32,7 @@
 #include "filesystem.h"
 #include "embedded_web_ui.h"
 #include "asic_result_task.h"
+#include "mining.h"
 #include "work_queue.h"
 #include "hashrate_monitor_task.h"
 
@@ -341,13 +342,28 @@ esp_err_t SYSTEM_init_peripherals(GlobalState * GLOBAL_STATE) {
 void SYSTEM_clean_jobs_queue(GlobalState * GLOBAL_STATE)
 {
     ESP_LOGI(TAG, "Clean Jobs: clearing queue");
-    queue_clear(&GLOBAL_STATE->stratum_queue);
 
+    // Publish the new generation before touching the stratum queue. ASIC send
+    // paths use this same lock and reject an old generation before UART TX, so
+    // current_work cannot be resent once invalidation becomes visible.
     pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
-    for (int i = 0; i < 128; i = i + 4) {
-        GLOBAL_STATE->valid_jobs[i] = 0;
+    ASIC_result_task_invalidate_pool_jobs();
+    for (int i = 0; i < 128; i++) {
+        if (GLOBAL_STATE->valid_jobs != NULL) {
+            GLOBAL_STATE->valid_jobs[i] = 0;
+        }
+        if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs != NULL &&
+            GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] != NULL) {
+            free_bm_job(
+                GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i]);
+            GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] = NULL;
+        }
     }
-    ASIC_result_task_invalidate_jobs();
+    // Lock ordering is valid_jobs_lock -> stratum_queue.lock. No path takes
+    // these locks in reverse: the scheduler releases the queue lock before an
+    // ASIC send. Keeping both locked here makes generation publication and
+    // removal of pre-clean queued work atomic from the scheduler's viewpoint.
+    queue_clear(&GLOBAL_STATE->stratum_queue);
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
     // Reset hashrate measurements to prevent a spike on reconnection

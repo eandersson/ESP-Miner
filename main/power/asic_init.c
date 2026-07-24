@@ -8,6 +8,7 @@
 #include "serial.h"
 #include "asic_reset.h"
 #include "asic_result_task.h"
+#include "mining.h"
 
 static const char *TAG = "asic_init";
 
@@ -56,10 +57,33 @@ uint8_t asic_initialize(GlobalState *GLOBAL_STATE, asic_init_mode_t mode, uint32
         return 0;
     }
 
+    // ASIC_init restores the chip's power-on default. Reapply the last
+    // negotiated effective mask so cadence and hardware search space remain
+    // aligned across live recovery.
+    ASIC_restore_version_mask(GLOBAL_STATE);
+
     ESP_LOGI(TAG, "Setting max baud rate and clearing buffers");
     SERIAL_set_baud(ASIC_set_max_baud(GLOBAL_STATE));
     SERIAL_clear_buffer();
+
+    // Hardware reset invalidates every device-side job slot. Publish the new
+    // slot epoch and clear host metadata atomically, while leaving the pool
+    // generation unchanged so create_jobs can immediately re-feed its valid
+    // current template after recovery.
+    pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
     ASIC_result_task_reset();
+    for (int i = 0; i < 128; i++) {
+        if (GLOBAL_STATE->valid_jobs != NULL) {
+            GLOBAL_STATE->valid_jobs[i] = 0;
+        }
+        if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs != NULL &&
+            GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] != NULL) {
+            free_bm_job(
+                GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i]);
+            GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] = NULL;
+        }
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
     GLOBAL_STATE->ASIC_initalized = true;
     

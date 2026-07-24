@@ -35,9 +35,10 @@ esp_err_t SERIAL_init(void)
     // Set UART1 pins(TX: IO17, RX: I018)
     ESP_ERROR_CHECK_WITHOUT_ABORT(uart_set_pin(UART_NUM_1, ECHO_TEST_TXD, ECHO_TEST_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // Install UART driver (we don't need an event queue here)
-    // tx buffer 0 so the tx time doesn't overlap with the job wait time
-    //  by returning before the job is written
+    // Install the UART driver without an event queue. The bounded TX ring lets
+    // the short command/job packets be queued without waiting for every byte to
+    // leave the wire. SERIAL_send still requires the complete packet to be
+    // accepted before reporting success.
     return uart_driver_install(UART_NUM_1, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
 }
 
@@ -58,16 +59,39 @@ esp_err_t SERIAL_set_baud(int baud)
     return ESP_OK;
 }
 
-int SERIAL_send(uint8_t *data, int len, bool debug)
+bool SERIAL_send(const uint8_t *data, size_t len, bool debug)
 {
+    if (data == NULL || len == 0) {
+        ESP_LOGE(TAG, "Refusing invalid UART write (data=%p, len=%u)",
+                 (const void *)data, (unsigned int)len);
+        return false;
+    }
+
+    if (!uart_is_driver_installed(UART_NUM_1)) {
+        ESP_LOGE(TAG, "UART write attempted before driver initialization");
+        return false;
+    }
+
     if (debug)
     {
         printf("tx: ");
-        prettyHex((unsigned char *)data, len);
+        prettyHex((unsigned char *)data, (int)len);
         printf("\n");
     }
 
-    return uart_write_bytes(UART_NUM_1, (const char *)data, len);
+    int written = uart_write_bytes(UART_NUM_1, data, len);
+    if (written < 0) {
+        ESP_LOGE(TAG, "UART write failed for %u-byte packet",
+                 (unsigned int)len);
+        return false;
+    }
+    if ((size_t)written != len) {
+        ESP_LOGE(TAG, "Incomplete UART write: %d of %u bytes accepted",
+                 written, (unsigned int)len);
+        return false;
+    }
+
+    return true;
 }
 
 /// @brief waits for a serial response from the device

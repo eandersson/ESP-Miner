@@ -1,4 +1,5 @@
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_transport.h"
 #include "esp_transport_tcp.h"
@@ -170,59 +171,60 @@ static void start_protocol_task(GlobalState *gs, stratum_protocol_t protocol)
 // Tell the V1 task to shut down and wait for it to exit.
 // Only closes the transport socket to unblock V1's recv — does NOT destroy it.
 // The V1 task handles its own full cleanup (destroy, queue clear) on exit.
-static void stop_v1_task(GlobalState *gs)
+static bool stop_v1_task(GlobalState *gs)
 {
     s_v1_should_shutdown = true;
 
-    // Close transport to unblock V1's blocked recv()
-    if (gs->transport) {
-        esp_transport_close(gs->transport);
-    }
+    // Close transport to unblock V1's blocked recv(), serialized with share TX.
+    stratum_v1_interrupt_connection(gs);
 
     coordinator_event_t evt;
     for (int i = 0; i < 100; i++) {
         if (xQueueReceive(s_event_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (evt == COORD_EVENT_V1_TASK_EXITED || evt == COORD_EVENT_PROTOCOL_FAILED) {
                 ESP_LOGI(TAG, "V1 task exited cleanly");
-                return;
+                return true;
             }
         }
     }
-    ESP_LOGW(TAG, "V1 task did not exit within timeout");
+    ESP_LOGE(TAG,
+             "V1 task did not exit within timeout; restarting to avoid overlapping protocol tasks");
+    esp_restart();
+    return false;
 }
 
 // Tell the V2 task to shut down and wait for it to exit.
 // Only closes the transport socket to unblock V2's recv — does NOT destroy it.
 // The V2 task handles its own full cleanup (destroy, noise ctx, queue clear) on exit.
-static void stop_v2_task(GlobalState *gs)
+static bool stop_v2_task(GlobalState *gs)
 {
     s_v2_should_shutdown = true;
 
-    // Close transport to unblock V2's blocked recv()
-    if (gs->transport) {
-        esp_transport_close(gs->transport);
-    }
+    // Close transport to unblock V2's blocked recv(), serialized with share TX.
+    stratum_v2_interrupt_connection(gs);
 
     coordinator_event_t evt;
     for (int i = 0; i < 100; i++) {
         if (xQueueReceive(s_event_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (evt == COORD_EVENT_V2_TASK_EXITED || evt == COORD_EVENT_PROTOCOL_FAILED) {
                 ESP_LOGI(TAG, "V2 task exited cleanly");
-                return;
+                return true;
             }
         }
     }
-    ESP_LOGW(TAG, "V2 task did not exit within timeout");
+    ESP_LOGE(TAG,
+             "V2 task did not exit within timeout; restarting to avoid overlapping protocol tasks");
+    esp_restart();
+    return false;
 }
 
 // Stop the currently running protocol task
-static void stop_running_task(GlobalState *gs)
+static bool stop_running_task(GlobalState *gs)
 {
     if (s_running_protocol == STRATUM_PROTOCOL_V2) {
-        stop_v2_task(gs);
-    } else {
-        stop_v1_task(gs);
+        return stop_v2_task(gs);
     }
+    return stop_v1_task(gs);
 }
 
 // TCP connect probe (used for SV2 — full noise handshake is too expensive)
@@ -288,7 +290,7 @@ static bool probe_pool(GlobalState *gs, bool use_fallback)
 // The failed task has already exited (it sent PROTOCOL_FAILED then deleted itself).
 static void switch_to_fallback(GlobalState *gs)
 {
-    queue_clear(&gs->stratum_queue);
+    SYSTEM_clean_jobs_queue(gs);
     reset_share_stats(gs);
 
     gs->SYSTEM_MODULE.is_using_fallback = true;
@@ -311,9 +313,16 @@ static void switch_to_primary(GlobalState *gs)
 {
     ESP_LOGI(TAG, "Primary pool is back! Switching from fallback.");
 
-    stop_running_task(gs);
+    if (!stop_running_task(gs)) {
+        // Do not publish a replacement transport while the old task can still
+        // wake up and tear it down. The heartbeat will retry the switch after
+        // the old task reports its exit.
+        ESP_LOGW(TAG,
+                 "Deferring primary-pool switch until the current protocol task exits");
+        return;
+    }
 
-    queue_clear(&gs->stratum_queue);
+    SYSTEM_clean_jobs_queue(gs);
     reset_share_stats(gs);
 
     gs->SYSTEM_MODULE.is_using_fallback = false;
@@ -360,6 +369,7 @@ static int pool_failure_threshold(GlobalState *gs)
 // management cuts ASIC power, and park the coordinator until a probe succeeds.
 static void enter_paused_state(GlobalState *gs)
 {
+    SYSTEM_clean_jobs_queue(gs);
     s_state = COORD_STATE_PAUSED;
     gs->SYSTEM_MODULE.pools_unavailable = true;
     s_heartbeat_enabled = false;
@@ -380,7 +390,7 @@ static void resume_on_pool(GlobalState *gs, bool use_fallback)
     s_running_protocol = proto;
     s_state = use_fallback ? COORD_STATE_RUNNING_FALLBACK : COORD_STATE_RUNNING_PRIMARY;
 
-    queue_clear(&gs->stratum_queue);
+    SYSTEM_clean_jobs_queue(gs);
     reset_share_stats(gs);
 
     ESP_LOGI(TAG, "Pool recovery: %s pool reachable, resuming mining (%s)",
@@ -452,7 +462,7 @@ static void handle_event(GlobalState *gs, coordinator_event_t evt)
                 switch_to_fallback(gs);
             } else if (s_state == COORD_STATE_RUNNING_FALLBACK) {
                 ESP_LOGI(TAG, "Fallback failed, trying primary");
-                queue_clear(&gs->stratum_queue);
+                SYSTEM_clean_jobs_queue(gs);
                 reset_share_stats(gs);
                 gs->SYSTEM_MODULE.is_using_fallback = false;
                 gs->stratum_protocol = s_primary_protocol;

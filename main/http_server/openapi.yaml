@@ -220,6 +220,7 @@ components:
       type: object
       required:
         - ASICModel
+        - asicJobInterval
         - apEnabled
         - autofanspeed
         - bestDiff
@@ -322,6 +323,11 @@ components:
         ASICModel:
           type: string
           description: ASIC model identifier
+        asicJobInterval:
+          type: integer
+          description: Maximum uninterrupted ASIC job residency in milliseconds for version-rolling chips
+          minimum: 1000
+          maximum: 60000
         apEnabled:
           type: number
           description: Whether AP mode is enabled (0=no, 1=yes)
@@ -934,6 +940,13 @@ components:
           minimum: 1
           examples:
             - 850
+        asicJobInterval:
+          type: integer
+          description: Maximum uninterrupted ASIC job residency in milliseconds for version-rolling chips
+          minimum: 1000
+          maximum: 60000
+          examples:
+            - 30000
         frequency:
           type: integer
           description: ASIC frequency in MHz

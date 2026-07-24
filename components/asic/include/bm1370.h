@@ -24,7 +24,9 @@ typedef struct __attribute__((__packed__))
 } BM1370_job;
 
 uint8_t BM1370_init(GlobalState * GLOBAL_STATE);
-void BM1370_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job);
+// Takes ownership of next_bm_job only when true is returned.
+bool BM1370_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
+                      uint32_t expected_generation);
 void BM1370_set_version_mask(uint32_t version_mask);
 int BM1370_set_max_baud(void);
 int BM1370_set_default_baud(void);

@@ -9,11 +9,13 @@
 #include "protocol_coordinator.h"
 #include "connect.h"
 #include "work_queue.h"
+#include "asic_result_task.h"
 #include <esp_sntp.h>
 #include "esp_timer.h"
 #include "esp_transport.h"
 #include <stdbool.h>
 #include <string.h>
+#include <pthread.h>
 #include "utils.h"
 #include "coinbase_decoder.h"
 #include <esp_heap_caps.h>
@@ -43,6 +45,13 @@
 #define BUFFER_SIZE 1024
 
 static const char *TAG = "stratum_v1_task";
+static pthread_mutex_t v1_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t v1_extranonce_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void free_v1_queued_work(void *work)
+{
+    STRATUM_V1_free_mining_notify((mining_notify *)work);
+}
 
 static StratumApiV1Message stratum_api_v1_message = {};
 
@@ -66,16 +75,89 @@ static void stratum_v1_reset_uid(GlobalState *GLOBAL_STATE)
 void stratum_v1_close_connection(GlobalState *GLOBAL_STATE)
 {
     ESP_LOGE(TAG, "Shutting down socket and restarting...");
-    taskENTER_CRITICAL(&GLOBAL_STATE->stratum_mux);
+
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
     esp_transport_handle_t transport = GLOBAL_STATE->transport;
     GLOBAL_STATE->transport = NULL;
-    taskEXIT_CRITICAL(&GLOBAL_STATE->stratum_mux);
+    pthread_mutex_unlock(&v1_lifecycle_lock);
 
     if (transport != NULL) {
         esp_transport_close(transport);
+        esp_transport_destroy(transport);
     }
-    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
     vTaskDelay(1000 / portTICK_PERIOD_MS);
+}
+
+void stratum_v1_interrupt_connection(GlobalState *GLOBAL_STATE)
+{
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    if (GLOBAL_STATE->transport != NULL) {
+        esp_transport_close(GLOBAL_STATE->transport);
+    }
+    pthread_mutex_unlock(&v1_lifecycle_lock);
+}
+
+static void stratum_v1_clean_jobs(GlobalState *GLOBAL_STATE)
+{
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    pthread_mutex_unlock(&v1_lifecycle_lock);
+}
+
+bool stratum_v1_snapshot_extranonce(GlobalState *GLOBAL_STATE,
+                                    char **extranonce,
+                                    uint32_t *extranonce_2_len)
+{
+    if (extranonce == NULL || extranonce_2_len == NULL) {
+        return false;
+    }
+
+    pthread_mutex_lock(&v1_extranonce_lock);
+    char *copy = GLOBAL_STATE->extranonce_str != NULL
+                     ? strdup(GLOBAL_STATE->extranonce_str)
+                     : NULL;
+    uint32_t length = GLOBAL_STATE->extranonce_2_len;
+    pthread_mutex_unlock(&v1_extranonce_lock);
+
+    if (copy == NULL) {
+        return false;
+    }
+    *extranonce = copy;
+    *extranonce_2_len = length;
+    return true;
+}
+
+static void stratum_v1_replace_extranonce(GlobalState *GLOBAL_STATE,
+                                          char *extranonce,
+                                          uint32_t extranonce_2_len)
+{
+    pthread_mutex_lock(&v1_extranonce_lock);
+    char *old_extranonce = GLOBAL_STATE->extranonce_str;
+    GLOBAL_STATE->extranonce_str = extranonce;
+    GLOBAL_STATE->extranonce_2_len = extranonce_2_len;
+    pthread_mutex_unlock(&v1_extranonce_lock);
+    free(old_extranonce);
+}
+
+int stratum_v1_submit_share_safe(
+    GlobalState *GLOBAL_STATE, uint32_t expected_generation, int uid,
+    const char *user, const char *job_id, const char *extranonce_2,
+    uint32_t ntime, uint32_t nonce, uint32_t version_bits,
+    uint64_t *sent_time_us)
+{
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    if (expected_generation != ASIC_result_task_get_job_generation() ||
+        GLOBAL_STATE->transport == NULL) {
+        pthread_mutex_unlock(&v1_lifecycle_lock);
+        return -1;
+    }
+
+    int result = STRATUM_V1_submit_share(
+        GLOBAL_STATE->transport, uid, user, job_id, extranonce_2, ntime,
+        nonce, version_bits, sent_time_us);
+    pthread_mutex_unlock(&v1_lifecycle_lock);
+    return result;
 }
 
 static void decode_mining_notification(GlobalState * GLOBAL_STATE, const mining_notify *mining_notification)
@@ -176,9 +258,6 @@ void stratum_v1_task(void *pvParameters)
     char *stratum_url = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].url;
     uint16_t port = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].port;
 
-    // Set V1-specific free function for the work queue
-    GLOBAL_STATE->stratum_queue.free_fn = (void (*)(void *))STRATUM_V1_free_mining_notify;
-
     STRATUM_V1_initialize_buffer();
     int retry_attempts = 0;
     int retry_critical_attempts = 0;
@@ -188,8 +267,10 @@ void stratum_v1_task(void *pvParameters)
         // Check if coordinator wants us to shut down
         if (protocol_coordinator_v1_should_shutdown()) {
             ESP_LOGI(TAG, "Coordinator requested shutdown, exiting");
+            stratum_v1_close_connection(GLOBAL_STATE);
             protocol_coordinator_v1_exited();
             vTaskDelete(NULL);
+            return;
         }
 
         if (!GLOBAL_STATE->ASIC_initalized) {
@@ -233,9 +314,10 @@ void stratum_v1_task(void *pvParameters)
         char * cert = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].cert;
         retry_critical_attempts = 0;
 
-        GLOBAL_STATE->transport = STRATUM_V1_transport_init(tls, cert);
+        esp_transport_handle_t transport =
+            STRATUM_V1_transport_init(tls, cert);
         // Check if transport was initialized
-        if (GLOBAL_STATE->transport == NULL) {
+        if (transport == NULL) {
             ESP_LOGE(TAG, "Transport initialization failed.");
             if (++retry_critical_attempts > MAX_CRITICAL_RETRY_ATTEMPTS) {
                 ESP_LOGE(TAG, "Max retry attempts reached, restarting...");
@@ -250,23 +332,26 @@ void stratum_v1_task(void *pvParameters)
         // Use the already-resolved IP to avoid a second DNS lookup inside esp_transport_connect.
         // This prevents long DNS timeouts from blocking the lwIP stack and starving the HTTP server.
         if (tls != DISABLED) {
-            esp_transport_ssl_set_common_name(GLOBAL_STATE->transport, stratum_url);
+            esp_transport_ssl_set_common_name(transport, stratum_url);
         }
         ESP_LOGI(TAG, "Transport initialized, connecting to %s:%d (%s)", stratum_url, port, conn_info.host_ip);
-        esp_err_t ret = esp_transport_connect(GLOBAL_STATE->transport, conn_info.host_ip, port, TRANSPORT_TIMEOUT_MS);
+        esp_err_t ret = esp_transport_connect(
+            transport, conn_info.host_ip, port, TRANSPORT_TIMEOUT_MS);
         if (ret != ESP_OK) {
             retry_attempts++;
             ESP_LOGE(TAG, "Transport unable to connect to %s:%d (errno %d). Attempt: %d", stratum_url, port, ret, retry_attempts);
             // close the transport
-            esp_transport_close(GLOBAL_STATE->transport);
-            esp_transport_destroy(GLOBAL_STATE->transport);
-            GLOBAL_STATE->transport = NULL;
+            esp_transport_close(transport);
+            esp_transport_destroy(transport);
             // instead of restarting, retry this every 5 seconds
             vTaskDelay(5000 / portTICK_PERIOD_MS);
             continue;
         }
 
-        stratum_socket_set_options(GLOBAL_STATE->transport);
+        stratum_socket_set_options(transport);
+        pthread_mutex_lock(&v1_lifecycle_lock);
+        GLOBAL_STATE->transport = transport;
+        pthread_mutex_unlock(&v1_lifecycle_lock);
 
         const char *protocol = (conn_info.addr_family == AF_INET6) ? "IPv6" : "IPv4";
         const char *tls_status;
@@ -283,7 +368,7 @@ void stratum_v1_task(void *pvParameters)
                  "%s%s", protocol, tls_status);
 
         stratum_v1_reset_uid(GLOBAL_STATE);
-        SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+        stratum_v1_clean_jobs(GLOBAL_STATE);
 
         ///// Start Stratum Action
         // mining.configure - ID: 1
@@ -344,15 +429,24 @@ void stratum_v1_task(void *pvParameters)
                 case MINING_NOTIFY:
                     GLOBAL_STATE->SYSTEM_MODULE.work_received++;
                     SYSTEM_notify_new_ntime(GLOBAL_STATE, stratum_api_v1_message.mining_notification->ntime);
-                    if (stratum_api_v1_message.mining_notification->clean_jobs &&
-                        (GLOBAL_STATE->stratum_queue.count > 0)) {
-                        SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+                    if (stratum_api_v1_message.mining_notification->clean_jobs) {
+                        // A clean notification invalidates work already running on
+                        // the ASIC as well as work still waiting in the queue. Do
+                        // this even when the queue is empty: create_jobs_task
+                        // normally has the current item dequeued while it waits.
+                        stratum_v1_clean_jobs(GLOBAL_STATE);
                     }
-                    if (GLOBAL_STATE->stratum_queue.count == QUEUE_SIZE) {
-                        mining_notify *next_notify_json_str = (mining_notify *) queue_dequeue(&GLOBAL_STATE->stratum_queue);
-                        STRATUM_V1_free_mining_notify(next_notify_json_str);
-                    }
-                    queue_enqueue(&GLOBAL_STATE->stratum_queue, stratum_api_v1_message.mining_notification);
+                    // queue_enqueue performs the capacity check while holding the
+                    // queue lock. Avoid racing create_jobs_task via queue.count.
+                    queue_enqueue(
+                        &GLOBAL_STATE->stratum_queue,
+                        stratum_api_v1_message.mining_notification,
+                        (work_queue_item_metadata) {
+                            .generation =
+                                ASIC_result_task_get_pool_generation(),
+                            .kind = WORK_QUEUE_ITEM_STRATUM_V1,
+                            .free_fn = free_v1_queued_work,
+                        });
                     decode_mining_notification(GLOBAL_STATE, stratum_api_v1_message.mining_notification);
                     stratum_api_v1_message.mining_notification = NULL;
                     break;
@@ -382,6 +476,12 @@ void stratum_v1_task(void *pvParameters)
 
                 case MINING_SET_EXTRANONCE:
                 case STRATUM_RESULT_SUBSCRIBE:
+                    if (stratum_api_v1_message.method == MINING_SET_EXTRANONCE) {
+                        // A new extranonce1 changes every coinbase. Invalidate
+                        // both queued and device-resident jobs before publishing
+                        // it so retained work cannot mix the old and new values.
+                        stratum_v1_clean_jobs(GLOBAL_STATE);
+                    }
                     // Validate extranonce_2_len to prevent buffer overflow
                     if (stratum_api_v1_message.extranonce_2_len > MAX_EXTRANONCE_2_LEN) {
                         ESP_LOGW(TAG, "Extranonce_2_len %d exceeds maximum %d, clamping to maximum",
@@ -389,13 +489,11 @@ void stratum_v1_task(void *pvParameters)
                         stratum_api_v1_message.extranonce_2_len = MAX_EXTRANONCE_2_LEN;
                     }
                     ESP_LOGI(TAG, "Set extranonce: %s, extranonce_2_len: %d", stratum_api_v1_message.extranonce_str, stratum_api_v1_message.extranonce_2_len);
-                    {
-                        char *old_extranonce_str = GLOBAL_STATE->extranonce_str;
-                        GLOBAL_STATE->extranonce_str = stratum_api_v1_message.extranonce_str;
-                        stratum_api_v1_message.extranonce_str = NULL;
-                        GLOBAL_STATE->extranonce_2_len = stratum_api_v1_message.extranonce_2_len;
-                        free(old_extranonce_str);
-                    }
+                    stratum_v1_replace_extranonce(
+                        GLOBAL_STATE,
+                        stratum_api_v1_message.extranonce_str,
+                        stratum_api_v1_message.extranonce_2_len);
+                    stratum_api_v1_message.extranonce_str = NULL;
                     break;
 
                 case MINING_PING:

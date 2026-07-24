@@ -182,6 +182,11 @@ export class EditComponent implements OnInit, OnDestroy, OnChanges {
           ]],
           coreVoltage: [info.coreVoltage, [Validators.required]],
           frequency: [info.frequency, [Validators.required]],
+          asicJobInterval: [info.asicJobInterval, [
+            Validators.required,
+            Validators.min(1000),
+            Validators.max(60000)
+          ]],
           autofanspeed: [info.autofanspeed == 1, [Validators.required]],
           minfanspeed: [info.minFanSpeed, [Validators.required]],
           manualFanSpeed: [info.manualFanSpeed, [Validators.required]],
@@ -376,6 +381,7 @@ export class EditComponent implements OnInit, OnDestroy, OnChanges {
       'displayTimeout',
       'coreVoltage',
       'frequency',
+      'asicJobInterval',
       'autofanspeed',
       'manualFanSpeed',
       'temptarget',

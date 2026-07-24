@@ -1,6 +1,10 @@
 #ifndef SERIAL_H_
 #define SERIAL_H_
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 typedef enum
@@ -11,7 +15,13 @@ typedef enum
 
 #define UART_FREQ 115200
 
-int SERIAL_send(uint8_t *, int, bool);
+/**
+ * Queue one complete packet for UART transmission.
+ *
+ * A true return means the UART driver accepted every byte into its TX pipeline.
+ * It does not imply an application-level acknowledgement from the ASIC.
+ */
+bool SERIAL_send(const uint8_t *data, size_t len, bool debug);
 esp_err_t SERIAL_init(void);
 void SERIAL_debug_rx(void);
 int16_t SERIAL_rx(uint8_t *, uint16_t, uint16_t);

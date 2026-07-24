@@ -35,6 +35,8 @@ static GlobalState GLOBAL_STATE;
 
 static const char * TAG = "bitaxe";
 
+#define ASIC_TASK_CORE 1
+
 static void heap_alloc_failed_hook(size_t requested_size, uint32_t caps, const char *function_name)
 {
     if (caps & MALLOC_CAP_SPIRAM) {
@@ -208,13 +210,18 @@ void app_main(void)
             self_test_show_message(&GLOBAL_STATE, GLOBAL_STATE.SYSTEM_MODULE.asic_status);
             system_init_ret = ESP_FAIL;
         } else {
-            if (xTaskCreate(create_jobs_task, "stratum miner", 8192, (void *) &GLOBAL_STATE, 20, NULL) != pdPASS) {
+            if (xTaskCreatePinnedToCore(create_jobs_task, "stratum miner",
+                                        8192, (void *)&GLOBAL_STATE, 20,
+                                        NULL, ASIC_TASK_CORE) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating stratum miner task");
             }
-            if (xTaskCreate(ASIC_result_rx_task, "asic result rx", 4096, (void *) &GLOBAL_STATE, 18, NULL) != pdPASS) {
+            // Keep the latency-sensitive UART path on core 1. ESP-IDF's Wi-Fi
+            // task is pinned to core 0, so this prevents radio work and ASIC RX
+            // from preempting each other during bursts.
+            if (xTaskCreatePinnedToCore(ASIC_result_rx_task, "asic result rx", 4096, (void *) &GLOBAL_STATE, 18, NULL, ASIC_TASK_CORE) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating asic result rx task");
             }
-            if (xTaskCreate(ASIC_result_task, "asic result", 8192, (void *) &GLOBAL_STATE, 15, NULL) != pdPASS) {
+            if (xTaskCreatePinnedToCore(ASIC_result_task, "asic result", 8192, (void *) &GLOBAL_STATE, 15, NULL, ASIC_TASK_CORE) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating asic result task");
             }
 

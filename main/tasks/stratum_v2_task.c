@@ -14,6 +14,7 @@
 #include "mining.h"
 #include "stratum_api.h"
 #include "work_queue.h"
+#include "asic_result_task.h"
 #include "utils.h"
 #include "libbase58.h"
 #include "device_config.h"
@@ -22,12 +23,35 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #define MAX_RETRY_ATTEMPTS 3
 #define TRANSPORT_TIMEOUT_MS 5000
 #define SV2_MAX_FRAME_SIZE 8192
+#define SV2_MAX_EXTRANONCE_SIZE 32
 
 static const char *TAG = "stratum_v2_task";
+static pthread_mutex_t sv2_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void free_sv2_extended_queued_work(void *work)
+{
+    sv2_ext_job_free((sv2_ext_job_t *)work);
+}
+
+static void stratum_v2_free_pending_jobs(sv2_conn_t *conn)
+{
+    if (conn == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < SV2_PENDING_JOBS_SIZE; i++) {
+        conn->pending_jobs[i].valid = false;
+        if (conn->ext_pending_jobs[i] != NULL) {
+            sv2_ext_job_free(conn->ext_pending_jobs[i]);
+            conn->ext_pending_jobs[i] = NULL;
+        }
+    }
+}
 
 // Load authority pubkey from NVS (base58-encoded) into 32-byte buffer.
 // SV2 format: base58check(0x0001_LE + 32_byte_xonly_pubkey)
@@ -90,17 +114,53 @@ static sv2_channel_type_t sv2_select_channel_type(GlobalState *GLOBAL_STATE, boo
 void stratum_v2_close_connection(GlobalState *GLOBAL_STATE)
 {
     ESP_LOGE(TAG, "Shutting down SV2 connection and restarting...");
-    if (GLOBAL_STATE->sv2_noise_ctx) {
-        sv2_noise_destroy(GLOBAL_STATE->sv2_noise_ctx);
-        GLOBAL_STATE->sv2_noise_ctx = NULL;
-    }
-    if (GLOBAL_STATE->transport) {
-        esp_transport_close(GLOBAL_STATE->transport);
-        esp_transport_destroy(GLOBAL_STATE->transport);
-        GLOBAL_STATE->transport = NULL;
-    }
+
+    sv2_noise_ctx_t *noise_ctx;
+    esp_transport_handle_t transport;
+
+    // Serialize teardown with share submission. Invalidation happens while the
+    // lifecycle lock is held, so a result that passed an earlier stale check
+    // must re-check its generation before it can use a replacement connection.
+    pthread_mutex_lock(&sv2_lifecycle_lock);
     SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    stratum_v2_free_pending_jobs(GLOBAL_STATE->sv2_conn);
+    if (GLOBAL_STATE->sv2_conn != NULL) {
+        GLOBAL_STATE->sv2_conn->channel_opened = false;
+    }
+    noise_ctx = GLOBAL_STATE->sv2_noise_ctx;
+    transport = GLOBAL_STATE->transport;
+    GLOBAL_STATE->sv2_noise_ctx = NULL;
+    GLOBAL_STATE->transport = NULL;
+    GLOBAL_STATE->sv2_conn = NULL;
+    pthread_mutex_unlock(&sv2_lifecycle_lock);
+
+    if (noise_ctx != NULL) {
+        sv2_noise_destroy(noise_ctx);
+    }
+    if (transport != NULL) {
+        esp_transport_close(transport);
+        esp_transport_destroy(transport);
+    }
     vTaskDelay(1000 / portTICK_PERIOD_MS);
+}
+
+void stratum_v2_interrupt_connection(GlobalState *GLOBAL_STATE)
+{
+    pthread_mutex_lock(&sv2_lifecycle_lock);
+    if (GLOBAL_STATE->transport != NULL) {
+        esp_transport_close(GLOBAL_STATE->transport);
+    }
+    pthread_mutex_unlock(&sv2_lifecycle_lock);
+}
+
+static void stratum_v2_clean_jobs(GlobalState *GLOBAL_STATE)
+{
+    // Keep the generation change ordered with share submission. Once this
+    // returns, no submitter can have passed the old-generation check and still
+    // be waiting to write that stale share.
+    pthread_mutex_lock(&sv2_lifecycle_lock);
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    pthread_mutex_unlock(&sv2_lifecycle_lock);
 }
 
 // Track per-share submit timestamps for response time measurement.
@@ -133,9 +193,16 @@ static void stratum_v2_track_submit(GlobalState *GLOBAL_STATE, uint32_t sequence
 }
 
 int stratum_v2_submit_share(GlobalState *GLOBAL_STATE, uint32_t job_id, uint32_t nonce,
-                            uint32_t ntime, uint32_t version)
+                            uint32_t ntime, uint32_t version,
+                            uint32_t expected_generation)
 {
-    if (!GLOBAL_STATE->transport || !GLOBAL_STATE->sv2_conn || !GLOBAL_STATE->sv2_noise_ctx) {
+    pthread_mutex_lock(&sv2_lifecycle_lock);
+    if (expected_generation != ASIC_result_task_get_job_generation() ||
+        !GLOBAL_STATE->transport || !GLOBAL_STATE->sv2_conn ||
+        !GLOBAL_STATE->sv2_noise_ctx ||
+        !GLOBAL_STATE->sv2_conn->channel_opened ||
+        GLOBAL_STATE->sv2_conn->channel_type != SV2_CHANNEL_STANDARD) {
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
         return -1;
     }
 
@@ -147,17 +214,32 @@ int stratum_v2_submit_share(GlobalState *GLOBAL_STATE, uint32_t job_id, uint32_t
                                                 conn->channel_id,
                                                 sequence_number,
                                                 job_id, nonce, ntime, version);
-    if (len < 0) return -1;
+    if (len < 0) {
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
+        return -1;
+    }
 
     stratum_v2_track_submit(GLOBAL_STATE, sequence_number);
-    return sv2_noise_send(GLOBAL_STATE->sv2_noise_ctx, GLOBAL_STATE->transport, buf, len);
+    int result = sv2_noise_send(
+        GLOBAL_STATE->sv2_noise_ctx, GLOBAL_STATE->transport, buf, len);
+    pthread_mutex_unlock(&sv2_lifecycle_lock);
+    return result;
 }
 
 int stratum_v2_submit_share_extended(GlobalState *GLOBAL_STATE, uint32_t job_id,
                                      uint32_t nonce, uint32_t ntime, uint32_t version,
-                                     const uint8_t *extranonce, uint8_t extranonce_len)
+                                     const uint8_t *extranonce, uint8_t extranonce_len,
+                                     uint32_t expected_generation)
 {
-    if (!GLOBAL_STATE->transport || !GLOBAL_STATE->sv2_conn || !GLOBAL_STATE->sv2_noise_ctx) {
+    pthread_mutex_lock(&sv2_lifecycle_lock);
+    if (expected_generation != ASIC_result_task_get_job_generation() ||
+        !GLOBAL_STATE->transport || !GLOBAL_STATE->sv2_conn ||
+        !GLOBAL_STATE->sv2_noise_ctx ||
+        !GLOBAL_STATE->sv2_conn->channel_opened ||
+        GLOBAL_STATE->sv2_conn->channel_type != SV2_CHANNEL_EXTENDED ||
+        extranonce == NULL ||
+        extranonce_len != GLOBAL_STATE->sv2_conn->extranonce_size) {
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
         return -1;
     }
 
@@ -170,23 +252,62 @@ int stratum_v2_submit_share_extended(GlobalState *GLOBAL_STATE, uint32_t job_id,
                                                 sequence_number,
                                                 job_id, nonce, ntime, version,
                                                 extranonce, extranonce_len);
-    if (len < 0) return -1;
+    if (len < 0) {
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
+        return -1;
+    }
 
     stratum_v2_track_submit(GLOBAL_STATE, sequence_number);
-    return sv2_noise_send(GLOBAL_STATE->sv2_noise_ctx, GLOBAL_STATE->transport, buf, len);
+    int result = sv2_noise_send(
+        GLOBAL_STATE->sv2_noise_ctx, GLOBAL_STATE->transport, buf, len);
+    pthread_mutex_unlock(&sv2_lifecycle_lock);
+    return result;
 }
 
 bool stratum_v2_is_extended_channel(GlobalState *GLOBAL_STATE)
 {
-    return GLOBAL_STATE->sv2_conn &&
-           GLOBAL_STATE->sv2_conn->channel_type == SV2_CHANNEL_EXTENDED;
+    pthread_mutex_lock(&sv2_lifecycle_lock);
+    bool is_extended =
+        GLOBAL_STATE->sv2_conn &&
+        GLOBAL_STATE->sv2_conn->channel_type == SV2_CHANNEL_EXTENDED;
+    pthread_mutex_unlock(&sv2_lifecycle_lock);
+    return is_extended;
 }
 
-// Enqueue an sv2_job_t onto the stratum queue
-static void stratum_v2_enqueue_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
+bool stratum_v2_snapshot_extended_work(
+    GlobalState *GLOBAL_STATE, uint32_t expected_generation,
+    stratum_v2_extended_work_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return false;
+    }
+
+    pthread_mutex_lock(&sv2_lifecycle_lock);
+    sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
+    bool valid =
+        expected_generation == ASIC_result_task_get_job_generation() &&
+        conn != NULL && conn->channel_opened &&
+        conn->channel_type == SV2_CHANNEL_EXTENDED &&
+        conn->extranonce_prefix_len <= sizeof(snapshot->extranonce_prefix) &&
+        conn->extranonce_size <= 32;
+    if (valid) {
+        snapshot->extranonce_prefix_len = conn->extranonce_prefix_len;
+        snapshot->extranonce_size = conn->extranonce_size;
+        memcpy(snapshot->extranonce_prefix, conn->extranonce_prefix,
+               conn->extranonce_prefix_len);
+    }
+    pthread_mutex_unlock(&sv2_lifecycle_lock);
+    return valid;
+}
+
+// Enqueue an sv2_job_t onto the stratum queue. start_immediately controls
+// scheduling only; invalidating work from the previous prevhash is handled
+// explicitly by SetNewPrevHash.
+static void stratum_v2_enqueue_job(GlobalState *GLOBAL_STATE,
                                    uint32_t job_id, uint32_t version,
                                    const uint8_t merkle_root[32], const uint8_t prev_hash[32],
-                                   uint32_t ntime, uint32_t nbits, bool clean_jobs)
+                                   uint32_t ntime, uint32_t nbits,
+                                   bool start_immediately)
 {
     sv2_job_t *job = malloc(sizeof(sv2_job_t));
     if (!job) {
@@ -200,42 +321,51 @@ static void stratum_v2_enqueue_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
     memcpy(job->prev_hash, prev_hash, 32);
     job->ntime = ntime;
     job->nbits = nbits;
-    job->clean_jobs = clean_jobs;
+    // create_jobs_task uses this field to bypass its periodic refresh delay.
+    // In SV2, an active job (min_ntime present) must start immediately, but it
+    // does not by itself invalidate shares from the current prevhash.
+    job->clean_jobs = start_immediately;
 
     GLOBAL_STATE->SYSTEM_MODULE.work_received++;
 
     SYSTEM_notify_new_ntime(GLOBAL_STATE, ntime);
 
-    if (clean_jobs && (GLOBAL_STATE->stratum_queue.count > 0)) {
-        SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    if (start_immediately) {
+        // Keep only the newest active-now job. This is a queue-only operation:
+        // already-running jobs remain valid until SetNewPrevHash says otherwise.
+        queue_clear(&GLOBAL_STATE->stratum_queue);
     }
 
-    if (GLOBAL_STATE->stratum_queue.count == QUEUE_SIZE) {
-        void *old = queue_dequeue(&GLOBAL_STATE->stratum_queue);
-        free(old);
-    }
-
-    queue_enqueue(&GLOBAL_STATE->stratum_queue, job);
+    queue_enqueue(
+        &GLOBAL_STATE->stratum_queue, job,
+        (work_queue_item_metadata) {
+            .generation = ASIC_result_task_get_pool_generation(),
+            .kind = WORK_QUEUE_ITEM_STRATUM_V2_STANDARD,
+            .free_fn = free,
+        });
 }
 
-// Enqueue an sv2_ext_job_t onto the stratum queue (extended channels)
-static void stratum_v2_enqueue_ext_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
+// Enqueue an sv2_ext_job_t onto the stratum queue (extended channels).
+static void stratum_v2_enqueue_ext_job(GlobalState *GLOBAL_STATE,
                                         sv2_ext_job_t *job)
 {
     GLOBAL_STATE->SYSTEM_MODULE.work_received++;
 
     SYSTEM_notify_new_ntime(GLOBAL_STATE, job->ntime);
 
-    if (job->clean_jobs && (GLOBAL_STATE->stratum_queue.count > 0)) {
-        SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    if (job->clean_jobs) {
+        // min_ntime makes this job active immediately. Replace queued work,
+        // without invalidating results from jobs on the same prevhash.
+        queue_clear(&GLOBAL_STATE->stratum_queue);
     }
 
-    if (GLOBAL_STATE->stratum_queue.count == QUEUE_SIZE) {
-        void *old = queue_dequeue(&GLOBAL_STATE->stratum_queue);
-        sv2_ext_job_free((sv2_ext_job_t *)old);
-    }
-
-    queue_enqueue(&GLOBAL_STATE->stratum_queue, job);
+    queue_enqueue(
+        &GLOBAL_STATE->stratum_queue, job,
+        (work_queue_item_metadata) {
+            .generation = ASIC_result_task_get_pool_generation(),
+            .kind = WORK_QUEUE_ITEM_STRATUM_V2_EXTENDED,
+            .free_fn = free_sv2_extended_queued_work,
+        });
 }
 
 // Decode coinbase from extended job prefix/suffix by converting to hex and reusing V1 decoder
@@ -408,7 +538,7 @@ static void stratum_v2_handle_new_extended_mining_job(GlobalState *GLOBAL_STATE,
             memcpy(job->prev_hash, conn->prev_hash, 32);
             job->nbits = conn->prev_hash_nbits;
             job->clean_jobs = true;
-            stratum_v2_enqueue_ext_job(GLOBAL_STATE, conn, job);
+            stratum_v2_enqueue_ext_job(GLOBAL_STATE, job);
         } else {
             // Store as pending until we get SetNewPrevHash
             if (conn->ext_pending_jobs[slot]) {
@@ -447,7 +577,7 @@ static void stratum_v2_handle_new_mining_job(GlobalState *GLOBAL_STATE, sv2_conn
 
     if (has_min_ntime) {
         if (conn->has_prev_hash) {
-            stratum_v2_enqueue_job(GLOBAL_STATE, conn, job_id, version, merkle_root,
+            stratum_v2_enqueue_job(GLOBAL_STATE, job_id, version, merkle_root,
                                    conn->prev_hash, min_ntime,
                                    conn->prev_hash_nbits, true);
         } else {
@@ -482,8 +612,6 @@ static void stratum_v2_handle_set_new_prev_hash(GlobalState *GLOBAL_STATE, sv2_c
     GLOBAL_STATE->network_nonce_diff = (uint64_t) networkDifficulty(nbits);
     suffixString(GLOBAL_STATE->network_nonce_diff, GLOBAL_STATE->network_diff_string, DIFF_STRING_SIZE, 0);
 
-    bool first_prev_hash = !conn->has_prev_hash;
-
     memcpy(conn->prev_hash, prev_hash, 32);
     conn->prev_hash_ntime = min_ntime;
     conn->prev_hash_nbits = nbits;
@@ -491,54 +619,50 @@ static void stratum_v2_handle_set_new_prev_hash(GlobalState *GLOBAL_STATE, sv2_c
 
     int slot = job_id % SV2_PENDING_JOBS_SIZE;
 
-    // Resolve standard channel pending jobs
+    // SetNewPrevHash is the SV2 clean-work event. Only its referenced job is
+    // valid, so invalidate queued/running ASIC work even if that job is missing
+    // from our pending ring.
+    stratum_v2_clean_jobs(GLOBAL_STATE);
+
+    // Snapshot the referenced jobs before invalidating every pending entry.
+    sv2_pending_job_t selected_job = {0};
     if (conn->pending_jobs[slot].valid && conn->pending_jobs[slot].job_id == job_id) {
-        stratum_v2_enqueue_job(GLOBAL_STATE, conn, job_id,
-                               conn->pending_jobs[slot].version,
-                               conn->pending_jobs[slot].merkle_root,
+        selected_job = conn->pending_jobs[slot];
+    }
+
+    sv2_ext_job_t *selected_ext_job = NULL;
+    if (conn->ext_pending_jobs[slot] &&
+        conn->ext_pending_jobs[slot]->job_id == job_id) {
+        selected_ext_job = conn->ext_pending_jobs[slot];
+    }
+
+    for (int i = 0; i < SV2_PENDING_JOBS_SIZE; i++) {
+        conn->pending_jobs[i].valid = false;
+
+        sv2_ext_job_t *pending_ext_job = conn->ext_pending_jobs[i];
+        conn->ext_pending_jobs[i] = NULL;
+        if (pending_ext_job != NULL && pending_ext_job != selected_ext_job) {
+            sv2_ext_job_free(pending_ext_job);
+        }
+    }
+
+    if (selected_job.valid) {
+        stratum_v2_enqueue_job(GLOBAL_STATE, job_id,
+                               selected_job.version,
+                               selected_job.merkle_root,
                                prev_hash, min_ntime, nbits, true);
-        conn->pending_jobs[slot].valid = false;
     }
 
-    if (first_prev_hash) {
-        for (int i = 0; i < SV2_PENDING_JOBS_SIZE; i++) {
-            if (conn->pending_jobs[i].valid && conn->pending_jobs[i].job_id != job_id) {
-                ESP_LOGD(TAG, "Enqueuing pending future job %lu with first prev_hash",
-                         conn->pending_jobs[i].job_id);
-                stratum_v2_enqueue_job(GLOBAL_STATE, conn, conn->pending_jobs[i].job_id,
-                                       conn->pending_jobs[i].version,
-                                       conn->pending_jobs[i].merkle_root,
-                                       prev_hash, min_ntime, nbits, true);
-                conn->pending_jobs[i].valid = false;
-            }
-        }
+    if (selected_ext_job != NULL) {
+        memcpy(selected_ext_job->prev_hash, prev_hash, 32);
+        selected_ext_job->ntime = min_ntime;
+        selected_ext_job->nbits = nbits;
+        selected_ext_job->clean_jobs = true;
+        stratum_v2_enqueue_ext_job(GLOBAL_STATE, selected_ext_job);
     }
 
-    // Resolve extended channel pending jobs
-    if (conn->ext_pending_jobs[slot] && conn->ext_pending_jobs[slot]->job_id == job_id) {
-        sv2_ext_job_t *ext_job = conn->ext_pending_jobs[slot];
-        conn->ext_pending_jobs[slot] = NULL;
-        memcpy(ext_job->prev_hash, prev_hash, 32);
-        ext_job->ntime = min_ntime;
-        ext_job->nbits = nbits;
-        ext_job->clean_jobs = true;
-        stratum_v2_enqueue_ext_job(GLOBAL_STATE, conn, ext_job);
-    }
-
-    if (first_prev_hash) {
-        for (int i = 0; i < SV2_PENDING_JOBS_SIZE; i++) {
-            if (conn->ext_pending_jobs[i] && conn->ext_pending_jobs[i]->job_id != job_id) {
-                sv2_ext_job_t *ext_job = conn->ext_pending_jobs[i];
-                conn->ext_pending_jobs[i] = NULL;
-                ESP_LOGD(TAG, "Enqueuing pending ext future job %lu with first prev_hash",
-                         ext_job->job_id);
-                memcpy(ext_job->prev_hash, prev_hash, 32);
-                ext_job->ntime = min_ntime;
-                ext_job->nbits = nbits;
-                ext_job->clean_jobs = true;
-                stratum_v2_enqueue_ext_job(GLOBAL_STATE, conn, ext_job);
-            }
-        }
+    if (!selected_job.valid && selected_ext_job == NULL) {
+        ESP_LOGW(TAG, "SetNewPrevHash references unknown job %lu", job_id);
     }
 }
 
@@ -569,13 +693,6 @@ void stratum_v2_task(void *pvParameters)
     bool use_fallback_init = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback;
     sv2_channel_type_t channel_type = sv2_select_channel_type(GLOBAL_STATE, use_fallback_init);
 
-    // Set V2-specific free function for the work queue
-    if (channel_type == SV2_CHANNEL_EXTENDED) {
-        GLOBAL_STATE->stratum_queue.free_fn = (void (*)(void *))sv2_ext_job_free;
-    } else {
-        GLOBAL_STATE->stratum_queue.free_fn = free;
-    }
-
     // Set default version mask for version rolling
     GLOBAL_STATE->version_mask = STRATUM_DEFAULT_VERSION_MASK;
     GLOBAL_STATE->new_stratum_version_rolling_msg = true;
@@ -588,8 +705,6 @@ void stratum_v2_task(void *pvParameters)
         vTaskDelete(NULL);
         return;
     }
-    GLOBAL_STATE->sv2_conn = conn;
-
     uint8_t *frame_buf = heap_caps_malloc(SV2_MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
     uint8_t *recv_buf = heap_caps_malloc(SV2_MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
 
@@ -598,7 +713,6 @@ void stratum_v2_task(void *pvParameters)
         free(frame_buf);
         free(recv_buf);
         free(conn);
-        GLOBAL_STATE->sv2_conn = NULL;
         protocol_coordinator_notify_failure();
         vTaskDelete(NULL);
         return;
@@ -622,7 +736,6 @@ void stratum_v2_task(void *pvParameters)
             free(frame_buf);
             free(recv_buf);
             free(conn);
-            GLOBAL_STATE->sv2_conn = NULL;
             protocol_coordinator_v2_exited();
             vTaskDelete(NULL);
             return;
@@ -642,7 +755,6 @@ void stratum_v2_task(void *pvParameters)
             free(frame_buf);
             free(recv_buf);
             free(conn);
-            GLOBAL_STATE->sv2_conn = NULL;
             // Send only failure event — coordinator knows the task exited because it failed
             protocol_coordinator_notify_failure();
             vTaskDelete(NULL);
@@ -692,13 +804,18 @@ void stratum_v2_task(void *pvParameters)
 
         ESP_LOGI(TAG, "TCP connected to %s:%d (%s)", stratum_url, port, conn_info.host_ip);
 
+        pthread_mutex_lock(&sv2_lifecycle_lock);
         GLOBAL_STATE->transport = transport;
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
         stratum_socket_set_options(transport);
 
         // Reset connection state
         memset(conn, 0, sizeof(*conn));
+        conn->channel_type = channel_type;
+        pthread_mutex_lock(&sv2_lifecycle_lock);
         GLOBAL_STATE->sv2_conn = conn;
         stratum_v2_update_pending_shares(GLOBAL_STATE);
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
 
         // --- Noise Handshake ---
         ESP_LOGI(TAG, "Starting Noise handshake (Noise_NX_Secp256k1+EllSwift_ChaChaPoly_SHA256)");
@@ -712,7 +829,9 @@ void stratum_v2_task(void *pvParameters)
             retry_attempts++;
             continue;
         }
+        pthread_mutex_lock(&sv2_lifecycle_lock);
         GLOBAL_STATE->sv2_noise_ctx = noise_ctx;
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
 
         // Load the optional authority pubkey and whether this pool requires it
         uint8_t auth_key[32];
@@ -770,7 +889,6 @@ void stratum_v2_task(void *pvParameters)
         int payload_len;
 
         // Select channel type and set connection state
-        conn->channel_type = channel_type;
         uint32_t setup_flags = (channel_type == SV2_CHANNEL_STANDARD) ? 0x01 : 0x00;
 
         // 1. Send SetupConnection
@@ -900,6 +1018,15 @@ void stratum_v2_task(void *pvParameters)
                     continue;
                 }
 
+                if (extranonce_size > SV2_MAX_EXTRANONCE_SIZE) {
+                    ESP_LOGE(TAG,
+                             "Pool extranonce size %u exceeds supported maximum %u",
+                             extranonce_size, SV2_MAX_EXTRANONCE_SIZE);
+                    stratum_v2_close_connection(GLOBAL_STATE);
+                    retry_attempts++;
+                    continue;
+                }
+
                 conn->extranonce_size = (uint8_t)extranonce_size;
                 conn->extranonce_prefix_len = extranonce_prefix_len;
                 memcpy(conn->extranonce_prefix, extranonce_prefix, extranonce_prefix_len);
@@ -922,8 +1049,12 @@ void stratum_v2_task(void *pvParameters)
             }
 
             conn->channel_id = channel_id;
-            conn->channel_opened = true;
             memcpy(conn->target, target, 32);
+            // Publish readiness only after every field used by share submission
+            // has been initialized. Submitters acquire the same mutex.
+            pthread_mutex_lock(&sv2_lifecycle_lock);
+            conn->channel_opened = true;
+            pthread_mutex_unlock(&sv2_lifecycle_lock);
 
             double pdiff = hash_to_pdiff(target);
             GLOBAL_STATE->pool_difficulty = pdiff;
@@ -1030,9 +1161,9 @@ void stratum_v2_task(void *pvParameters)
     }
 
     // Should not reach here, but clean up just in case
+    stratum_v2_close_connection(GLOBAL_STATE);
     free(frame_buf);
     free(recv_buf);
     free(conn);
-    GLOBAL_STATE->sv2_conn = NULL;
     vTaskDelete(NULL);
 }

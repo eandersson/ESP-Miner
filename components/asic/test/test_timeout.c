@@ -1,6 +1,7 @@
 #include "unity.h"
 
 #include "asic_common.h"
+#include "mining.h"
 
 TEST_CASE("Check asic timeout 1x BM1397", "[common]")
 {
@@ -16,6 +17,21 @@ TEST_CASE("Check asic timeout 1x BM1397", "[common]")
     double expected_ms = 27.962;
 
     TEST_ASSERT_FLOAT_WITHIN(0.01, expected_ms, timeout_ms);
+}
+
+TEST_CASE("BM1397 single-midstate interval tracks its smaller search", "[common]")
+{
+    double timeout_ms = calculate_bm_timeout_ms(
+        450.0f, 1, 672, 168, 1, 1.0f, 20.0);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 9.320, timeout_ms);
+}
+
+TEST_CASE("BM1397 uses only established distinct midstate packet sizes", "[common]")
+{
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_midstate_count(0));
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_midstate_count(0x00002000));
+    TEST_ASSERT_EQUAL_UINT32(4, version_mask_midstate_count(0x00006000));
+    TEST_ASSERT_EQUAL_UINT32(4, version_mask_midstate_count(0x1fffe000));
 }
 
 TEST_CASE("Check asic timeout 2x BM1370", "[common]")
@@ -98,11 +114,20 @@ TEST_CASE("HCN calculation rejects invalid frequency", "[common]")
     TEST_ASSERT_EQUAL_UINT32(0, calculate_bm_hcn(0.0f, 1, 128, 1.0, 25.0, 0.0));
 }
 
-TEST_CASE("Version-rolling job interval preserves refresh cap", "[common]")
+TEST_CASE("Version-rolling job interval preserves configured residency cap", "[common]")
 {
     double interval_ms = calculate_bm_job_interval_ms(
-        525.0f, 2, 2040, 128, 65536, 250.0);
-    TEST_ASSERT_DOUBLE_WITHIN(0.01, 250.0, interval_ms);
+        525.0f, 2, 2040, 128, 65536, 30000.0);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 30000.0, interval_ms);
+}
+
+TEST_CASE("Multi-chip interval is capped once after topology-adjusted scan", "[common]")
+{
+    // Six BM1368 chips still have about 35 seconds of version+nonce space.
+    // The 30-second residency cap must not be divided by the chip count again.
+    double interval_ms = calculate_bm_job_interval_ms(
+        490.0f, 6, 1276, 80, 65536, 30000.0);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 30000.0, interval_ms);
 }
 
 TEST_CASE("Job interval never exceeds calculated scan time", "[common]")

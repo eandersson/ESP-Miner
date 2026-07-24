@@ -60,6 +60,7 @@ const mockSystemInfo: ISystemInfo = {
   coreVoltageActual: 1.2,
   current: 0,
   coreVoltage: 0,
+  asicJobInterval: 30000,
   maxPower: 20,
   poolConnectionInfo: 'Connected',
   responseTime: 45,

@@ -48,6 +48,10 @@ typedef struct task_result
     // -- job result response
     uint8_t job_id;
     uint32_t nonce;
+    // Raw version information from the ASIC. The RX task combines this with
+    // the job snapshot so the decoded version and job metadata are atomic.
+    uint32_t version_bits;
+    uint8_t version_rolling_index;
     uint32_t rolled_version;
     // ---- register response
     register_type_t register_type;

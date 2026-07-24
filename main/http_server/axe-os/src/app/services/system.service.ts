@@ -77,6 +77,7 @@ export class SystemApiService {
         maxAllocHeap: 90000,
         coreVoltage: 1200,
         coreVoltageActual: 1200,
+        asicJobInterval: 30000,
         hostname: "Bitaxe",
         macAddr: "2C:54:91:88:C9:E3",
         ssid: "default",

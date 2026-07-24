@@ -16,6 +16,9 @@
 #include "asic_reset.h"
 #include "device_config.h"
 #include "hashrate_monitor_task.h"
+#include "asic_result_task.h"
+#include "work_queue.h"
+#include "stratum_api.h"
 #include "PID.h"
 #include "self_test.h"
 #include "stratum_api.h"
@@ -45,6 +48,11 @@
 #define DIFFICULTY 16
 
 static const char * TAG = "self_test";
+
+static void free_self_test_queued_work(void *work)
+{
+    STRATUM_V1_free_mining_notify((mining_notify *)work);
+}
 
 static SemaphoreHandle_t longPressSemaphore;
 static bool isFactoryTest = false;
@@ -527,7 +535,14 @@ void self_test_task(void * pvParameters)
 
     if (msg.method == MINING_NOTIFY) {
         ESP_LOGI(TAG, "Enqueuing mock work into stratum_queue");
-        queue_enqueue(&GLOBAL_STATE->stratum_queue, msg.mining_notification);
+        queue_enqueue(&GLOBAL_STATE->stratum_queue,
+                      msg.mining_notification,
+                      (work_queue_item_metadata) {
+                          .generation =
+                              ASIC_result_task_get_pool_generation(),
+                          .kind = WORK_QUEUE_ITEM_STRATUM_V1,
+                          .free_fn = free_self_test_queued_work,
+                      });
     } else {
         ESP_LOGE(TAG, "Failed to parse mock mining notification");
         tests_done(GLOBAL_STATE, false);

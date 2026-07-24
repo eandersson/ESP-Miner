@@ -22,7 +22,8 @@
 
 static const char *TAG = "asic_result";
 
-#define ASIC_RESULT_QUEUE_LENGTH 32
+#define ASIC_RESULT_QUEUE_LENGTH 64
+#define ASIC_RESULT_DEDUP_CACHE_SIZE 64
 
 typedef struct
 {
@@ -33,16 +34,30 @@ typedef struct
     stratum_protocol_t protocol;
 } queued_asic_result_t;
 
+typedef struct
+{
+    uint64_t job_fingerprint;
+    uint32_t generation;
+    uint32_t nonce;
+    uint32_t rolled_version;
+    uint8_t job_id;
+    bool valid;
+} recent_asic_result_t;
+
 static QueueHandle_t asic_result_queue;
 static atomic_uint_fast32_t job_generation;
+static atomic_uint_fast32_t pool_generation;
 static atomic_uint_fast32_t enqueued_result_count;
 static atomic_uint_fast32_t processed_result_count;
 static atomic_uint_fast32_t dropped_result_count;
 static atomic_uint_fast32_t invalid_job_count;
 static atomic_uint_fast32_t stale_result_count;
+static atomic_uint_fast32_t duplicate_result_count;
 static atomic_uint_fast32_t metadata_failure_count;
 static atomic_uint_fast32_t queue_high_watermark;
 static atomic_uint_fast32_t max_queue_latency_ms;
+static recent_asic_result_t recent_results[ASIC_RESULT_DEDUP_CACHE_SIZE];
+static size_t recent_result_index;
 
 static void free_queued_result(queued_asic_result_t *queued_result)
 {
@@ -77,6 +92,61 @@ static void update_atomic_max(atomic_uint_fast32_t *maximum, uint32_t value)
     }
 }
 
+static uint64_t fingerprint_bytes(uint64_t hash, const void *data, size_t length)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    for (size_t i = 0; i < length; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t fingerprint_job(const bm_job *job)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    hash = fingerprint_bytes(hash, &job->ntime, sizeof(job->ntime));
+    hash = fingerprint_bytes(hash, &job->version, sizeof(job->version));
+    hash = fingerprint_bytes(hash, &job->target, sizeof(job->target));
+    if (job->jobid != NULL) {
+        hash = fingerprint_bytes(hash, job->jobid, strlen(job->jobid));
+    }
+    if (job->extranonce2 != NULL) {
+        hash = fingerprint_bytes(hash, job->extranonce2, strlen(job->extranonce2));
+    }
+    return hash;
+}
+
+static bool is_duplicate_result(const queued_asic_result_t *queued_result)
+{
+    const task_result *result = &queued_result->result;
+    uint64_t job_fingerprint = fingerprint_job(&queued_result->job);
+
+    for (size_t i = 0; i < ASIC_RESULT_DEDUP_CACHE_SIZE; i++) {
+        const recent_asic_result_t *recent = &recent_results[i];
+        if (recent->valid &&
+            recent->generation == queued_result->generation &&
+            recent->job_id == result->job_id &&
+            recent->nonce == result->nonce &&
+            recent->rolled_version == result->rolled_version &&
+            recent->job_fingerprint == job_fingerprint) {
+            return true;
+        }
+    }
+
+    recent_results[recent_result_index] = (recent_asic_result_t) {
+        .job_fingerprint = job_fingerprint,
+        .generation = queued_result->generation,
+        .nonce = result->nonce,
+        .rolled_version = result->rolled_version,
+        .job_id = result->job_id,
+        .valid = true,
+    };
+    recent_result_index =
+        (recent_result_index + 1) % ASIC_RESULT_DEDUP_CACHE_SIZE;
+    return false;
+}
+
 static void log_result_metrics(void)
 {
     static int64_t last_log_us;
@@ -89,17 +159,19 @@ static void log_result_metrics(void)
     asic_rx_stats_t rx_stats;
     get_work_rx_stats(&rx_stats);
     ESP_LOGI(TAG,
-             "RX metrics: frames=%lu crc=%lu discarded=%lu uart_err=%lu "
-             "queued=%lu processed=%lu dropped=%lu stale=%lu invalid=%lu "
-             "metadata_err=%lu queue_peak=%lu latency_max=%lums",
+             "RX metrics: frames=%lu crc=%lu discarded=%lu timeouts=%lu uart_err=%lu "
+             "queued=%lu processed=%lu dropped=%lu stale=%lu duplicate=%lu "
+             "invalid=%lu metadata_err=%lu queue_peak=%lu latency_max=%lums",
              (unsigned long)rx_stats.frames_received,
              (unsigned long)rx_stats.crc_errors,
              (unsigned long)rx_stats.discarded_bytes,
+             (unsigned long)rx_stats.timeouts,
              (unsigned long)rx_stats.uart_errors,
              (unsigned long)atomic_load(&enqueued_result_count),
              (unsigned long)atomic_load(&processed_result_count),
              (unsigned long)atomic_load(&dropped_result_count),
              (unsigned long)atomic_load(&stale_result_count),
+             (unsigned long)atomic_load(&duplicate_result_count),
              (unsigned long)atomic_load(&invalid_job_count),
              (unsigned long)atomic_load(&metadata_failure_count),
              (unsigned long)atomic_load(&queue_high_watermark),
@@ -119,14 +191,18 @@ esp_err_t ASIC_result_task_init(void)
     }
 
     atomic_init(&job_generation, 1);
+    atomic_init(&pool_generation, 1);
     atomic_init(&enqueued_result_count, 0);
     atomic_init(&processed_result_count, 0);
     atomic_init(&dropped_result_count, 0);
     atomic_init(&invalid_job_count, 0);
     atomic_init(&stale_result_count, 0);
+    atomic_init(&duplicate_result_count, 0);
     atomic_init(&metadata_failure_count, 0);
     atomic_init(&queue_high_watermark, 0);
     atomic_init(&max_queue_latency_ms, 0);
+    memset(recent_results, 0, sizeof(recent_results));
+    recent_result_index = 0;
     return ESP_OK;
 }
 
@@ -134,6 +210,22 @@ void ASIC_result_task_invalidate_jobs(void)
 {
     atomic_fetch_add(&job_generation, 1);
     drain_result_queue();
+}
+
+void ASIC_result_task_invalidate_pool_jobs(void)
+{
+    atomic_fetch_add(&pool_generation, 1);
+    ASIC_result_task_invalidate_jobs();
+}
+
+uint32_t ASIC_result_task_get_job_generation(void)
+{
+    return (uint32_t)atomic_load(&job_generation);
+}
+
+uint32_t ASIC_result_task_get_pool_generation(void)
+{
+    return (uint32_t)atomic_load(&pool_generation);
 }
 
 void ASIC_result_task_reset(void)
@@ -165,8 +257,6 @@ void ASIC_result_rx_task(void *pvParameters)
         queued_asic_result_t queued_result = {
             .result = *asic_result,
             .has_job = false,
-            .generation = (uint32_t)atomic_load(&job_generation),
-            .protocol = GLOBAL_STATE->stratum_protocol,
         };
 
         if (asic_result->register_type == REGISTER_INVALID) {
@@ -179,16 +269,39 @@ void ASIC_result_rx_task(void *pvParameters)
             bool valid = (GLOBAL_STATE->valid_jobs[job_id] != 0) &&
                          (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id] != NULL);
             if (valid) {
-                queued_result.job = *GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id];
+                const bm_job *active_job =
+                    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id];
+                queued_result.job = *active_job;
                 queued_result.job.jobid = queued_result.job.jobid ? strdup(queued_result.job.jobid) : NULL;
                 queued_result.job.extranonce2 = queued_result.job.extranonce2 ? strdup(queued_result.job.extranonce2) : NULL;
                 queued_result.has_job = true;
+                queued_result.generation =
+                    (uint32_t)atomic_load(&job_generation);
+                queued_result.protocol = GLOBAL_STATE->stratum_protocol;
+
+                // Resolve the rolled version from the same locked job snapshot
+                // used for nonce validation. This avoids pairing version data
+                // from an old slot with metadata from a newly reused slot.
+                if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id == BM1397) {
+                    queued_result.result.rolled_version =
+                        queued_result.job.version;
+                    for (uint8_t i = 0;
+                         i < queued_result.result.version_rolling_index; i++) {
+                        queued_result.result.rolled_version = increment_bitmask(
+                            queued_result.result.rolled_version,
+                            queued_result.job.version_mask);
+                    }
+                } else {
+                    queued_result.result.rolled_version =
+                        queued_result.job.version |
+                        queued_result.result.version_bits;
+                }
             }
             pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
             if (!valid) {
                 atomic_fetch_add(&invalid_job_count, 1);
-                ESP_LOGW(TAG, "Invalid job nonce found, 0x%02X", job_id);
+                ESP_LOGD(TAG, "Invalid job nonce found, 0x%02X", job_id);
                 continue;
             }
             if (queued_result.job.jobid == NULL || queued_result.job.extranonce2 == NULL) {
@@ -197,6 +310,10 @@ void ASIC_result_rx_task(void *pvParameters)
                 free_queued_result(&queued_result);
                 continue;
             }
+        } else {
+            queued_result.generation =
+                (uint32_t)atomic_load(&job_generation);
+            queued_result.protocol = GLOBAL_STATE->stratum_protocol;
         }
 
         if (xQueueSend(asic_result_queue, &queued_result, 0) != pdTRUE) {
@@ -246,7 +363,12 @@ void ASIC_result_task(void *pvParameters)
             continue;
         }
 
-        uint8_t job_id = asic_result->job_id;
+        if (is_duplicate_result(&queued_result)) {
+            atomic_fetch_add(&duplicate_result_count, 1);
+            free_queued_result(&queued_result);
+            continue;
+        }
+
         bm_job *active_job = &queued_result.job;
         // check the nonce difficulty
         double nonce_diff = test_nonce_value(active_job, asic_result->nonce, asic_result->rolled_version);
@@ -272,22 +394,36 @@ void ASIC_result_task(void *pvParameters)
                 uint32_t sv2_job_id = (uint32_t)strtoul(active_job->jobid, NULL, 10);
 
                 if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
-                    sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
                     // SV2 spec: extranonce_size is the miner's rollable portion.
                     // The pool prepends its extranonce_prefix separately.
-                    uint8_t en2_len = conn->extranonce_size;
+                    size_t en2_hex_len = strlen(active_job->extranonce2);
+                    if ((en2_hex_len & 1U) != 0 ||
+                        en2_hex_len / 2U > 32U) {
+                        ESP_LOGW(TAG, "Invalid SV2 extranonce metadata length %u",
+                                 (unsigned int)en2_hex_len);
+                        free_queued_result(&queued_result);
+                        continue;
+                    }
+                    uint8_t en2_len = (uint8_t)(en2_hex_len / 2U);
                     uint8_t extranonce_2[32];
-                    hex2bin(active_job->extranonce2, extranonce_2, en2_len);
+                    if (hex2bin(active_job->extranonce2, extranonce_2,
+                                en2_len) != en2_len) {
+                        ESP_LOGW(TAG, "Invalid SV2 extranonce metadata");
+                        free_queued_result(&queued_result);
+                        continue;
+                    }
                     ret = stratum_v2_submit_share_extended(GLOBAL_STATE, sv2_job_id,
                                                            asic_result->nonce,
                                                            active_job->ntime,
                                                            asic_result->rolled_version,
-                                                           extranonce_2, en2_len);
+                                                           extranonce_2, en2_len,
+                                                           queued_result.generation);
                 } else {
                     ret = stratum_v2_submit_share(GLOBAL_STATE, sv2_job_id,
                                                    asic_result->nonce,
                                                    active_job->ntime,
-                                                   asic_result->rolled_version);
+                                                   asic_result->rolled_version,
+                                                   queued_result.generation);
                 }
 
                 if (ret < 0) {
@@ -300,30 +436,20 @@ void ASIC_result_task(void *pvParameters)
                 char * user = GLOBAL_STATE->SYSTEM_MODULE.pools[active_idx].user;
 
                 taskENTER_CRITICAL(&GLOBAL_STATE->stratum_mux);
-                esp_transport_handle_t transport = GLOBAL_STATE->transport;
                 int uid = GLOBAL_STATE->send_uid++;
                 taskEXIT_CRITICAL(&GLOBAL_STATE->stratum_mux);
 
-                if (transport == NULL) {
-                    ESP_LOGW(TAG, "No stratum connection, dropping share (job 0x%02X)", job_id);
+                uint64_t sent_time_us = 0;
+                int ret = stratum_v1_submit_share_safe(
+                    GLOBAL_STATE, queued_result.generation, uid, user,
+                    active_job->jobid, active_job->extranonce2,
+                    active_job->ntime, asic_result->nonce, version_bits,
+                    &sent_time_us);
+
+                if (ret < 0) {
+                    ESP_LOGW(TAG, "Unable to write share to socket (ret: %d, errno %d: %s)", ret, errno, strerror(errno));
+                    // stratum_task recv loop will detect a broken connection on its next read and handle reconnection
                 } else {
-                    uint64_t sent_time_us = 0;
-                    int ret = STRATUM_V1_submit_share(
-                        transport,
-                        uid,
-                        user,
-                        active_job->jobid,
-                        active_job->extranonce2,
-                        active_job->ntime,
-                        asic_result->nonce,
-                        version_bits,
-                        &sent_time_us);
-
-                    if (ret < 0) {
-                        ESP_LOGW(TAG, "Unable to write share to socket (ret: %d, errno %d: %s)", ret, errno, strerror(errno));
-                        // stratum_task recv loop will detect a broken connection on its next read and handle reconnection
-                    }
-
                     float process_time = (sent_time_us - asic_result->timestamp_us) / 1000.0f;
                     GLOBAL_STATE->SYSTEM_MODULE.process_time = process_time;
                     ESP_LOGD(TAG, "Processing time: %0.1f ms", process_time);

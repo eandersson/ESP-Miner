@@ -177,7 +177,7 @@ TEST_CASE("Check known working midstate + job command", "[bm1397]")
     uint8_t buf[1024];
     memset(buf, 0, 1024);
 
-    BM1397_send_work(&GLOBAL_STATE, &test_job);
+    BM1397_send_work(&GLOBAL_STATE, &test_job, 0);
     uint16_t received = SERIAL_rx(buf, 9, 20);
     TEST_ASSERT_GREATER_OR_EQUAL_UINT16(sizeof(struct asic_result), received);
 
