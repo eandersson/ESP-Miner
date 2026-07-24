@@ -150,20 +150,30 @@ void ASIC_set_nonce_space(GlobalState * GLOBAL_STATE)
 
 double ASIC_get_asic_job_frequency_ms(GlobalState * GLOBAL_STATE)
 {
-    float freq = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value;
+    float freq = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.actual_frequency;
+    if (freq <= 0.0f) {
+        freq = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value;
+    }
     int cores = GLOBAL_STATE->DEVICE_CONFIG.family.asic.core_count;
     int small_cores = GLOBAL_STATE->DEVICE_CONFIG.family.asic.small_core_count;
     int asic_count = GLOBAL_STATE->DEVICE_CONFIG.family.asic_count;
-    int asic_default_timeout_divided = GLOBAL_STATE->DEVICE_CONFIG.family.asic.default_asic_timeout / _next_power_of_two(asic_count);
+    double refresh_cap_ms =
+        (double)GLOBAL_STATE->DEVICE_CONFIG.family.asic.default_asic_timeout /
+        (double)_next_power_of_two(asic_count);
 
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
             // no version-rolling so same Nonce Space is splitted between Big Cores
-            return calculate_bm_timeout_ms(freq, asic_count, small_cores, cores, 4, 1.0, asic_default_timeout_divided);
+            return calculate_bm_timeout_ms(freq, asic_count, small_cores, cores,
+                                           4, 1.0, refresh_cap_ms);
         case BM1366:
         case BM1368:
         case BM1370:
-            return asic_default_timeout_divided;
+            // Version rolling makes the full search much longer than the desired
+            // work refresh. Clamp the configured refresh to the calculated scan
+            // duration so future frequency/topology changes cannot create idle gaps.
+            return calculate_bm_job_interval_ms(freq, asic_count, small_cores,
+                                                cores, 65536, refresh_cap_ms);
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot compute job frequency", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
     return 500;

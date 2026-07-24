@@ -194,6 +194,10 @@ void app_main(void)
     setup_ble_stop();
 
     queue_init(&GLOBAL_STATE.stratum_queue);
+    if (ASIC_result_task_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to initialize ASIC result processing");
+        return;
+    }
 
     if (system_init_ret == ESP_OK) {
         if (asic_initialize(&GLOBAL_STATE, ASIC_INIT_COLD_BOOT, 0) == 0) {
@@ -206,6 +210,9 @@ void app_main(void)
         } else {
             if (xTaskCreate(create_jobs_task, "stratum miner", 8192, (void *) &GLOBAL_STATE, 20, NULL) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating stratum miner task");
+            }
+            if (xTaskCreate(ASIC_result_rx_task, "asic result rx", 4096, (void *) &GLOBAL_STATE, 18, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "Error creating asic result rx task");
             }
             if (xTaskCreate(ASIC_result_task, "asic result", 8192, (void *) &GLOBAL_STATE, 15, NULL) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating asic result task");

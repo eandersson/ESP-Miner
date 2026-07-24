@@ -10,9 +10,11 @@
 #include "esp_timer.h"
 
 #define PREAMBLE 0xAA55
+#define ASIC_RX_TIMEOUT_MS 100
 
 static const char * TAG = "common";
 static char asic_chain_error[96];
+static asic_rx_stream_t work_rx_stream;
 
 static void format_asic_indices(char *buffer, size_t buffer_size, int first_index, int end_index)
 {
@@ -145,46 +147,125 @@ int count_asic_chips(uint16_t asic_count, uint16_t chip_id, int chip_id_response
     return chip_counter;
 }
 
+void asic_rx_stream_reset(asic_rx_stream_t *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    memset(stream, 0, sizeof(*stream));
+}
+
+static void discard_first_stream_byte(asic_rx_stream_t *stream)
+{
+    if (stream->length > 1) {
+        memmove(stream->data, stream->data + 1, stream->length - 1);
+    }
+    if (stream->length > 0) {
+        stream->length--;
+        stream->discarded_bytes++;
+    }
+}
+
+bool asic_rx_stream_push(asic_rx_stream_t *stream, uint8_t byte, uint8_t *frame, size_t frame_size)
+{
+    if (stream == NULL || frame == NULL || frame_size < 3 || frame_size > ASIC_RX_FRAME_MAX_SIZE) {
+        return false;
+    }
+
+    if (stream->length == ASIC_RX_FRAME_MAX_SIZE) {
+        discard_first_stream_byte(stream);
+    }
+    stream->data[stream->length++] = byte;
+
+    while (stream->length >= 2 &&
+           (stream->data[0] != 0xAA || stream->data[1] != 0x55)) {
+        discard_first_stream_byte(stream);
+    }
+
+    if (stream->length < frame_size) {
+        return false;
+    }
+
+    if (crc5(stream->data + 2, frame_size - 2) == 0) {
+        memcpy(frame, stream->data, frame_size);
+        stream->length = 0;
+        stream->frames_received++;
+        return true;
+    }
+
+    // Keep scanning instead of flushing bytes that may contain the next frame.
+    stream->crc_errors++;
+    discard_first_stream_byte(stream);
+    while (stream->length >= 2 &&
+           (stream->data[0] != 0xAA || stream->data[1] != 0x55)) {
+        discard_first_stream_byte(stream);
+    }
+    return false;
+}
+
+void reset_work_rx_parser(void)
+{
+    asic_rx_stream_reset(&work_rx_stream);
+}
+
+void get_work_rx_stats(asic_rx_stats_t *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+
+    stats->discarded_bytes = work_rx_stream.discarded_bytes;
+    stats->frames_received = work_rx_stream.frames_received;
+    stats->crc_errors = work_rx_stream.crc_errors;
+    stats->timeouts = work_rx_stream.timeouts;
+    stats->uart_errors = work_rx_stream.uart_errors;
+}
+
 esp_err_t receive_work(uint8_t * buffer, int buffer_size, uint64_t *out_timestamp_us)
 {
-    int received = SERIAL_rx(buffer, buffer_size, 10000);
-    if (out_timestamp_us) {
-        *out_timestamp_us = esp_timer_get_time();
-    }
-
-    if (received < 0) {
-        ESP_LOGE(TAG, "UART error in serial RX");
+    if (buffer == NULL || buffer_size < 3 || buffer_size > ASIC_RX_FRAME_MAX_SIZE) {
+        ESP_LOGE(TAG, "Invalid ASIC response size %d", buffer_size);
         return ESP_FAIL;
     }
 
-    if (received == 0) {
-        ESP_LOGD(TAG, "UART timeout in serial RX");
-        return ESP_FAIL;
+    int64_t deadline_us = esp_timer_get_time() + (ASIC_RX_TIMEOUT_MS * 1000);
+    uint32_t discarded_before = work_rx_stream.discarded_bytes;
+
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) {
+            break;
+        }
+        uint16_t remaining_ms = (uint16_t)((remaining_us + 999) / 1000);
+        uint8_t byte;
+        int received = SERIAL_rx(&byte, 1, remaining_ms);
+
+        if (received < 0) {
+            work_rx_stream.uart_errors++;
+            ESP_LOGE(TAG, "UART error in serial RX");
+            return ESP_FAIL;
+        }
+        if (received == 0) {
+            break;
+        }
+
+        if (asic_rx_stream_push(&work_rx_stream, byte, buffer, buffer_size)) {
+            if (out_timestamp_us) {
+                *out_timestamp_us = esp_timer_get_time();
+            }
+            uint32_t discarded = work_rx_stream.discarded_bytes - discarded_before;
+            if (discarded > 0) {
+                ESP_LOGW(TAG, "ASIC RX resynchronized after discarding %lu byte(s)",
+                         (unsigned long)discarded);
+            }
+            return ESP_OK;
+        }
     }
 
-    if (received != buffer_size) {
-        ESP_LOGE(TAG, "Invalid response length %i", received);
-        ESP_LOG_BUFFER_HEX(TAG, buffer, received);
-        SERIAL_clear_buffer();
-        return ESP_FAIL;
-    }
-
-    uint16_t received_preamble = (buffer[0] << 8) | buffer[1];
-    if (received_preamble != PREAMBLE) {
-        ESP_LOGE(TAG, "Preamble mismatch: got 0x%04x, expected 0x%04x", received_preamble, PREAMBLE);
-        ESP_LOG_BUFFER_HEX(TAG, buffer, received);
-        SERIAL_clear_buffer();
-        return ESP_FAIL;
-    }
-
-    if (crc5(buffer + 2, buffer_size - 2) != 0) {
-        ESP_LOGE(TAG, "Checksum failed on response");        
-        ESP_LOG_BUFFER_HEX(TAG, buffer, received);
-        SERIAL_clear_buffer();
-        return ESP_FAIL;
-    }
-
-    return ESP_OK;
+    work_rx_stream.timeouts++;
+    ESP_LOGD(TAG, "UART timeout in serial RX");
+    return ESP_FAIL;
 }
 
 void get_difficulty_mask(double difficulty, uint8_t *job_difficulty_mask)
@@ -216,6 +297,31 @@ void get_difficulty_mask(double difficulty, uint8_t *job_difficulty_mask)
     job_difficulty_mask[5] = _reverse_bits( mask        & 0xFF);
 }
 
+uint32_t calculate_bm_hcn(float frequency_mhz, size_t asic_count, size_t cores,
+                          double nonce_fraction, double frequency_multiplier,
+                          double correction)
+{
+    if (frequency_mhz <= 0.0f || asic_count == 0 || cores == 0 ||
+        nonce_fraction <= 0.0 || frequency_multiplier <= 0.0) {
+        return 0;
+    }
+
+    double nonce_space_per_core = NONCE_SPACE /
+                                  (double)_next_power_of_two((int)cores) /
+                                  (double)_next_power_of_two((int)asic_count);
+    double hcn = nonce_space_per_core * frequency_multiplier /
+                 (double)frequency_mhz * 0.5;
+    hcn = nonce_fraction * (hcn - correction);
+
+    if (hcn <= 0.0) {
+        return 0;
+    }
+    if (hcn >= (double)UINT32_MAX) {
+        return UINT32_MAX;
+    }
+    return (uint32_t)hcn;
+}
+
 double calculate_bm_timeout_ms(float frequency_mhz, size_t asic_count, size_t small_cores, size_t cores, size_t version_size, float timeout_percent, double default_time_ms)
 {
     if (asic_count <= 0)
@@ -242,4 +348,22 @@ double calculate_bm_timeout_ms(float frequency_mhz, size_t asic_count, size_t sm
         return default_time_ms;
 
     return (double)timeout_percent * fullspace_timeout_ms;
+}
+
+double calculate_bm_job_interval_ms(float frequency_mhz, size_t asic_count,
+                                    size_t small_cores, size_t cores,
+                                    size_t version_size, double max_refresh_ms)
+{
+    if (max_refresh_ms < 1.0) {
+        max_refresh_ms = 1.0;
+    }
+    if (frequency_mhz <= 0.0f || asic_count == 0 || small_cores == 0 ||
+        cores == 0 || version_size == 0) {
+        return max_refresh_ms;
+    }
+
+    double full_scan_ms = calculate_bm_timeout_ms(
+        frequency_mhz, asic_count, small_cores, cores, version_size, 1.0f,
+        max_refresh_ms);
+    return fmax(1.0, fmin(max_refresh_ms, full_scan_ms));
 }

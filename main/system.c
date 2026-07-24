@@ -31,6 +31,7 @@
 #include "self_test.h"
 #include "filesystem.h"
 #include "embedded_web_ui.h"
+#include "asic_result_task.h"
 #include "work_queue.h"
 #include "hashrate_monitor_task.h"
 
@@ -346,6 +347,7 @@ void SYSTEM_clean_jobs_queue(GlobalState * GLOBAL_STATE)
     for (int i = 0; i < 128; i = i + 4) {
         GLOBAL_STATE->valid_jobs[i] = 0;
     }
+    ASIC_result_task_invalidate_jobs();
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
     // Reset hashrate measurements to prevent a spike on reconnection

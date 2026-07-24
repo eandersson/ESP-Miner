@@ -80,3 +80,34 @@ TEST_CASE("Check max asic timeout 1x BM1370", "[common]")
 
     TEST_ASSERT_FLOAT_WITHIN(0.01, expected_ms, timeout_ms);
 }
+
+TEST_CASE("HCN calculation matches BM1366 defaults", "[common]")
+{
+    uint32_t hcn = calculate_bm_hcn(485.0f, 1, 112, 1.0, 25.0, 0.0);
+    TEST_ASSERT_EQUAL_UINT32(864804, hcn);
+}
+
+TEST_CASE("HCN calculation applies BM1370 correction", "[common]")
+{
+    uint32_t hcn = calculate_bm_hcn(525.0f, 2, 128, 1.0, 25.0, 268.0);
+    TEST_ASSERT_EQUAL_UINT32(399189, hcn);
+}
+
+TEST_CASE("HCN calculation rejects invalid frequency", "[common]")
+{
+    TEST_ASSERT_EQUAL_UINT32(0, calculate_bm_hcn(0.0f, 1, 128, 1.0, 25.0, 0.0));
+}
+
+TEST_CASE("Version-rolling job interval preserves refresh cap", "[common]")
+{
+    double interval_ms = calculate_bm_job_interval_ms(
+        525.0f, 2, 2040, 128, 65536, 250.0);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 250.0, interval_ms);
+}
+
+TEST_CASE("Job interval never exceeds calculated scan time", "[common]")
+{
+    double interval_ms = calculate_bm_job_interval_ms(
+        450.0f, 1, 672, 168, 4, 1000.0);
+    TEST_ASSERT_DOUBLE_WITHIN(0.01, 37.282, interval_ms);
+}

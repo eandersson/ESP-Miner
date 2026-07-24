@@ -3,7 +3,9 @@
 #include "system.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "utils.h"
 #include "global_state.h"
 #include "mining.h"
@@ -16,10 +18,131 @@
 #include "freertos/task.h"
 #include "scoreboard.h"
 #include "self_test.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "asic_result";
 
-void ASIC_result_task(void *pvParameters)
+#define ASIC_RESULT_QUEUE_LENGTH 32
+
+typedef struct
+{
+    task_result result;
+    bm_job job;
+    bool has_job;
+    uint32_t generation;
+    stratum_protocol_t protocol;
+} queued_asic_result_t;
+
+static QueueHandle_t asic_result_queue;
+static atomic_uint_fast32_t job_generation;
+static atomic_uint_fast32_t enqueued_result_count;
+static atomic_uint_fast32_t processed_result_count;
+static atomic_uint_fast32_t dropped_result_count;
+static atomic_uint_fast32_t invalid_job_count;
+static atomic_uint_fast32_t stale_result_count;
+static atomic_uint_fast32_t metadata_failure_count;
+static atomic_uint_fast32_t queue_high_watermark;
+static atomic_uint_fast32_t max_queue_latency_ms;
+
+static void free_queued_result(queued_asic_result_t *queued_result)
+{
+    if (queued_result == NULL || !queued_result->has_job) {
+        return;
+    }
+
+    free(queued_result->job.jobid);
+    free(queued_result->job.extranonce2);
+    queued_result->job.jobid = NULL;
+    queued_result->job.extranonce2 = NULL;
+    queued_result->has_job = false;
+}
+
+static void drain_result_queue(void)
+{
+    if (asic_result_queue == NULL) {
+        return;
+    }
+
+    queued_asic_result_t queued_result;
+    while (xQueueReceive(asic_result_queue, &queued_result, 0) == pdTRUE) {
+        free_queued_result(&queued_result);
+    }
+}
+
+static void update_atomic_max(atomic_uint_fast32_t *maximum, uint32_t value)
+{
+    uint_fast32_t current = atomic_load(maximum);
+    while (value > current &&
+           !atomic_compare_exchange_weak(maximum, &current, value)) {
+    }
+}
+
+static void log_result_metrics(void)
+{
+    static int64_t last_log_us;
+    int64_t now_us = esp_timer_get_time();
+    if (last_log_us != 0 && now_us - last_log_us < 60000000) {
+        return;
+    }
+    last_log_us = now_us;
+
+    asic_rx_stats_t rx_stats;
+    get_work_rx_stats(&rx_stats);
+    ESP_LOGI(TAG,
+             "RX metrics: frames=%lu crc=%lu discarded=%lu uart_err=%lu "
+             "queued=%lu processed=%lu dropped=%lu stale=%lu invalid=%lu "
+             "metadata_err=%lu queue_peak=%lu latency_max=%lums",
+             (unsigned long)rx_stats.frames_received,
+             (unsigned long)rx_stats.crc_errors,
+             (unsigned long)rx_stats.discarded_bytes,
+             (unsigned long)rx_stats.uart_errors,
+             (unsigned long)atomic_load(&enqueued_result_count),
+             (unsigned long)atomic_load(&processed_result_count),
+             (unsigned long)atomic_load(&dropped_result_count),
+             (unsigned long)atomic_load(&stale_result_count),
+             (unsigned long)atomic_load(&invalid_job_count),
+             (unsigned long)atomic_load(&metadata_failure_count),
+             (unsigned long)atomic_load(&queue_high_watermark),
+             (unsigned long)atomic_load(&max_queue_latency_ms));
+}
+
+esp_err_t ASIC_result_task_init(void)
+{
+    if (asic_result_queue != NULL) {
+        return ESP_OK;
+    }
+
+    asic_result_queue = xQueueCreate(ASIC_RESULT_QUEUE_LENGTH, sizeof(queued_asic_result_t));
+    if (asic_result_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create ASIC result queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    atomic_init(&job_generation, 1);
+    atomic_init(&enqueued_result_count, 0);
+    atomic_init(&processed_result_count, 0);
+    atomic_init(&dropped_result_count, 0);
+    atomic_init(&invalid_job_count, 0);
+    atomic_init(&stale_result_count, 0);
+    atomic_init(&metadata_failure_count, 0);
+    atomic_init(&queue_high_watermark, 0);
+    atomic_init(&max_queue_latency_ms, 0);
+    return ESP_OK;
+}
+
+void ASIC_result_task_invalidate_jobs(void)
+{
+    atomic_fetch_add(&job_generation, 1);
+    drain_result_queue();
+}
+
+void ASIC_result_task_reset(void)
+{
+    reset_work_rx_parser();
+    ASIC_result_task_invalidate_jobs();
+}
+
+void ASIC_result_rx_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
@@ -28,57 +151,122 @@ void ASIC_result_task(void *pvParameters)
         // Check if ASIC is initialized before trying to process work
         if (!GLOBAL_STATE->ASIC_initalized) {
             vTaskDelay(100 / portTICK_PERIOD_MS);
+            log_result_metrics();
             continue;
         }
 
         task_result *asic_result = ASIC_process_work(GLOBAL_STATE);
 
-        if (asic_result == NULL)
-        {
+        if (asic_result == NULL) {
+            log_result_metrics();
             continue;
         }
+
+        queued_asic_result_t queued_result = {
+            .result = *asic_result,
+            .has_job = false,
+            .generation = (uint32_t)atomic_load(&job_generation),
+            .protocol = GLOBAL_STATE->stratum_protocol,
+        };
+
+        if (asic_result->register_type == REGISTER_INVALID) {
+            uint8_t job_id = asic_result->job_id;
+
+            // Snapshot the job before enqueueing. A queued result can outlive the
+            // ASIC's job-ID cycle, so resolving the slot later could pair the
+            // nonce with a newer job that reused the same ID.
+            pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
+            bool valid = (GLOBAL_STATE->valid_jobs[job_id] != 0) &&
+                         (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id] != NULL);
+            if (valid) {
+                queued_result.job = *GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id];
+                queued_result.job.jobid = queued_result.job.jobid ? strdup(queued_result.job.jobid) : NULL;
+                queued_result.job.extranonce2 = queued_result.job.extranonce2 ? strdup(queued_result.job.extranonce2) : NULL;
+                queued_result.has_job = true;
+            }
+            pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
+
+            if (!valid) {
+                atomic_fetch_add(&invalid_job_count, 1);
+                ESP_LOGW(TAG, "Invalid job nonce found, 0x%02X", job_id);
+                continue;
+            }
+            if (queued_result.job.jobid == NULL || queued_result.job.extranonce2 == NULL) {
+                atomic_fetch_add(&metadata_failure_count, 1);
+                ESP_LOGE(TAG, "Failed to snapshot metadata for job 0x%02X", job_id);
+                free_queued_result(&queued_result);
+                continue;
+            }
+        }
+
+        if (xQueueSend(asic_result_queue, &queued_result, 0) != pdTRUE) {
+            free_queued_result(&queued_result);
+            uint32_t dropped = (uint32_t)atomic_fetch_add(&dropped_result_count, 1) + 1;
+            // Log at powers of two so a stalled consumer cannot create a log storm.
+            if ((dropped & (dropped - 1)) == 0) {
+                ESP_LOGW(TAG, "ASIC result queue full; dropped %lu result(s)",
+                         (unsigned long)dropped);
+            }
+        } else {
+            atomic_fetch_add(&enqueued_result_count, 1);
+            update_atomic_max(&queue_high_watermark,
+                              (uint32_t)uxQueueMessagesWaiting(asic_result_queue));
+        }
+        log_result_metrics();
+    }
+}
+
+void ASIC_result_task(void *pvParameters)
+{
+    GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
+    queued_asic_result_t queued_result;
+
+    while (1)
+    {
+        if (xQueueReceive(asic_result_queue, &queued_result, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        task_result *asic_result = &queued_result.result;
+        atomic_fetch_add(&processed_result_count, 1);
+
+        uint64_t latency_us = (uint64_t)esp_timer_get_time() - asic_result->timestamp_us;
+        uint32_t latency_ms = latency_us / 1000 > UINT32_MAX
+                                  ? UINT32_MAX
+                                  : (uint32_t)(latency_us / 1000);
+        update_atomic_max(&max_queue_latency_ms, latency_ms);
 
         if (asic_result->register_type != REGISTER_INVALID) {
             hashrate_monitor_register_read(GLOBAL_STATE, asic_result->register_type, asic_result->asic_nr, asic_result->value, asic_result->timestamp_us);
             continue;
         }
 
-        uint8_t job_id = asic_result->job_id;
-
-        // Snapshot the job while holding the lock. The shared slot
-        // (ASIC_TASK_MODULE.active_jobs[job_id]) can be freed and reused by
-        // BM1370_send_work() while we run the (potentially multi-second, blocking)
-        // share submit below; keeping a pointer into it is a use-after-free. The
-        // bm_job body is inline and safe to copy by value — deep-copy the two
-        // heap-owned strings so the snapshot stays valid after we unlock.
-        pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
-        bool valid = (GLOBAL_STATE->valid_jobs[job_id] != 0) &&
-                     (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id] != NULL);
-        if (!valid)
-        {
-            pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
-            ESP_LOGW(TAG, "Invalid job nonce found, 0x%02X", job_id);
+        if (queued_result.generation != (uint32_t)atomic_load(&job_generation)) {
+            atomic_fetch_add(&stale_result_count, 1);
+            free_queued_result(&queued_result);
             continue;
         }
-        bm_job active_job_snapshot = *GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id];
-        active_job_snapshot.jobid = active_job_snapshot.jobid ? strdup(active_job_snapshot.jobid) : NULL;
-        active_job_snapshot.extranonce2 = active_job_snapshot.extranonce2 ? strdup(active_job_snapshot.extranonce2) : NULL;
-        pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
-        bm_job *active_job = &active_job_snapshot;
+
+        uint8_t job_id = asic_result->job_id;
+        bm_job *active_job = &queued_result.job;
         // check the nonce difficulty
         double nonce_diff = test_nonce_value(active_job, asic_result->nonce, asic_result->rolled_version);
 
         if (GLOBAL_STATE->SELF_TEST_MODULE.is_active) {
             self_test_record_nonce(GLOBAL_STATE, nonce_diff);
-            free(active_job->jobid);
-            free(active_job->extranonce2);
+            free_queued_result(&queued_result);
             continue;
         }
 
         uint32_t version_bits = asic_result->rolled_version ^ active_job->version;
+        if (queued_result.generation != (uint32_t)atomic_load(&job_generation)) {
+            atomic_fetch_add(&stale_result_count, 1);
+            free_queued_result(&queued_result);
+            continue;
+        }
+
         if (nonce_diff >= active_job->pool_diff)
         {
-            if (GLOBAL_STATE->stratum_protocol == STRATUM_PROTOCOL_V2) {
+            if (queued_result.protocol == STRATUM_PROTOCOL_V2) {
                 // SV2: submit with binary protocol
                 int ret;
                 uint32_t sv2_job_id = (uint32_t)strtoul(active_job->jobid, NULL, 10);
@@ -138,19 +326,18 @@ void ASIC_result_task(void *pvParameters)
 
                     float process_time = (sent_time_us - asic_result->timestamp_us) / 1000.0f;
                     GLOBAL_STATE->SYSTEM_MODULE.process_time = process_time;
-                    ESP_LOGI(TAG, "Processing time: %0.1f ms", process_time);
+                    ESP_LOGD(TAG, "Processing time: %0.1f ms", process_time);
                 }
             }
         }
 
         //log the ASIC response
-        ESP_LOGI(TAG, "ID: %s, ASIC nr: %d, Core: %d/%d, ver: %08" PRIX32 " Nonce %08" PRIX32 " diff %.1f of %g.", active_job->jobid, asic_result->asic_nr, asic_result->core_id, asic_result->small_core_id, asic_result->rolled_version, asic_result->nonce, nonce_diff, active_job->pool_diff);
+        ESP_LOGD(TAG, "ID: %s, ASIC nr: %d, Core: %d/%d, ver: %08" PRIX32 " Nonce %08" PRIX32 " diff %.1f of %g.", active_job->jobid, asic_result->asic_nr, asic_result->core_id, asic_result->small_core_id, asic_result->rolled_version, asic_result->nonce, nonce_diff, active_job->pool_diff);
 
         SYSTEM_notify_found_nonce(GLOBAL_STATE, nonce_diff, active_job->target);
 
         scoreboard_add(&GLOBAL_STATE->SYSTEM_MODULE.scoreboard, nonce_diff, active_job->jobid, active_job->extranonce2, active_job->ntime, asic_result->nonce, version_bits);
 
-        free(active_job->jobid);
-        free(active_job->extranonce2);
+        free_queued_result(&queued_result);
     }
 }

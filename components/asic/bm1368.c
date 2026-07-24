@@ -135,17 +135,15 @@ void BM1368_set_hash_counting_number(uint32_t hcn) {
 }
 
 void BM1368_set_nonce_space(double nonce_percent, float frequency, uint16_t asic_count, uint16_t cores) 
-{   
-    int cores_up = _next_power_of_two(cores);
-    int asic_count_up =  _next_power_of_two(asic_count);
-
-    // HCN hash counting number (the size of the nonce space)
-    float hcn_space = (float)NONCE_SPACE / cores_up / asic_count_up;
-    double hcn_max = hcn_space * (double)FREQ_MULT / frequency * 0.5f; 
-    double hcn_frac = nonce_percent * hcn_max;
-    uint32_t hcn_register_value = (uint32_t)hcn_frac;
-
-    BM1368_set_hash_counting_number(hcn_register_value);
+{
+    uint32_t hcn = calculate_bm_hcn(frequency, asic_count, cores,
+                                    nonce_percent, FREQ_MULT, 0.0);
+    if (hcn == 0) {
+        ESP_LOGE(TAG, "Invalid nonce-space parameters: frequency=%g count=%u cores=%u",
+                 frequency, asic_count, cores);
+        return;
+    }
+    BM1368_set_hash_counting_number(hcn);
 }
 
 float BM1368_send_hash_frequency(float target_freq)

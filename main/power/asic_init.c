@@ -7,6 +7,7 @@
 #include "asic_common.h"
 #include "serial.h"
 #include "asic_reset.h"
+#include "asic_result_task.h"
 
 static const char *TAG = "asic_init";
 
@@ -58,6 +59,7 @@ uint8_t asic_initialize(GlobalState *GLOBAL_STATE, asic_init_mode_t mode, uint32
     ESP_LOGI(TAG, "Setting max baud rate and clearing buffers");
     SERIAL_set_baud(ASIC_set_max_baud(GLOBAL_STATE));
     SERIAL_clear_buffer();
+    ASIC_result_task_reset();
 
     GLOBAL_STATE->ASIC_initalized = true;
     
