@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
-import { BehaviorSubject, Observable, Subject, EMPTY, timer, merge, fromEvent } from 'rxjs';
-import { catchError, retry, share, tap, switchMap, startWith, scan, shareReplay, map, timeout, bufferTime, filter, distinctUntilChanged } from 'rxjs/operators';
+import { BehaviorSubject, Observable, Subject, EMPTY, timer, merge, fromEvent, defer } from 'rxjs';
+import { catchError, retry, share, tap, switchMap, startWith, scan, shareReplay, map, timeout, bufferTime, filter, distinctUntilChanged, finalize } from 'rxjs/operators';
 import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
 import { SystemInfo as ISystemInfo } from 'src/app/generated/models';
 import { SystemApiService } from './system.service';
@@ -17,6 +17,7 @@ export class LiveDataService {
   // received anything, so a close can be attributed to a stalled stream or not.
   private openedAt = 0;
   private lastMessageAt = 0;
+  private socketSeq = 0;
 
   // Shared info stream for the whole app
   public readonly info$: Observable<ISystemInfo>;
@@ -78,7 +79,7 @@ export class LiveDataService {
   }
 
   private connect(): Observable<any> {
-    if (environment.mock || this.socket$ || !window.location.host) {
+    if (environment.mock || !window.location.host) {
       return EMPTY;
     }
 
@@ -86,34 +87,35 @@ export class LiveDataService {
     const host = window.location.host;
     const url = `${protocol}//${host}/api/ws/live`;
 
-    this.socket$ = webSocket({
-      url,
-      openObserver: {
-        next: () => {
-          this.openedAt = Date.now();
-          this.lastMessageAt = 0;
-          console.log('Live WebSocket connected');
-          this.connectedSubject.next(true);
-        }
-      },
-      closeObserver: {
-        next: (event: CloseEvent) => {
-          // code/wasClean identify who closed us: 1006 + !wasClean means no close
-          // frame arrived (server or network dropped it), while 1000/1005 + wasClean
-          // means this client initiated the close -- i.e. the timeout below fired.
-          const sinceOpen = this.openedAt ? Date.now() - this.openedAt : -1;
-          console.log(
-            `Live WebSocket disconnected (code=${event?.code} reason="${event?.reason}" ` +
-            `wasClean=${event?.wasClean} afterMs=${sinceOpen} lastMsgAgoMs=` +
-            `${this.lastMessageAt ? Date.now() - this.lastMessageAt : -1})`
-          );
-          this.connectedSubject.next(false);
-          this.socket$ = null;
-        }
-      }
-    });
+    return defer(() => {
+      const socketId = ++this.socketSeq;
 
-    return this.socket$.pipe(
+      this.socket$ = webSocket({
+        url,
+        openObserver: {
+          next: () => {
+            this.openedAt = Date.now();
+            this.lastMessageAt = 0;
+            console.log(`Live WebSocket connected #${socketId}`);
+            this.connectedSubject.next(true);
+          }
+        },
+        closeObserver: {
+          next: (event: CloseEvent) => {
+            const sinceOpen = this.openedAt ? Date.now() - this.openedAt : -1;
+            console.log(
+              `Live WebSocket disconnected #${socketId} (code=${event?.code} ` +
+              `reason="${event?.reason}" wasClean=${event?.wasClean} ` +
+              `afterMs=${sinceOpen} lastMsgAgoMs=` +
+              `${this.lastMessageAt ? Date.now() - this.lastMessageAt : -1})`
+            );
+            this.connectedSubject.next(false);
+          }
+        }
+      });
+
+      return this.socket$;
+    }).pipe(
       timeout(30000),
       tap({
         next: msg => {
@@ -122,10 +124,16 @@ export class LiveDataService {
             this.updates$.next(msg.data);
           }
         },
-        error: err => console.log(`Live WebSocket stream error #${socketId}: ${err?.name ?? err}`)
+        // An error means the stream faulted (TimeoutError, socket error). A
+        // finalize with no preceding error means it was unsubscribed instead.
+        error: err => console.log(`Live WebSocket stream error: ${err?.name ?? err}`)
       }),
-      finalize(() => console.log(`Live WebSocket chain finalized #${socketId}`)),
+      finalize(() => console.log('Live WebSocket chain finalized')),
       retry({ delay: 5000 }),
+      // resetOnRefCountZero:false is the important part. share() defaults to true in
+      // RxJS 7, so the refcount briefly reaching zero unsubscribes the source and
+      // closes a perfectly healthy socket -- a clean client close (1005) mid-stream,
+      // exactly what the close diagnostics reported.
       share({ resetOnRefCountZero: false })
     );
   }
