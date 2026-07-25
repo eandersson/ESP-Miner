@@ -115,12 +115,16 @@ export class LiveDataService {
 
     return this.socket$.pipe(
       timeout(30000),
-      tap(msg => {
-        this.lastMessageAt = Date.now();
-        if (msg.event === 'update' && msg.data) {
-          this.updates$.next(msg.data);
-        }
+      tap({
+        next: msg => {
+          this.lastMessageAt = Date.now();
+          if (msg.event === 'update' && msg.data) {
+            this.updates$.next(msg.data);
+          }
+        },
+        error: err => console.log(`Live WebSocket stream error #${socketId}: ${err?.name ?? err}`)
       }),
+      finalize(() => console.log(`Live WebSocket chain finalized #${socketId}`)),
       retry({ delay: 5000 }),
       share({ resetOnRefCountZero: false })
     );
