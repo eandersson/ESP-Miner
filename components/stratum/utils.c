@@ -136,6 +136,15 @@ static const uint32_t sha256_initial_state[8] = {
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
+// SHA-256 midstate: the compression state after the single 64-byte block in
+// `data`, with no padding or length appended. PSA has no API for extracting an
+// intermediate hash state, so the compression function is open-coded here.
+//
+// The state is emitted big-endian, matching what the ESP-IDF hardware-SHA
+// Mbed TLS port used to leave in mbedtls_sha256_context.state. Do NOT switch
+// back to mbedtls_sha256_* to get this: in IDF 6.0 that API resolves to
+// upstream software Mbed TLS, whose .state is host-endian, so it compiles
+// cleanly and silently produces byte-swapped midstates.
 void midstate_sha256_bin(const uint8_t *data, const size_t data_len, uint8_t dest[32])
 {
     if (data == NULL || data_len != 64) {
