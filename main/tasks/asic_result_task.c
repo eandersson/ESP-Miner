@@ -12,6 +12,7 @@
 #include "stratum_api.h"
 #include "stratum_v1_task.h"
 #include "stratum_v2_task.h"
+#include "stratum_socket.h"
 #include "sv2_protocol.h"
 #include "hashrate_monitor_task.h"
 #include "asic.h"
@@ -354,6 +355,7 @@ void ASIC_result_task(void *pvParameters)
 
         if (asic_result->register_type != REGISTER_INVALID) {
             hashrate_monitor_register_read(GLOBAL_STATE, asic_result->register_type, asic_result->asic_nr, asic_result->value, asic_result->timestamp_us);
+            free_queued_result(&queued_result);
             continue;
         }
 
@@ -426,7 +428,10 @@ void ASIC_result_task(void *pvParameters)
                                                    queued_result.generation);
                 }
 
-                if (ret < 0) {
+                if (ret == STRATUM_SOCKET_WRITE_TRUNCATED) {
+                    ESP_LOGE(TAG, "Partial SV2 frame written; dropping connection");
+                    stratum_v2_interrupt_connection(GLOBAL_STATE);
+                } else if (ret < 0) {
                     ESP_LOGW(TAG, "Failed to submit SV2 share (ret=%d, errno=%d: %s)",
                              ret, errno, strerror(errno));
                 }
@@ -446,7 +451,10 @@ void ASIC_result_task(void *pvParameters)
                     active_job->ntime, asic_result->nonce, version_bits,
                     &sent_time_us);
 
-                if (ret < 0) {
+                if (ret == STRATUM_SOCKET_WRITE_TRUNCATED) {
+                    ESP_LOGE(TAG, "Partial share written to socket; dropping connection");
+                    stratum_v1_interrupt_connection(GLOBAL_STATE);
+                } else if (ret < 0) {
                     ESP_LOGW(TAG, "Unable to write share to socket (ret: %d, errno %d: %s)", ret, errno, strerror(errno));
                     // stratum_task recv loop will detect a broken connection on its next read and handle reconnection
                 } else {

@@ -13,7 +13,8 @@ export class LiveDataService {
   private socket$: WebSocketSubject<any> | null = null;
   private updates$ = new Subject<Partial<ISystemInfo>>();
 
-  // Connection diagnostics, read only by the close log below.
+  // Diagnostics for connection churn: when this socket opened and when it last
+  // received anything, so a close can be attributed to a stalled stream or not.
   private openedAt = 0;
   private lastMessageAt = 0;
 
@@ -97,10 +98,14 @@ export class LiveDataService {
       },
       closeObserver: {
         next: (event: CloseEvent) => {
+          // code/wasClean identify who closed us: 1006 + !wasClean means no close
+          // frame arrived (server or network dropped it), while 1000/1005 + wasClean
+          // means this client initiated the close -- i.e. the timeout below fired.
+          const sinceOpen = this.openedAt ? Date.now() - this.openedAt : -1;
           console.log(
-            `Live WebSocket disconnected (code=${event?.code} wasClean=${event?.wasClean}` +
-            ` afterMs=${this.openedAt ? Date.now() - this.openedAt : -1}` +
-            ` lastMsgAgoMs=${this.lastMessageAt ? Date.now() - this.lastMessageAt : -1})`
+            `Live WebSocket disconnected (code=${event?.code} reason="${event?.reason}" ` +
+            `wasClean=${event?.wasClean} afterMs=${sinceOpen} lastMsgAgoMs=` +
+            `${this.lastMessageAt ? Date.now() - this.lastMessageAt : -1})`
           );
           this.connectedSubject.next(false);
           this.socket$ = null;

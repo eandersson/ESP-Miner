@@ -28,11 +28,14 @@ esp_err_t stratum_socket_resolve(const char *hostname, uint16_t port, stratum_co
 // by both the SV1 and SV2 stratum tasks.
 void stratum_socket_set_options(esp_transport_handle_t transport);
 
+#define STRATUM_SOCKET_WRITE_ERROR      (-1)
+#define STRATUM_SOCKET_WRITE_TRUNCATED  (-2)
+
 // Serialize writes to the pool connection and keep writing until the complete
 // message has been accepted by the transport. esp_transport_write() is allowed
 // to return a short positive write; treating that as success can truncate a V1
 // JSON request or an encrypted V2 frame.
-// Returns len on success and -1 on failure.
+// Returns len on success, or one of the negative codes above on failure.
 int stratum_socket_write_all(esp_transport_handle_t transport, const void *buffer,
                              size_t len, int timeout_ms);
 

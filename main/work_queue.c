@@ -147,6 +147,6 @@ void queue_clear(work_queue *queue)
         queue->count--;
     }
 
-    pthread_cond_signal(&queue->not_full);
+    pthread_cond_broadcast(&queue->not_full);
     pthread_mutex_unlock(&queue->lock);
 }

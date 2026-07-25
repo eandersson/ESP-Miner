@@ -11,6 +11,7 @@
 #include <string.h>
 
 static const char *TAG = "stratum_socket";
+
 static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int stratum_socket_write_all(esp_transport_handle_t transport, const void *buffer,
@@ -31,16 +32,20 @@ int stratum_socket_write_all(esp_transport_handle_t transport, const void *buffe
     while (written < len) {
         int ret = esp_transport_write(transport, bytes + written,
                                       (int)(len - written), timeout_ms);
-        if (ret <= 0) {
-            if (ret == 0) {
-                errno = ETIMEDOUT;
-            }
-            ESP_LOGE(TAG, "Pool write failed after %zu/%zu bytes (ret=%d, errno=%d)",
-                     written, len, ret, errno);
-            pthread_mutex_unlock(&write_lock);
-            return -1;
+        if (ret > 0) {
+            written += ret;
+            continue;
         }
-        written += ret;
+        if (ret == 0) {
+            errno = ETIMEDOUT;
+        }
+
+        ESP_LOGE(TAG, "Pool write failed after %zu/%zu bytes (ret=%d, errno=%d)",
+                 written, len, ret, errno);
+        pthread_mutex_unlock(&write_lock);
+
+        return written > 0 ? STRATUM_SOCKET_WRITE_TRUNCATED
+                           : STRATUM_SOCKET_WRITE_ERROR;
     }
     pthread_mutex_unlock(&write_lock);
 

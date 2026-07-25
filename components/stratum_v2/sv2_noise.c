@@ -62,11 +62,13 @@ static int noise_recv_exact(esp_transport_handle_t transport, uint8_t *buf, int 
 static int noise_send_all(esp_transport_handle_t transport, const uint8_t *buf, int len)
 {
     int ret = stratum_socket_write_all(transport, buf, len, TRANSPORT_TIMEOUT_MS);
-    if (ret != len) {
-        ESP_LOGE(TAG, "send failed: ret=%d", ret);
-        return -1;
+    if (ret == len) {
+        return 0;
     }
-    return 0;
+    ESP_LOGE(TAG, "send failed: ret=%d", ret);
+    return ret == STRATUM_SOCKET_WRITE_TRUNCATED
+               ? STRATUM_SOCKET_WRITE_TRUNCATED
+               : -1;
 }
 
 // --- Crypto helpers ---
