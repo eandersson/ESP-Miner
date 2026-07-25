@@ -90,7 +90,7 @@ export class LiveDataService {
     return defer(() => {
       const socketId = ++this.socketSeq;
 
-      this.socket$ = webSocket({
+      const socket = webSocket<any>({
         url,
         openObserver: {
           next: () => {
@@ -114,7 +114,8 @@ export class LiveDataService {
         }
       });
 
-      return this.socket$;
+      this.socket$ = socket;
+      return socket;
     }).pipe(
       timeout(30000),
       tap({
