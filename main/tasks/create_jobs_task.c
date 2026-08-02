@@ -693,7 +693,8 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
 
-    bm_job *next_job = malloc(sizeof(bm_job));
+    bm_job *next_job = allocate_bm_job(notification->job_id,
+                                       extranonce_2_str);
 
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new job");
@@ -701,26 +702,19 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
     }
 
     construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask, difficulty, next_job);
-    next_job->extranonce2 = strdup(extranonce_2_str);
-    next_job->jobid = strdup(notification->job_id);
     next_job->version_mask = GLOBAL_STATE->version_mask;
-    if (next_job->extranonce2 == NULL || next_job->jobid == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate metadata for new job");
-        free_bm_job(next_job);
-        return false;
-    }
 
     // Check if ASIC is initialized before trying to send work
     if (!GLOBAL_STATE->ASIC_initalized) {
         // Clean up the job since we're not sending it
         // Note: This job was never stored in active_jobs, so it's safe to free
         ESP_LOGW(TAG, "ASIC not initialized, skipping job send");
-        free_bm_job(next_job);
+        release_bm_job(next_job);
         return false;
     }
 
     if (!ASIC_send_work(GLOBAL_STATE, next_job, expected_generation)) {
-        free_bm_job(next_job);
+        release_bm_job(next_job);
         return false;
     }
     return true;
@@ -735,7 +729,9 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job,
                               uint32_t version_mask,
                               uint32_t expected_generation)
 {
-    bm_job *next_job = malloc(sizeof(bm_job));
+    char jobid_str[16];
+    snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, sv2_job->job_id);
+    bm_job *next_job = allocate_bm_job(jobid_str, "");
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new SV2 job");
         return false;
@@ -791,26 +787,16 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job,
         next_job->num_midstates = 1;
     }
 
-    // SV2 job metadata
-    char jobid_str[16];
-    snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, sv2_job->job_id);
-    next_job->jobid = strdup(jobid_str);
-    next_job->extranonce2 = strdup(""); // unused in SV2 standard
     next_job->version_mask = version_mask;
-    if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate metadata for new SV2 job");
-        free_bm_job(next_job);
-        return false;
-    }
 
     if (!GLOBAL_STATE->ASIC_initalized) {
         ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 job send");
-        free_bm_job(next_job);
+        release_bm_job(next_job);
         return false;
     }
 
     if (!ASIC_send_work(GLOBAL_STATE, next_job, expected_generation)) {
-        free_bm_job(next_job);
+        release_bm_job(next_job);
         return false;
     }
     return true;
@@ -834,12 +820,6 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
         return false;
     }
 
-    bm_job *next_job = malloc(sizeof(bm_job));
-    if (!next_job) {
-        ESP_LOGE(TAG, "Failed to allocate memory for SV2 ext job");
-        return false;
-    }
-
     uint32_t version_mask = GLOBAL_STATE->version_mask;
 
     // Derive extranonce_2 from counter
@@ -851,6 +831,16 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
     for (int i = extranonce_2_len - 1; i >= 0 && extranonce_2_counter > 0; i--) {
         extranonce_2[i] = (uint8_t)(extranonce_2_counter & 0xFF);
         extranonce_2_counter >>= 8;
+    }
+
+    char jobid_str[16];
+    snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, ext_job->job_id);
+    char en2_hex[65];
+    bin2hex(extranonce_2, extranonce_2_len, en2_hex, sizeof(en2_hex));
+    bm_job *next_job = allocate_bm_job(jobid_str, en2_hex);
+    if (!next_job) {
+        ESP_LOGE(TAG, "Failed to allocate memory for SV2 ext job");
+        return false;
     }
 
     // Compute coinbase tx hash: prefix + extranonce_prefix + extranonce_2 + suffix
@@ -916,30 +906,16 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
         next_job->num_midstates = 1;
     }
 
-    // Job metadata
-    char jobid_str[16];
-    snprintf(jobid_str, sizeof(jobid_str), "%" PRIu32, ext_job->job_id);
-    next_job->jobid = strdup(jobid_str);
-
-    // Store extranonce_2 as hex for share submission
-    char en2_hex[65];
-    bin2hex(extranonce_2, extranonce_2_len, en2_hex, sizeof(en2_hex));
-    next_job->extranonce2 = strdup(en2_hex);
     next_job->version_mask = version_mask;
-    if (next_job->jobid == NULL || next_job->extranonce2 == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate metadata for SV2 ext job");
-        free_bm_job(next_job);
-        return false;
-    }
 
     if (!GLOBAL_STATE->ASIC_initalized) {
         ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 ext job send");
-        free_bm_job(next_job);
+        release_bm_job(next_job);
         return false;
     }
 
     if (!ASIC_send_work(GLOBAL_STATE, next_job, expected_generation)) {
-        free_bm_job(next_job);
+        release_bm_job(next_job);
         return false;
     }
     return true;

@@ -354,7 +354,7 @@ void SYSTEM_clean_jobs_queue(GlobalState * GLOBAL_STATE)
         }
         if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs != NULL &&
             GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] != NULL) {
-            free_bm_job(
+            release_bm_job(
                 GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i]);
             GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] = NULL;
         }

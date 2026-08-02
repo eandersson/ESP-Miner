@@ -364,7 +364,7 @@ bool BM1370_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
     if (replaced_job != NULL && replaced_job != next_bm_job) {
-        free_bm_job(replaced_job);
+        release_bm_job(replaced_job);
     }
 
     if (!sent) {

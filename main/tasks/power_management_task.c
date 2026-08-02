@@ -169,8 +169,6 @@ void POWER_MANAGEMENT_task(void * pvParameters)
 
             last_known_asic_voltage = nvs_config_get_u16(NVS_CONFIG_ASIC_VOLTAGE);
             last_known_asic_frequency = nvs_config_get_float(NVS_CONFIG_ASIC_FREQUENCY);
-            nvs_config_set_bool(NVS_CONFIG_AUTO_FAN_SPEED, false);
-            nvs_config_set_u16(NVS_CONFIG_MANUAL_FAN_SPEED, 100);
             nvs_config_set_bool(NVS_CONFIG_OVERHEAT_MODE, true);
             ESP_LOGW(TAG, "Entering safe mode due to overheat condition. System operation halted.");
             mining_stop(GLOBAL_STATE);
@@ -178,7 +176,9 @@ void POWER_MANAGEMENT_task(void * pvParameters)
             // Note: ASIC temperature readings are invalid when ASIC is powered down (returns -1)
             // For 600-series boards that use ASIC thermal diode, we rely on VR temp and fixed cooling time
             // For boards with EMC internal temp sensor, readings remain valid
-            bool asic_temp_valid = GLOBAL_STATE->DEVICE_CONFIG.emc_internal_temp;
+            bool asic_temp_valid =
+                GLOBAL_STATE->DEVICE_CONFIG.emc_internal_temp ||
+                GLOBAL_STATE->DEVICE_CONFIG.TMP1075;
             int cooling_cycles = 0;
             const int MIN_COOLING_CYCLES = 6; // Minimum 30 seconds cooling
             

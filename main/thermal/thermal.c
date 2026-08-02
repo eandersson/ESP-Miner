@@ -75,36 +75,39 @@ uint16_t Thermal_get_fan2_speed(DeviceConfig * DEVICE_CONFIG)
 
 float Thermal_get_chip_temp(GlobalState * GLOBAL_STATE)
 {
-    if (!GLOBAL_STATE->ASIC_initalized) {
-        return -1;
-    }
-
     if (GLOBAL_STATE->DEVICE_CONFIG.EMC2101) {
         if (GLOBAL_STATE->DEVICE_CONFIG.emc_internal_temp) {
+            // The EMC2101 internal sensor remains valid while ASIC Vcore is
+            // disabled, so overheat recovery can observe actual cooldown.
             return EMC2101_get_internal_temp();
-        } else {
+        }
+        if (GLOBAL_STATE->ASIC_initalized) {
             return EMC2101_get_external_temp();
         }
-    }
-    if (GLOBAL_STATE->DEVICE_CONFIG.EMC2103) {
-        return EMC2103_get_external_temp();
+        return -1;
     }
     if (GLOBAL_STATE->DEVICE_CONFIG.TMP1075) {
         return TMP1075_read_temperature(0);
+    }
+    if (!GLOBAL_STATE->ASIC_initalized) {
+        return -1;
+    }
+    if (GLOBAL_STATE->DEVICE_CONFIG.EMC2103) {
+        return EMC2103_get_external_temp();
     }
     return -1;
 }
 
 float Thermal_get_chip_temp2(GlobalState * GLOBAL_STATE)
 {
+    if (GLOBAL_STATE->DEVICE_CONFIG.TMP1075) {
+        return TMP1075_read_temperature(1);
+    }
     if (!GLOBAL_STATE->ASIC_initalized) {
         return -1;
     }
     if (GLOBAL_STATE->DEVICE_CONFIG.EMC2103) {
         return EMC2103_get_external_temp2();
-    }
-    if (GLOBAL_STATE->DEVICE_CONFIG.TMP1075) {
-        return TMP1075_read_temperature(1);
     }
     return -1;
 }

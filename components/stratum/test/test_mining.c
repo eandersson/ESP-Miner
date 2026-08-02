@@ -6,6 +6,29 @@
 #include <limits.h>
 #include <string.h>
 
+TEST_CASE("Refcounted jobs retain inline metadata", "[mining]")
+{
+    bm_job *job = allocate_bm_job("pool-job-123", "01020304");
+    TEST_ASSERT_NOT_NULL(job);
+    TEST_ASSERT_EQUAL_STRING("pool-job-123", job->jobid);
+    TEST_ASSERT_EQUAL_STRING("01020304", job->extranonce2);
+
+    retain_bm_job(job);
+    release_bm_job(job);
+
+    // The queue's retained reference keeps metadata alive after an active slot
+    // releases its ownership.
+    TEST_ASSERT_EQUAL_STRING("pool-job-123", job->jobid);
+    TEST_ASSERT_EQUAL_STRING("01020304", job->extranonce2);
+    release_bm_job(job);
+}
+
+TEST_CASE("Job allocation rejects missing metadata", "[mining]")
+{
+    TEST_ASSERT_NULL(allocate_bm_job(NULL, ""));
+    TEST_ASSERT_NULL(allocate_bm_job("job", NULL));
+}
+
 TEST_CASE("Check coinbase tx construction", "[mining]")
 {
     const char *coinbase_1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff20020862062f503253482f04b8864e5008";

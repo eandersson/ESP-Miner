@@ -1,10 +1,83 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <stddef.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include "mining.h"
 #include "stratum_api.h"
 #include "utils.h"
 #include "psa/crypto.h"
+
+typedef struct
+{
+    atomic_uint ref_count;
+    bm_job job;
+    char metadata[];
+} allocated_bm_job_t;
+
+static allocated_bm_job_t *get_job_allocation(bm_job *job)
+{
+    return (allocated_bm_job_t *)((char *)job -
+                                  offsetof(allocated_bm_job_t, job));
+}
+
+bm_job *allocate_bm_job(const char *jobid, const char *extranonce2)
+{
+    if (jobid == NULL || extranonce2 == NULL) {
+        return NULL;
+    }
+
+    size_t jobid_size = strlen(jobid) + 1;
+    size_t extranonce2_size = strlen(extranonce2) + 1;
+    if (jobid_size > SIZE_MAX - extranonce2_size ||
+        sizeof(allocated_bm_job_t) >
+            SIZE_MAX - jobid_size - extranonce2_size) {
+        return NULL;
+    }
+
+    allocated_bm_job_t *allocation = calloc(
+        1, sizeof(*allocation) + jobid_size + extranonce2_size);
+    if (allocation == NULL) {
+        return NULL;
+    }
+
+    bm_job *job = &allocation->job;
+    char *metadata = allocation->metadata;
+    job->jobid = metadata;
+    memcpy(job->jobid, jobid, jobid_size);
+    job->extranonce2 = metadata + jobid_size;
+    memcpy(job->extranonce2, extranonce2, extranonce2_size);
+    atomic_init(&allocation->ref_count, 1);
+    return job;
+}
+
+void retain_bm_job(bm_job *job)
+{
+    if (job != NULL) {
+        allocated_bm_job_t *allocation = get_job_allocation(job);
+        atomic_fetch_add_explicit(&allocation->ref_count, 1,
+                                  memory_order_relaxed);
+    }
+}
+
+void release_bm_job(bm_job *job)
+{
+    if (job == NULL) {
+        return;
+    }
+
+    // The caller owns the initial reference and transfers it to active_jobs on
+    // a successful send. Result queue entries retain their own references so a
+    // reused slot cannot free metadata that a pending result still needs.
+    allocated_bm_job_t *allocation = get_job_allocation(job);
+    if (atomic_fetch_sub_explicit(&allocation->ref_count, 1,
+                                  memory_order_acq_rel) != 1) {
+        return;
+    }
+
+    free(allocation);
+}
 
 void free_bm_job(bm_job *job)
 {

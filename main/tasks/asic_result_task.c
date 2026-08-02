@@ -29,8 +29,7 @@ static const char *TAG = "asic_result";
 typedef struct
 {
     task_result result;
-    bm_job job;
-    bool has_job;
+    bm_job *job;
     uint32_t generation;
     stratum_protocol_t protocol;
 } queued_asic_result_t;
@@ -62,15 +61,12 @@ static size_t recent_result_index;
 
 static void free_queued_result(queued_asic_result_t *queued_result)
 {
-    if (queued_result == NULL || !queued_result->has_job) {
+    if (queued_result == NULL || queued_result->job == NULL) {
         return;
     }
 
-    free(queued_result->job.jobid);
-    free(queued_result->job.extranonce2);
-    queued_result->job.jobid = NULL;
-    queued_result->job.extranonce2 = NULL;
-    queued_result->has_job = false;
+    release_bm_job(queued_result->job);
+    queued_result->job = NULL;
 }
 
 static void drain_result_queue(void)
@@ -121,7 +117,7 @@ static uint64_t fingerprint_job(const bm_job *job)
 static bool is_duplicate_result(const queued_asic_result_t *queued_result)
 {
     const task_result *result = &queued_result->result;
-    uint64_t job_fingerprint = fingerprint_job(&queued_result->job);
+    uint64_t job_fingerprint = fingerprint_job(queued_result->job);
 
     for (size_t i = 0; i < ASIC_RESULT_DEDUP_CACHE_SIZE; i++) {
         const recent_asic_result_t *recent = &recent_results[i];
@@ -257,7 +253,7 @@ void ASIC_result_rx_task(void *pvParameters)
 
         queued_asic_result_t queued_result = {
             .result = *asic_result,
-            .has_job = false,
+            .job = NULL,
         };
 
         if (asic_result->register_type == REGISTER_INVALID) {
@@ -270,12 +266,10 @@ void ASIC_result_rx_task(void *pvParameters)
             bool valid = (GLOBAL_STATE->valid_jobs[job_id] != 0) &&
                          (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id] != NULL);
             if (valid) {
-                const bm_job *active_job =
+                bm_job *active_job =
                     GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job_id];
-                queued_result.job = *active_job;
-                queued_result.job.jobid = queued_result.job.jobid ? strdup(queued_result.job.jobid) : NULL;
-                queued_result.job.extranonce2 = queued_result.job.extranonce2 ? strdup(queued_result.job.extranonce2) : NULL;
-                queued_result.has_job = true;
+                retain_bm_job(active_job);
+                queued_result.job = active_job;
                 queued_result.generation =
                     (uint32_t)atomic_load(&job_generation);
                 queued_result.protocol = GLOBAL_STATE->stratum_protocol;
@@ -285,16 +279,16 @@ void ASIC_result_rx_task(void *pvParameters)
                 // from an old slot with metadata from a newly reused slot.
                 if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id == BM1397) {
                     queued_result.result.rolled_version =
-                        queued_result.job.version;
+                        queued_result.job->version;
                     for (uint8_t i = 0;
                          i < queued_result.result.version_rolling_index; i++) {
                         queued_result.result.rolled_version = increment_bitmask(
                             queued_result.result.rolled_version,
-                            queued_result.job.version_mask);
+                            queued_result.job->version_mask);
                     }
                 } else {
                     queued_result.result.rolled_version =
-                        queued_result.job.version |
+                        queued_result.job->version |
                         queued_result.result.version_bits;
                 }
             }
@@ -305,7 +299,8 @@ void ASIC_result_rx_task(void *pvParameters)
                 ESP_LOGD(TAG, "Invalid job nonce found, 0x%02X", job_id);
                 continue;
             }
-            if (queued_result.job.jobid == NULL || queued_result.job.extranonce2 == NULL) {
+            if (queued_result.job->jobid == NULL ||
+                queued_result.job->extranonce2 == NULL) {
                 atomic_fetch_add(&metadata_failure_count, 1);
                 ESP_LOGE(TAG, "Failed to snapshot metadata for job 0x%02X", job_id);
                 free_queued_result(&queued_result);
@@ -371,7 +366,7 @@ void ASIC_result_task(void *pvParameters)
             continue;
         }
 
-        bm_job *active_job = &queued_result.job;
+        bm_job *active_job = queued_result.job;
         // check the nonce difficulty
         double nonce_diff = test_nonce_value(active_job, asic_result->nonce, asic_result->rolled_version);
 

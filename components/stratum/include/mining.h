@@ -25,6 +25,13 @@ typedef struct bm_job
     char *extranonce2;
 } bm_job;
 
+// Allocate a zero-initialized job with immutable metadata stored in the same
+// allocation. The returned reference is owned by the caller.
+bm_job *allocate_bm_job(const char *jobid, const char *extranonce2);
+void retain_bm_job(bm_job *job);
+void release_bm_job(bm_job *job);
+// Free a legacy independently allocated job and its metadata. Jobs returned by
+// allocate_bm_job() must instead be released with release_bm_job().
 void free_bm_job(bm_job *job);
 
 void calculate_coinbase_tx_hash(const char *coinbase_1, const char *coinbase_2,
