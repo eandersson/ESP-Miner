@@ -654,14 +654,14 @@ static void refresh_requested_settings(GlobalState *GLOBAL_STATE)
 static void update_soft_thermal_governor(GlobalState *GLOBAL_STATE,
                                          power_control_t *control,
                                          float hottest_temp,
+                                         bool vr_required,
                                          bool vr_valid,
                                          TickType_t now)
 {
     PowerManagementModule *power = &GLOBAL_STATE->POWER_MANAGEMENT_MODULE;
     bool hot = hottest_temp >= THROTTLE_TEMP_C ||
-               (vr_valid && power->vr_temp >= TPS546_THROTTLE_TEMP_C);
-    bool cool = hottest_temp <= THROTTLE_RELEASE_TEMP_C &&
-                (!vr_valid || power->vr_temp <= TPS546_RELEASE_TEMP_C);
+               (vr_required && vr_valid &&
+                power->vr_temp >= TPS546_THROTTLE_TEMP_C);
 
     if (hot) {
         control->throttle_last_cool_sample = 0;
@@ -697,6 +697,21 @@ static void update_soft_thermal_governor(GlobalState *GLOBAL_STATE,
         return;
     }
 
+    if (vr_required && !vr_valid) {
+        // Chip-temperature attack remains active when TPS546 telemetry is
+        // unavailable, but no frequency may be restored without proving that
+        // the regulator also has thermal headroom. Do not carry release credit
+        // across this blind interval.
+        control->throttle_last_cool_sample = 0;
+        control->throttle_cool_accumulated_ms = 0;
+        control->throttle_fast_cool_accumulated_ms = 0;
+        control->throttle_warm_samples = 0;
+        control->throttle_last_cool_was_fast = false;
+        return;
+    }
+
+    bool cool = hottest_temp <= THROTTLE_RELEASE_TEMP_C &&
+                (!vr_required || power->vr_temp <= TPS546_RELEASE_TEMP_C);
     if (!cool) {
         // Only intervals between consecutive qualified-cool samples count.
         // One noisy sample pauses rather than erases cooling credit, but warm
@@ -717,7 +732,8 @@ static void update_soft_thermal_governor(GlobalState *GLOBAL_STATE,
 
     bool fast_release_band =
         hottest_temp <= THROTTLE_RELEASE_FAST_TEMP_C &&
-        (!vr_valid || power->vr_temp <= TPS546_RELEASE_FAST_TEMP_C);
+        (!vr_required ||
+         power->vr_temp <= TPS546_RELEASE_FAST_TEMP_C);
 
     if (control->throttle_last_cool_sample != 0) {
         uint32_t elapsed_ms = pdTICKS_TO_MS(
@@ -1050,20 +1066,11 @@ void POWER_MANAGEMENT_task(void *pvParameters)
             }
         }
 
-        bool governor_inputs_valid = chip_temps_valid &&
-            (!GLOBAL_STATE->DEVICE_CONFIG.TPS546 || vr_valid);
-        if (governor_inputs_valid) {
+        if (chip_temps_valid) {
             update_soft_thermal_governor(GLOBAL_STATE, &control, hottest_temp,
-                                         vr_valid && GLOBAL_STATE->DEVICE_CONFIG.TPS546,
+                                         GLOBAL_STATE->DEVICE_CONFIG.TPS546,
+                                         vr_valid,
                                          now);
-        } else {
-            // An invalid regulator temperature is also a blind interval on
-            // boards whose release policy depends on that sensor.
-            control.throttle_last_cool_sample = 0;
-            control.throttle_cool_accumulated_ms = 0;
-            control.throttle_fast_cool_accumulated_ms = 0;
-            control.throttle_warm_samples = 0;
-            control.throttle_last_cool_was_fast = false;
         }
 
         float target_frequency = fminf(power->requested_frequency,
