@@ -49,6 +49,7 @@ typedef struct
     uint32_t generation;
     uint32_t nonce;
     uint32_t version_bits;
+    double difficulty;
     uint64_t result_timestamp_us;
 } queued_v1_share_t;
 
@@ -571,7 +572,7 @@ void ASIC_result_rx_task(void *pvParameters)
 
 static bool enqueue_v1_share(GlobalState *GLOBAL_STATE,
                              const queued_asic_result_t *queued_result,
-                             uint32_t version_bits)
+                             uint32_t version_bits, double difficulty)
 {
     uint16_t active_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback
                               ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
@@ -584,6 +585,7 @@ static bool enqueue_v1_share(GlobalState *GLOBAL_STATE,
         .generation = queued_result->generation,
         .nonce = queued_result->result.nonce,
         .version_bits = version_bits,
+        .difficulty = difficulty,
         .result_timestamp_us = queued_result->result.timestamp_us,
     };
 
@@ -681,7 +683,15 @@ void ASIC_result_task(void *pvParameters)
             continue;
         }
 
-        if (nonce_diff >= active_job->pool_diff)
+        double required_share_difficulty = active_job->pool_diff;
+        if (queued_result.protocol == STRATUM_PROTOCOL_V1) {
+            required_share_difficulty =
+                mining_v1_effective_share_difficulty(
+                    active_job->pool_diff,
+                    stratum_v1_get_current_difficulty(GLOBAL_STATE));
+        }
+
+        if (nonce_diff >= required_share_difficulty)
         {
             if (queued_result.protocol == STRATUM_PROTOCOL_V2) {
                 // SV2: submit with binary protocol
@@ -733,14 +743,14 @@ void ASIC_result_task(void *pvParameters)
                 // register traffic to evict valid shares. A dedicated bounded
                 // worker owns V1 submissions and rechecks the generation.
                 if (!enqueue_v1_share(GLOBAL_STATE, &queued_result,
-                                      version_bits)) {
+                                      version_bits, nonce_diff)) {
                     ESP_LOGW(TAG, "Unable to queue valid Stratum V1 share");
                 }
             }
         }
 
         //log the ASIC response
-        ESP_LOGD(TAG, "ID: %s, ASIC nr: %d, Core: %d/%d, ver: %08" PRIX32 " Nonce %08" PRIX32 " diff %.1f of %g.", active_job->jobid, asic_result->asic_nr, asic_result->core_id, asic_result->small_core_id, asic_result->rolled_version, asic_result->nonce, nonce_diff, active_job->pool_diff);
+        ESP_LOGD(TAG, "ID: %s, ASIC nr: %d, Core: %d/%d, ver: %08" PRIX32 " Nonce %08" PRIX32 " diff %.1f of %g.", active_job->jobid, asic_result->asic_nr, asic_result->core_id, asic_result->small_core_id, asic_result->rolled_version, asic_result->nonce, nonce_diff, required_share_difficulty);
 
         SYSTEM_notify_found_nonce(GLOBAL_STATE, nonce_diff, active_job->target);
 
@@ -776,9 +786,14 @@ void ASIC_v1_share_submit_task(void *pvParameters)
             GLOBAL_STATE, share.generation, uid, share.user,
             share.job->jobid, share.job->extranonce2, share.job->ntime,
             share.nonce, share.job->version_rolling_enabled,
-            share.version_bits, &sent_time_us);
+            share.version_bits, share.difficulty, share.job->pool_diff,
+            &sent_time_us);
 
-        if (ret == STRATUM_SOCKET_WRITE_TRUNCATED) {
+        if (ret == STRATUM_V1_SUBMIT_FILTERED) {
+            atomic_fetch_add(&dropped_share_count, 1);
+            ESP_LOGD(TAG,
+                     "Filtered queued V1 share below updated pool difficulty");
+        } else if (ret == STRATUM_SOCKET_WRITE_TRUNCATED) {
             ESP_LOGE(TAG,
                      "Partial share written to socket; dropping connection");
             stratum_v1_interrupt_connection(GLOBAL_STATE);

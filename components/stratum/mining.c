@@ -1,6 +1,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <float.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -242,6 +244,23 @@ bool extranonce_2_increment(uint64_t *extranonce_2, uint32_t length)
 
     (*extranonce_2)++;
     return true;
+}
+
+double mining_v1_effective_share_difficulty(double job_difficulty,
+                                            double announced_difficulty)
+{
+    // Fail closed if either side is not a finite positive value. Normal jobs
+    // are validated before reaching this helper; DBL_MAX prevents corrupted
+    // connection state from putting a below-target share on the wire.
+    if (!isfinite(job_difficulty) || !(job_difficulty > 0.0) ||
+        !isfinite(announced_difficulty) ||
+        !(announced_difficulty > 0.0)) {
+        return DBL_MAX;
+    }
+
+    return job_difficulty > announced_difficulty
+               ? job_difficulty
+               : announced_difficulty;
 }
 
 double hash_to_pdiff(const uint8_t hash[32])

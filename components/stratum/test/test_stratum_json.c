@@ -77,6 +77,15 @@ TEST_CASE("Parse stratum set_difficulty params with fractional", "[mining.set_di
     TEST_ASSERT_EQUAL_DOUBLE(100.5, stratum_api_v1_message.new_difficulty);
 }
 
+TEST_CASE("Reject non-finite stratum difficulty", "[mining.set_difficulty]")
+{
+    const char *json_string =
+        "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[1e309]}";
+    StratumApiV1Message stratum_api_v1_message = {};
+    TEST_ASSERT_FALSE(
+        STRATUM_V1_parse(&stratum_api_v1_message, json_string));
+}
+
 TEST_CASE("Parse stratum notify params", "[mining.notify]")
 {
     StratumApiV1Message stratum_api_v1_message = {};

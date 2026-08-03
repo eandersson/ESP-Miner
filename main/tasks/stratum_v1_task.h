@@ -17,14 +17,19 @@ typedef struct
     bool version_rolling_enabled;
 } stratum_v1_work;
 
+enum {
+    STRATUM_V1_SUBMIT_FILTERED = 0,
+};
+
 void stratum_v1_task(void *pvParameters);
 void stratum_v1_close_connection(GlobalState *GLOBAL_STATE);
 void stratum_v1_interrupt_connection(GlobalState *GLOBAL_STATE);
+double stratum_v1_get_current_difficulty(GlobalState *GLOBAL_STATE);
 int stratum_v1_submit_share_safe(
     GlobalState *GLOBAL_STATE, uint32_t expected_generation, int uid,
     const char *user, const char *job_id, const char *extranonce_2,
     uint32_t ntime, uint32_t nonce, bool version_rolling_enabled,
-    uint32_t version_bits,
+    uint32_t version_bits, double share_difficulty, double job_difficulty,
     uint64_t *sent_time_us);
 
 #endif // STRATUM_V1_TASK_H_

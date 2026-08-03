@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <math.h>
 
 #define TRANSPORT_TIMEOUT_MS 5000
 #define BUFFER_SIZE 1024
@@ -407,8 +408,9 @@ static bool parse_set_difficulty(cJSON *json, StratumApiV1Message *message)
         return false;
     }
     message->new_difficulty = difficulty->valuedouble;
-    if (!(message->new_difficulty > 0.0)) {
-        ESP_LOGE(TAG, "Pool difficulty must be positive");
+    if (!isfinite(message->new_difficulty) ||
+        !(message->new_difficulty > 0.0)) {
+        ESP_LOGE(TAG, "Pool difficulty must be positive and finite");
         return false;
     }
     ESP_LOGI(TAG, "Set pool difficulty: %.2f", message->new_difficulty);

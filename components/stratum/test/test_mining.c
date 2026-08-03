@@ -3,7 +3,9 @@
 #include "stratum_api.h"
 #include "utils.h"
 
+#include <float.h>
 #include <limits.h>
+#include <math.h>
 #include <string.h>
 
 TEST_CASE("Refcounted jobs retain inline metadata", "[mining]")
@@ -271,24 +273,59 @@ TEST_CASE("Extranonce2 generation validates capacity", "[mining extranonce2]")
         1, MAX_EXTRANONCE_2_LEN + 1, too_small, sizeof(too_small)));
 }
 
+static void assert_equal_uint64_without_unity64(uint64_t expected,
+                                                uint64_t actual)
+{
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)(expected >> 32),
+                             (uint32_t)(actual >> 32));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)expected, (uint32_t)actual);
+}
+
 TEST_CASE("Extranonce2 counter never wraps", "[mining extranonce2]")
 {
     uint64_t value = 0;
     TEST_ASSERT_FALSE(extranonce_2_increment(&value, 0));
-    TEST_ASSERT_EQUAL_UINT64(0, value);
+    assert_equal_uint64_without_unity64(0, value);
 
     value = UINT8_MAX - 1;
     TEST_ASSERT_TRUE(extranonce_2_increment(&value, 1));
-    TEST_ASSERT_EQUAL_UINT64(UINT8_MAX, value);
+    assert_equal_uint64_without_unity64(UINT8_MAX, value);
     TEST_ASSERT_FALSE(extranonce_2_increment(&value, 1));
-    TEST_ASSERT_EQUAL_UINT64(UINT8_MAX, value);
+    assert_equal_uint64_without_unity64(UINT8_MAX, value);
 
     value = UINT16_MAX;
     TEST_ASSERT_FALSE(extranonce_2_increment(&value, 2));
+    assert_equal_uint64_without_unity64(UINT16_MAX, value);
     value = UINT64_MAX;
     TEST_ASSERT_FALSE(extranonce_2_increment(&value, 8));
+    assert_equal_uint64_without_unity64(UINT64_MAX, value);
     TEST_ASSERT_FALSE(extranonce_2_increment(
         &value, MAX_EXTRANONCE_2_LEN));
+    assert_equal_uint64_without_unity64(UINT64_MAX, value);
+}
+
+TEST_CASE("V1 share threshold follows the strictest live difficulty",
+          "[mining difficulty]")
+{
+    // An increase may be enforced immediately by compatibility pools even
+    // though the V1 specification associates it with the next job.
+    TEST_ASSERT_EQUAL_DOUBLE(
+        1000.0, mining_v1_effective_share_difficulty(500.0, 1000.0));
+
+    // A decrease must not weaken a job that was issued at a higher target.
+    TEST_ASSERT_EQUAL_DOUBLE(
+        1000.0, mining_v1_effective_share_difficulty(1000.0, 500.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        100.5, mining_v1_effective_share_difficulty(100.25, 100.5));
+
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(0.0, 1000.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(1000.0, 0.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(NAN, 1000.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(1000.0, INFINITY));
 }
 
 TEST_CASE("Test nonce diff checking", "[mining test_nonce][not-on-qemu]")

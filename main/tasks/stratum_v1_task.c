@@ -207,9 +207,26 @@ static void stratum_v1_reset_connection_state(GlobalState *GLOBAL_STATE)
 static void stratum_v1_set_difficulty(GlobalState *GLOBAL_STATE,
                                       double difficulty)
 {
+    // Do not take stratum_v1_submit_lock here. Submitters serialize socket
+    // writes separately and re-read pool_difficulty under v1_state_lock before
+    // each write.
+    // An already-snapshotted write may finish, but blocking pool RX behind its
+    // five-second socket timeout would delay subsequent difficulty/job data.
     pthread_mutex_lock(&v1_state_lock);
     GLOBAL_STATE->pool_difficulty = difficulty;
     pthread_mutex_unlock(&v1_state_lock);
+}
+
+double stratum_v1_get_current_difficulty(GlobalState *GLOBAL_STATE)
+{
+    if (GLOBAL_STATE == NULL) {
+        return 0.0;
+    }
+
+    pthread_mutex_lock(&v1_state_lock);
+    double difficulty = GLOBAL_STATE->pool_difficulty;
+    pthread_mutex_unlock(&v1_state_lock);
+    return difficulty;
 }
 
 static void stratum_v1_set_rolling_state(GlobalState *GLOBAL_STATE,
@@ -284,7 +301,7 @@ int stratum_v1_submit_share_safe(
     GlobalState *GLOBAL_STATE, uint32_t expected_generation, int uid,
     const char *user, const char *job_id, const char *extranonce_2,
     uint32_t ntime, uint32_t nonce, bool version_rolling_enabled,
-    uint32_t version_bits,
+    uint32_t version_bits, double share_difficulty, double job_difficulty,
     uint64_t *sent_time_us)
 {
     // SYSTEM_clean_jobs_queue takes this same lock before publishing a new
@@ -298,6 +315,18 @@ int stratum_v1_submit_share_safe(
         pthread_mutex_unlock(&GLOBAL_STATE->stratum_v1_submit_lock);
         return -1;
     }
+
+    pthread_mutex_lock(&v1_state_lock);
+    double announced_difficulty = GLOBAL_STATE->pool_difficulty;
+    pthread_mutex_unlock(&v1_state_lock);
+    double required_difficulty = mining_v1_effective_share_difficulty(
+        job_difficulty, announced_difficulty);
+    if (!(share_difficulty >= required_difficulty)) {
+        pthread_mutex_unlock(&v1_lifecycle_lock);
+        pthread_mutex_unlock(&GLOBAL_STATE->stratum_v1_submit_lock);
+        return STRATUM_V1_SUBMIT_FILTERED;
+    }
+
     esp_transport_handle_t transport = GLOBAL_STATE->transport;
     v1_active_writers++;
     pthread_mutex_unlock(&v1_lifecycle_lock);
@@ -733,9 +762,9 @@ void stratum_v1_task(void *pvParameters)
 
                 case MINING_SET_DIFFICULTY:
                     ESP_LOGI(TAG, "Set pool difficulty: %.2f", stratum_api_v1_message.new_difficulty);
-                    // V1 set_difficulty applies to the next notify. Keeping it
-                    // in the connection snapshot prevents a later update from
-                    // changing already-issued work.
+                    // Keep the per-job snapshot for spec-compliant pools. The
+                    // submit path also applies increases immediately because
+                    // some pools enforce the new threshold without a notify.
                     stratum_v1_set_difficulty(
                         GLOBAL_STATE,
                         stratum_api_v1_message.new_difficulty);
