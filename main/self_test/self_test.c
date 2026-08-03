@@ -19,6 +19,7 @@
 #include "asic_result_task.h"
 #include "work_queue.h"
 #include "stratum_api.h"
+#include "stratum_v1_task.h"
 #include "PID.h"
 #include "self_test.h"
 #include "stratum_api.h"
@@ -51,7 +52,13 @@ static const char * TAG = "self_test";
 
 static void free_self_test_queued_work(void *work)
 {
-    STRATUM_V1_free_mining_notify((mining_notify *)work);
+    stratum_v1_work *v1_work = (stratum_v1_work *)work;
+    if (v1_work == NULL) {
+        return;
+    }
+    STRATUM_V1_free_mining_notify(v1_work->notification);
+    free(v1_work->extranonce_1);
+    free(v1_work);
 }
 
 static SemaphoreHandle_t longPressSemaphore;
@@ -535,14 +542,36 @@ void self_test_task(void * pvParameters)
 
     if (msg.method == MINING_NOTIFY) {
         ESP_LOGI(TAG, "Enqueuing mock work into stratum_queue");
+        stratum_v1_work *work = calloc(1, sizeof(*work));
+        if (work == NULL) {
+            ESP_LOGE(TAG, "Unable to allocate self-test V1 work context");
+            STRATUM_V1_free_mining_notify(msg.mining_notification);
+            msg.mining_notification = NULL;
+            tests_done(GLOBAL_STATE, false);
+            return;
+        }
+        work->notification = msg.mining_notification;
+        work->extranonce_1 = strdup(GLOBAL_STATE->extranonce_str);
+        work->extranonce_2_len = GLOBAL_STATE->extranonce_2_len;
+        work->difficulty = GLOBAL_STATE->pool_difficulty;
+        work->version_rolling_enabled = true;
+        work->version_mask = GLOBAL_STATE->version_mask;
+        if (work->extranonce_1 == NULL) {
+            free_self_test_queued_work(work);
+            msg.mining_notification = NULL;
+            ESP_LOGE(TAG, "Unable to snapshot self-test extranonce");
+            tests_done(GLOBAL_STATE, false);
+            return;
+        }
         queue_enqueue(&GLOBAL_STATE->stratum_queue,
-                      msg.mining_notification,
+                      work,
                       (work_queue_item_metadata) {
                           .generation =
                               ASIC_result_task_get_pool_generation(),
                           .kind = WORK_QUEUE_ITEM_STRATUM_V1,
                           .free_fn = free_self_test_queued_work,
                       });
+        msg.mining_notification = NULL;
     } else {
         ESP_LOGE(TAG, "Failed to parse mock mining notification");
         tests_done(GLOBAL_STATE, false);

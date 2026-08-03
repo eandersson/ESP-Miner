@@ -21,6 +21,16 @@ typedef struct bm_job bm_job;
 typedef struct sv2_conn sv2_conn;
 typedef struct sv2_noise_ctx sv2_noise_ctx;
 
+// ASIC lifecycle is deliberately more expressive than ASIC_initalized.  The
+// compatibility boolean is kept for older consumers, but is true only while
+// this state is RUNNING so no work is submitted during a reset or ramp-down.
+typedef enum {
+    ASIC_LIFECYCLE_STOPPED = 0,
+    ASIC_LIFECYCLE_STARTING,
+    ASIC_LIFECYCLE_RUNNING,
+    ASIC_LIFECYCLE_STOPPING,
+} asic_lifecycle_state_t;
+
 #define STRATUM_USER CONFIG_STRATUM_USER
 #define FALLBACK_STRATUM_USER CONFIG_FALLBACK_STRATUM_USER
 
@@ -148,6 +158,12 @@ typedef struct AsicTaskModule
     // it also may return a previous nonce under some circumstances
     // so we keep a list of jobs indexed by the job id
     bm_job **active_jobs;
+    // Keep the immediately preceding owner of each wire job ID. A nonce can
+    // still be in the ASIC/UART pipeline when the small hardware ID space is
+    // reused, so result handling must be able to validate both generations.
+    bm_job **retired_jobs;
+    int64_t *active_job_dispatch_us;
+    int64_t *retired_job_dispatch_us;
     // Current job to be processed (replaces ASIC_jobs_queue)
     bm_job *current_job;
     //semaphone
@@ -171,11 +187,18 @@ typedef struct GlobalState
 
     uint8_t * valid_jobs;
     pthread_mutex_t valid_jobs_lock;
+    // Serializes a V1 share write with job-generation invalidation without
+    // holding valid_jobs_lock across a potentially slow network operation.
+    pthread_mutex_t stratum_v1_submit_lock;
 
     double pool_difficulty;
     bool new_set_mining_difficulty_msg;
     uint32_t version_mask;
     bool new_stratum_version_rolling_msg;
+    // Stratum V1's BIP310 state is reset for every TCP connection. Keep it
+    // separate from the shared mask above, which is also used by Stratum V2.
+    bool stratum_v1_version_rolling_enabled;
+    uint32_t stratum_v1_version_mask;
 
     esp_transport_handle_t transport;
     portMUX_TYPE stratum_mux;
@@ -188,7 +211,8 @@ typedef struct GlobalState
     struct sv2_conn *sv2_conn;
     struct sv2_noise_ctx *sv2_noise_ctx;
 
-    bool ASIC_initalized;
+    volatile asic_lifecycle_state_t asic_lifecycle;
+    volatile bool ASIC_initalized;
     bool psram_is_available;
     bool filesystem_is_available;
 

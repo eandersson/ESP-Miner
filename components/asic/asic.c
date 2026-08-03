@@ -51,20 +51,23 @@ task_result * ASIC_process_work(GlobalState * GLOBAL_STATE)
     return NULL;
 }
 
-int ASIC_set_max_baud(GlobalState * GLOBAL_STATE)
+esp_err_t ASIC_set_max_baud(GlobalState *GLOBAL_STATE, int *baud)
 {
+    if (GLOBAL_STATE == NULL || baud == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            return BM1397_set_max_baud();
+            return BM1397_set_max_baud(baud);
         case BM1366:
-            return BM1366_set_max_baud();
+            return BM1366_set_max_baud(baud);
         case BM1368:
-            return BM1368_set_max_baud();
+            return BM1368_set_max_baud(baud);
         case BM1370:
-            return BM1370_set_max_baud();
+            return BM1370_set_max_baud(baud);
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set max baud", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
-    return 0;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 bool ASIC_send_work(GlobalState * GLOBAL_STATE, bm_job * next_job,
@@ -89,54 +92,67 @@ bool ASIC_send_work(GlobalState * GLOBAL_STATE, bm_job * next_job,
     }
 }
 
-void ASIC_set_version_mask(GlobalState * GLOBAL_STATE, uint32_t mask)
+esp_err_t ASIC_set_version_mask(GlobalState *GLOBAL_STATE, uint32_t mask)
 {
+    if (GLOBAL_STATE == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err;
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            BM1397_set_version_mask(mask);
+            err = BM1397_set_version_mask(mask);
             break;
         case BM1366:
-            BM1366_set_version_mask(mask);
+            err = BM1366_set_version_mask(mask);
             break;
         case BM1368:
-            BM1368_set_version_mask(mask);
+            err = BM1368_set_version_mask(mask);
             break;
         case BM1370:
-            BM1370_set_version_mask(mask);
+            err = BM1370_set_version_mask(mask);
             break;
         default:
             ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set version mask", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
-            break;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set ASIC version mask 0x%08lx: %s",
+                 (unsigned long)mask, esp_err_to_name(err));
+        return err;
     }
     effective_version_mask = mask;
+    return ESP_OK;
 }
 
-void ASIC_restore_version_mask(GlobalState *GLOBAL_STATE)
+esp_err_t ASIC_restore_version_mask(GlobalState *GLOBAL_STATE)
 {
-    ASIC_set_version_mask(GLOBAL_STATE, effective_version_mask);
+    return ASIC_set_version_mask(GLOBAL_STATE, effective_version_mask);
 }
 
-void ASIC_set_frequency(GlobalState * GLOBAL_STATE)
+esp_err_t ASIC_set_frequency(GlobalState *GLOBAL_STATE)
 {
+    if (GLOBAL_STATE == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            do_frequency_transition(GLOBAL_STATE, BM1397_send_hash_frequency);
-            return;
+            return do_frequency_transition(GLOBAL_STATE, BM1397_send_hash_frequency);
         case BM1366:
-            do_frequency_transition(GLOBAL_STATE, BM1366_send_hash_frequency);
-            return;
+            return do_frequency_transition(GLOBAL_STATE, BM1366_send_hash_frequency);
         case BM1368:
-            do_frequency_transition(GLOBAL_STATE, BM1368_send_hash_frequency);
-            return;
+            return do_frequency_transition(GLOBAL_STATE, BM1368_send_hash_frequency);
         case BM1370:
-            do_frequency_transition(GLOBAL_STATE, BM1370_send_hash_frequency);
-            return;
+            return do_frequency_transition(GLOBAL_STATE, BM1370_send_hash_frequency);
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set frequency", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
-void ASIC_set_nonce_space(GlobalState * GLOBAL_STATE)
+esp_err_t ASIC_set_nonce_space(GlobalState *GLOBAL_STATE)
 {
+    if (GLOBAL_STATE == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     float nonce_percent = 1.0;
     int cores = GLOBAL_STATE->DEVICE_CONFIG.family.asic.core_count;
     int asic_count = GLOBAL_STATE->DEVICE_CONFIG.family.asic_count;
@@ -144,18 +160,16 @@ void ASIC_set_nonce_space(GlobalState * GLOBAL_STATE)
 
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            return;
+            return ESP_OK;
         case BM1366:
-            BM1366_set_nonce_space(nonce_percent, frequency, asic_count, cores);
-            return;
+            return BM1366_set_nonce_space(nonce_percent, frequency, asic_count, cores);
         case BM1368:
-            BM1368_set_nonce_space(nonce_percent, frequency, asic_count, cores);
-            return;
+            return BM1368_set_nonce_space(nonce_percent, frequency, asic_count, cores);
         case BM1370:
-            BM1370_set_nonce_space(nonce_percent, frequency, asic_count, cores);
-            return;
+            return BM1370_set_nonce_space(nonce_percent, frequency, asic_count, cores);
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set nonce space", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 double ASIC_get_asic_job_frequency_ms(GlobalState * GLOBAL_STATE)

@@ -60,8 +60,8 @@ static Settings settings[NVS_CONFIG_COUNT] = {
     [NVS_CONFIG_SECONDARY_POOL_INDEX]                  = {.nvs_key_name = "sec_idx",         .type = TYPE_U16,   .default_value = {.u16 = 1},                                           .rest_name = "secondaryPoolIndex",                 .min = 0,  .max = MAX_POOLS - 1},
     [NVS_CONFIG_USE_FALLBACK_STRATUM]                  = {.nvs_key_name = "usefbstartum",    .type = TYPE_BOOL,                                                                         .rest_name = "useFallbackStratum",                 .min = 0,  .max = 1},
 
-    [NVS_CONFIG_ASIC_FREQUENCY]                        = {.nvs_key_name = "asicfrequency_f", .type = TYPE_FLOAT, .default_value = {.f   = CONFIG_ASIC_FREQUENCY},                       .rest_name = "frequency",                          .min = 1,  .max = UINT16_MAX},
-    [NVS_CONFIG_ASIC_VOLTAGE]                          = {.nvs_key_name = "asicvoltage",     .type = TYPE_U16,   .default_value = {.u16 = CONFIG_ASIC_VOLTAGE},                         .rest_name = "coreVoltage",                        .min = 1,  .max = UINT16_MAX},
+    [NVS_CONFIG_ASIC_FREQUENCY]                        = {.nvs_key_name = "asicfrequency_f", .type = TYPE_FLOAT, .default_value = {.f   = CONFIG_ASIC_FREQUENCY},                       .rest_name = "frequency",                          .min = 50, .max = 800},
+    [NVS_CONFIG_ASIC_VOLTAGE]                          = {.nvs_key_name = "asicvoltage",     .type = TYPE_U16,   .default_value = {.u16 = CONFIG_ASIC_VOLTAGE},                         .rest_name = "coreVoltage",                        .min = 1, .max = UINT16_MAX},
     [NVS_CONFIG_ASIC_JOB_INTERVAL]                     = {.nvs_key_name = "asic_job_ms",     .type = TYPE_U16,   .default_value = {.u16 = 30000},                                       .rest_name = "asicJobInterval",                    .min = 1000, .max = 60000},
     [NVS_CONFIG_OVERCLOCK_ENABLED]                     = {.nvs_key_name = "oc_enabled",      .type = TYPE_BOOL,                                                                         .rest_name = "overclockEnabled",                   .min = 0,  .max = 1},
     
@@ -338,20 +338,18 @@ static void nvs_task(void *pvParameters)
                         setting->value[update.index].str = update.value.str;
                         break;
                     case TYPE_U16:
-                        setting->value[update.index].u16 = update.value.u16;
+                        // Numeric/bool setters publish accepted state before
+                        // enqueueing. Do not let an older queued flash write
+                        // roll the live cache back over a newer request.
                         break;
                     case TYPE_I32:
-                        setting->value[update.index].i32 = update.value.i32;
                         break;
                     case TYPE_U64:
-                        setting->value[update.index].u64 = update.value.u64;
                         break;
                     case TYPE_FLOAT:
-                        setting->value[update.index].f = update.value.f;
                         snprintf(nvs_str_buf, sizeof(nvs_str_buf), "%f", update.value.f);
                         break;
                     case TYPE_BOOL:
-                        setting->value[update.index].b = update.value.b;
                         break;
                 }
                 xSemaphoreGive(nvs_cache_mutex);
@@ -600,10 +598,24 @@ uint16_t nvs_config_get_u16(NvsConfigKey key)
 void nvs_config_set_u16(NvsConfigKey key, uint16_t value)
 {
     Settings *setting = nvs_config_get_settings(key);
-    if (!setting || setting->type != TYPE_U16 || setting->value[0].u16 == value) return;
+    if (!setting || setting->type != TYPE_U16) return;
 
+    // The cache is the authoritative accepted configuration, not merely the
+    // last value flushed by the asynchronous worker. Publish before queueing
+    // so rapid A->B->A requests cannot have the final request deduplicated
+    // against stale state and later apply B.
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    if (setting->value[0].u16 == value) {
+        xSemaphoreGive(nvs_cache_mutex);
+        return;
+    }
+    setting->value[0].u16 = value;
     ConfigUpdate update = { .key = key, .type = TYPE_U16, .value.u16 = value };
+    // Keep cache publication and queue insertion in the same total order
+    // across HTTP, BAP, and internal writers. The worker can dequeue to make
+    // space without this mutex, so a full queue cannot deadlock here.
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    xSemaphoreGive(nvs_cache_mutex);
 }
 
 int32_t nvs_config_get_i32(NvsConfigKey key)
@@ -626,10 +638,17 @@ int32_t nvs_config_get_i32(NvsConfigKey key)
 void nvs_config_set_i32(NvsConfigKey key, int32_t value)
 {
     Settings *setting = nvs_config_get_settings(key);
-    if (!setting || setting->type != TYPE_I32 || setting->value[0].i32 == value) return;
+    if (!setting || setting->type != TYPE_I32) return;
 
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    if (setting->value[0].i32 == value) {
+        xSemaphoreGive(nvs_cache_mutex);
+        return;
+    }
+    setting->value[0].i32 = value;
     ConfigUpdate update = { .key = key, .type = TYPE_I32, .value.i32 = value };
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    xSemaphoreGive(nvs_cache_mutex);
 }
 
 uint64_t nvs_config_get_u64(NvsConfigKey key)
@@ -652,10 +671,17 @@ uint64_t nvs_config_get_u64(NvsConfigKey key)
 void nvs_config_set_u64(NvsConfigKey key, uint64_t value)
 {
     Settings *setting = nvs_config_get_settings(key);
-    if (!setting || setting->type != TYPE_U64 || setting->value[0].u64 == value) return;
+    if (!setting || setting->type != TYPE_U64) return;
 
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    if (setting->value[0].u64 == value) {
+        xSemaphoreGive(nvs_cache_mutex);
+        return;
+    }
+    setting->value[0].u64 = value;
     ConfigUpdate update = { .key = key, .type = TYPE_U64, .value.u64 = value };
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    xSemaphoreGive(nvs_cache_mutex);
 }
 
 float nvs_config_get_float(NvsConfigKey key)
@@ -678,10 +704,17 @@ float nvs_config_get_float(NvsConfigKey key)
 void nvs_config_set_float(NvsConfigKey key, float value)
 {
     Settings *setting = nvs_config_get_settings(key);
-    if (!setting || setting->type != TYPE_FLOAT || fabsf(setting->value[0].f - value) < 0.001f) return;
+    if (!setting || setting->type != TYPE_FLOAT) return;
 
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    if (fabsf(setting->value[0].f - value) < 0.001f) {
+        xSemaphoreGive(nvs_cache_mutex);
+        return;
+    }
+    setting->value[0].f = value;
     ConfigUpdate update = { .key = key, .type = TYPE_FLOAT, .value.f = value };
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    xSemaphoreGive(nvs_cache_mutex);
 }
 
 bool nvs_config_get_bool(NvsConfigKey key)
@@ -704,8 +737,15 @@ bool nvs_config_get_bool(NvsConfigKey key)
 void nvs_config_set_bool(NvsConfigKey key, bool value)
 {
     Settings *setting = nvs_config_get_settings(key);
-    if (!setting || setting->type != TYPE_BOOL || setting->value[0].b == value) return;
+    if (!setting || setting->type != TYPE_BOOL) return;
 
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    if (setting->value[0].b == value) {
+        xSemaphoreGive(nvs_cache_mutex);
+        return;
+    }
+    setting->value[0].b = value;
     ConfigUpdate update = { .key = key, .type = TYPE_BOOL, .value.b = value };
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    xSemaphoreGive(nvs_cache_mutex);
 }

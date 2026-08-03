@@ -7,6 +7,10 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -17,13 +21,47 @@
 #include "bap_uart.h"
 #include "bap_subscription.h"
 #include "bap.h"
-#include "asic.h"
+#include "power_management_task.h"
 
 static const char *TAG = "BAP_HANDLERS";
 
 static bap_command_handler_t handlers[BAP_CMD_UNKNOWN + 1] = {0};
 static char last_processed_message[BAP_MAX_MESSAGE_LEN] = {0};
 static uint32_t last_message_time = 0;
+
+static bool parse_complete(const char *end)
+{
+    while (*end != '\0' && isspace((unsigned char)*end)) {
+        end++;
+    }
+    return *end == '\0';
+}
+
+static bool parse_frequency(const char *value, float *frequency_mhz)
+{
+    errno = 0;
+    char *end = NULL;
+    float parsed = strtof(value, &end);
+    if (end == value || errno == ERANGE || !isfinite(parsed) ||
+        !parse_complete(end)) {
+        return false;
+    }
+    *frequency_mhz = parsed;
+    return true;
+}
+
+static bool parse_voltage(const char *value, uint16_t *voltage_mv)
+{
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || errno == ERANGE || parsed > UINT16_MAX ||
+        !parse_complete(end)) {
+        return false;
+    }
+    *voltage_mv = (uint16_t)parsed;
+    return true;
+}
 
 void BAP_register_handler(bap_command_t cmd, bap_command_handler_t handler) {
     if (cmd >= 0 && cmd <= BAP_CMD_UNKNOWN) {
@@ -303,47 +341,54 @@ void BAP_handle_settings(const char *parameter, const char *value) {
     switch (param) {
         case BAP_PARAM_FREQUENCY:
             {
-                float target_frequency = atof(value);
-                
-                if (target_frequency < 100.0f || target_frequency > 800.0f) {
-                    ESP_LOGE(TAG, "Invalid frequency value: %.2f MHz (valid range: 100-800 MHz)", target_frequency);
+                float target_frequency = 0.0f;
+                if (!parse_frequency(value, &target_frequency)) {
+                    ESP_LOGE(TAG, "Invalid frequency value: %s", value);
                     BAP_send_message(BAP_CMD_ERR, parameter, "invalid_range");
                     return;
                 }
-                
-                //ESP_LOGI(TAG, "Setting ASIC frequency to %.2f MHz", target_frequency);
-                
-                bap_global_state->POWER_MANAGEMENT_MODULE.frequency_value = target_frequency;
 
-                ASIC_set_frequency(bap_global_state);
-                ASIC_set_nonce_space(bap_global_state);
-
-                //ESP_LOGI(TAG, "Frequency successfully set to %.2f MHz", target_frequency);
-
-                nvs_config_set_float(NVS_CONFIG_ASIC_FREQUENCY, target_frequency);
+                esp_err_t err = POWER_MANAGEMENT_request_frequency(
+                    bap_global_state, target_frequency);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "ASIC frequency request %.2f MHz rejected: %s",
+                             target_frequency, esp_err_to_name(err));
+                    BAP_send_message(BAP_CMD_ERR, parameter,
+                                     err == ESP_ERR_INVALID_ARG
+                                         ? "invalid_range"
+                                         : "request_failed");
+                    return;
+                }
 
                 char freq_str[32];
                 snprintf(freq_str, sizeof(freq_str), "%.2f", target_frequency);
-                BAP_send_message(BAP_CMD_ACK, parameter, freq_str);            }
+                BAP_send_message(BAP_CMD_ACK, parameter, freq_str);
+            }
             break;
 
         case BAP_PARAM_ASIC_VOLTAGE:
             {
-                uint16_t target_voltage_mv = (uint16_t)atoi(value);
-
-                if (target_voltage_mv < 700 || target_voltage_mv > 1400) {
-                    ESP_LOGE(TAG, "Invalid voltage value: %d mV (valid range: 700-1400 mV)", target_voltage_mv);
+                uint16_t target_voltage_mv = 0;
+                if (!parse_voltage(value, &target_voltage_mv)) {
+                    ESP_LOGE(TAG, "Invalid voltage value: %s", value);
                     BAP_send_message(BAP_CMD_ERR, parameter, "invalid_range");
                     return;
                 }
 
-                //ESP_LOGI(TAG, "Setting ASIC voltage to %d mV", target_voltage_mv);
-
-                nvs_config_set_u16(NVS_CONFIG_ASIC_VOLTAGE, target_voltage_mv);
-                //ESP_LOGI(TAG, "Voltage successfully set to %d mV", target_voltage_mv);
+                esp_err_t err = POWER_MANAGEMENT_request_voltage(
+                    bap_global_state, target_voltage_mv);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "ASIC voltage request %u mV rejected: %s",
+                             target_voltage_mv, esp_err_to_name(err));
+                    BAP_send_message(BAP_CMD_ERR, parameter,
+                                     err == ESP_ERR_INVALID_ARG
+                                         ? "invalid_range"
+                                         : "request_failed");
+                    return;
+                }
 
                 char voltage_str[32];
-                snprintf(voltage_str, sizeof(voltage_str), "%d", target_voltage_mv);
+                snprintf(voltage_str, sizeof(voltage_str), "%u", target_voltage_mv);
                 BAP_send_message(BAP_CMD_ACK, parameter, voltage_str);
             }
             break;

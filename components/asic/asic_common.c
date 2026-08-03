@@ -20,6 +20,16 @@ static esp_err_t receive_stream_frame(asic_rx_stream_t *stream, uint8_t *buffer,
                                       size_t frame_size, uint32_t timeout_ms,
                                       uint64_t *out_timestamp_us);
 
+register_type_t asic_register_map_lookup(const register_type_t *register_map,
+                                         size_t register_map_size,
+                                         uint8_t register_address)
+{
+    if (register_map == NULL || register_address >= register_map_size) {
+        return REGISTER_INVALID;
+    }
+    return register_map[register_address];
+}
+
 static void format_asic_indices(char *buffer, size_t buffer_size, int first_index, int end_index)
 {
     size_t offset = 0;

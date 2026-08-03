@@ -1,6 +1,7 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "work_queue.h"
 #include "global_state.h"
@@ -20,6 +21,9 @@
 #include "stratum_v1_task.h"
 #include "stratum_v2_task.h"
 #include "asic_result_task.h"
+#include "asic_init.h"
+#include "asic_reset.h"
+#include "vcore.h"
 #include "utils.h"
 
 static const char *TAG = "create_jobs_task";
@@ -31,9 +35,33 @@ static const char *TAG = "create_jobs_task";
 #define JOB_ASIC_NOT_READY_RETRY_US 100000
 #define MICROSECONDS_PER_MILLISECOND 1000
 
-static bool generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification,
-                          uint64_t extranonce_2, double difficulty,
+static void scheduler_fail_closed(GlobalState *GLOBAL_STATE,
+                                  const char *message)
+{
+    GLOBAL_STATE->SYSTEM_MODULE.hardware_fault = true;
+    snprintf(GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg,
+             sizeof(GLOBAL_STATE->SYSTEM_MODULE.hardware_fault_msg), "%s",
+             message);
+
+    // The ASIC was already initialized before this task was created. If its
+    // scheduler cannot start, immediately revoke RUNNING and remove power so
+    // the rest of the system cannot present an idle chip as mining-ready.
+    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
+    if (asic_hold_reset_low() != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to hold ASIC reset after scheduler failure");
+    }
+    if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to disable VCORE after scheduler failure");
+    }
+    GLOBAL_STATE->POWER_MANAGEMENT_MODULE.expected_hashrate = 0.0f;
+    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPED);
+}
+
+static bool generate_work(GlobalState *GLOBAL_STATE, stratum_v1_work *work,
+                          uint64_t extranonce_2,
                           uint32_t expected_generation);
+static bm_job *prepare_work_v1(stratum_v1_work *work,
+                               uint64_t extranonce_2);
 static bool generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *job,
                               double difficulty, uint32_t version_cursor,
                               uint32_t ntime_offset,
@@ -53,6 +81,33 @@ static void free_work_item(void *work,
     } else {
         free(work);
     }
+}
+
+static void discard_prepared_v1_job(bm_job **job)
+{
+    if (job == NULL || *job == NULL) {
+        return;
+    }
+    release_bm_job(*job);
+    *job = NULL;
+}
+
+static bool send_prepared_job(GlobalState *GLOBAL_STATE, bm_job *job,
+                              uint32_t expected_generation)
+{
+    if (job == NULL) {
+        return false;
+    }
+    if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
+        ESP_LOGW(TAG, "ASIC not initialized, skipping job send");
+        release_bm_job(job);
+        return false;
+    }
+    if (!ASIC_send_work(GLOBAL_STATE, job, expected_generation)) {
+        release_bm_job(job);
+        return false;
+    }
+    return true;
 }
 
 static work_queue_item_kind get_active_work_kind(GlobalState *GLOBAL_STATE)
@@ -145,7 +200,7 @@ static bool work_has_clean_jobs(void *work, work_queue_item_kind kind)
         return ((sv2_job_t *)work)->clean_jobs;
     }
     return kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
-           ((mining_notify *)work)->clean_jobs;
+           ((stratum_v1_work *)work)->notification->clean_jobs;
 }
 
 static void log_dequeued_work(void *work, work_queue_item_kind kind)
@@ -158,13 +213,14 @@ static void log_dequeued_work(void *work, work_queue_item_kind kind)
                  ((sv2_job_t *)work)->job_id);
     } else if (kind == WORK_QUEUE_ITEM_STRATUM_V1) {
         ESP_LOGI(TAG, "New Work Dequeued %s",
-                 ((mining_notify *)work)->job_id);
+                 ((stratum_v1_work *)work)->notification->job_id);
     }
 }
 
 static bool apply_pending_control_updates(GlobalState *GLOBAL_STATE,
                                           double *difficulty)
 {
+    static int64_t next_mask_retry_us;
     bool changed = false;
 
     if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
@@ -176,12 +232,26 @@ static bool apply_pending_control_updates(GlobalState *GLOBAL_STATE,
     }
 
     if (GLOBAL_STATE->new_stratum_version_rolling_msg &&
-        GLOBAL_STATE->ASIC_initalized) {
-        ESP_LOGI(TAG, "Set chip version rolls %i",
-                 (int)(GLOBAL_STATE->version_mask >> 13));
-        ASIC_set_version_mask(GLOBAL_STATE, GLOBAL_STATE->version_mask);
-        GLOBAL_STATE->new_stratum_version_rolling_msg = false;
-        changed = true;
+        asic_lifecycle_is_running(GLOBAL_STATE)) {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_mask_retry_us) {
+            ESP_LOGI(TAG, "Set chip version rolls %i",
+                     (int)(GLOBAL_STATE->version_mask >> 13));
+            esp_err_t err = ASIC_set_version_mask(
+                GLOBAL_STATE, GLOBAL_STATE->version_mask);
+            if (err == ESP_OK) {
+                GLOBAL_STATE->new_stratum_version_rolling_msg = false;
+                next_mask_retry_us = 0;
+                changed = true;
+            } else {
+                // Preserve the pending state. A transient UART failure must
+                // not make software believe the chip accepted a new mask.
+                next_mask_retry_us = now_us + 1000000;
+                ESP_LOGW(TAG,
+                         "ASIC version-mask update failed (%s); retrying",
+                         esp_err_to_name(err));
+            }
+        }
     }
 
     return changed;
@@ -209,8 +279,8 @@ static bool dispatch_work(GlobalState *GLOBAL_STATE, void *current_work,
 
     if (kind == WORK_QUEUE_ITEM_STRATUM_V1) {
         return generate_work(
-            GLOBAL_STATE, (mining_notify *)current_work, extranonce_2,
-            difficulty, expected_generation);
+            GLOBAL_STATE, (stratum_v1_work *)current_work, extranonce_2,
+            expected_generation);
     }
     ESP_LOGE(TAG, "Cannot dispatch unknown work item kind");
     return false;
@@ -223,23 +293,40 @@ void create_jobs_task(void *pvParameters)
     // Initialize ASIC task module (moved from ASIC_task)
     if (!esp_psram_is_initialized()) {
         ESP_LOGE(TAG, "PSRAM unavailable; cannot allocate ASIC job tracking");
-        GLOBAL_STATE->ASIC_initalized = false;
+        scheduler_fail_closed(
+            GLOBAL_STATE, "PSRAM unavailable for ASIC job tracking");
         vTaskDelete(NULL);
         return;
     }
 
     GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs = heap_caps_calloc(
         128, sizeof(bm_job *), MALLOC_CAP_SPIRAM);
+    GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs = heap_caps_calloc(
+        128, sizeof(bm_job *), MALLOC_CAP_SPIRAM);
+    GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us = heap_caps_calloc(
+        128, sizeof(int64_t), MALLOC_CAP_SPIRAM);
+    GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us = heap_caps_calloc(
+        128, sizeof(int64_t), MALLOC_CAP_SPIRAM);
     GLOBAL_STATE->valid_jobs = heap_caps_calloc(
         128, sizeof(uint8_t), MALLOC_CAP_SPIRAM);
     if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us == NULL ||
         GLOBAL_STATE->valid_jobs == NULL) {
         ESP_LOGE(TAG, "Unable to allocate ASIC job tracking");
         heap_caps_free(GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs);
+        heap_caps_free(GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs);
+        heap_caps_free(GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us);
+        heap_caps_free(GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us);
         heap_caps_free(GLOBAL_STATE->valid_jobs);
         GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs = NULL;
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs = NULL;
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us = NULL;
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us = NULL;
         GLOBAL_STATE->valid_jobs = NULL;
-        GLOBAL_STATE->ASIC_initalized = false;
+        scheduler_fail_closed(
+            GLOBAL_STATE, "ASIC job tracking allocation failed");
         vTaskDelete(NULL);
         return;
     }
@@ -262,6 +349,12 @@ void create_jobs_task(void *pvParameters)
     uint32_t prepared_job_generation = 0;
     uint32_t sv2_version_cursor = 0;
     uint32_t sv2_ntime_offset = 0;
+    bool v1_extranonce_exhausted = false;
+    uint32_t applied_v1_version_mask = UINT32_MAX;
+    bm_job *prepared_v1_job = NULL;
+    const stratum_v1_work *prepared_v1_owner = NULL;
+    uint64_t prepared_v1_extranonce = 0;
+    uint32_t prepared_v1_pool_generation = 0;
 
     ESP_LOGI(TAG, "ASIC Job Interval: %.3f ms",
              (double)interval_us / MICROSECONDS_PER_MILLISECOND);
@@ -278,6 +371,8 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "Protocol switched from %s to %s, discarding current work",
                          work_kind_name(current_work_metadata.kind),
                          work_kind_name(active_kind));
+                discard_prepared_v1_job(&prepared_v1_job);
+                prepared_v1_owner = NULL;
                 free_work_item(current_work,
                                &current_work_metadata);
                 current_work = NULL;
@@ -286,6 +381,8 @@ void create_jobs_task(void *pvParameters)
             }
             observed_active_kind = active_kind;
             extranonce_2 = 0;
+            v1_extranonce_exhausted = false;
+            applied_v1_version_mask = UINT32_MAX;
             residency_deadline_us = 0;
             retry_not_before_us = 0;
             has_dispatched_work = false;
@@ -332,6 +429,8 @@ void create_jobs_task(void *pvParameters)
         int64_t now_us = esp_timer_get_time();
         if (!dispatch_pending && current_work != NULL &&
             has_dispatched_work &&
+            !(current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
+              v1_extranonce_exhausted) &&
             !is_sv2_standard_channel(GLOBAL_STATE,
                                      current_work_metadata.kind) &&
             now_us >= residency_deadline_us) {
@@ -343,6 +442,8 @@ void create_jobs_task(void *pvParameters)
         if (dispatch_pending) {
             wait_ms = deadline_wait_ms(retry_not_before_us, now_us);
         } else if (current_work == NULL ||
+                   (current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
+                    v1_extranonce_exhausted) ||
                    is_sv2_standard_channel(GLOBAL_STATE,
                                            current_work_metadata.kind)) {
             wait_ms = JOB_SCHEDULER_IDLE_POLL_MS;
@@ -361,12 +462,16 @@ void create_jobs_task(void *pvParameters)
         if (new_work != NULL) {
             active_kind = get_active_work_kind(GLOBAL_STATE);
             if (active_kind != observed_active_kind) {
+                discard_prepared_v1_job(&prepared_v1_job);
+                prepared_v1_owner = NULL;
                 free_work_item(current_work, &current_work_metadata);
                 current_work = NULL;
                 current_work_metadata =
                     (work_queue_item_metadata){0};
                 observed_active_kind = active_kind;
                 extranonce_2 = 0;
+                v1_extranonce_exhausted = false;
+                applied_v1_version_mask = UINT32_MAX;
                 residency_deadline_us = 0;
                 retry_not_before_us = 0;
                 has_dispatched_work = false;
@@ -397,6 +502,8 @@ void create_jobs_task(void *pvParameters)
                     bool generation_changed =
                         dequeued_metadata.generation !=
                         current_work_pool_generation;
+                    discard_prepared_v1_job(&prepared_v1_job);
+                    prepared_v1_owner = NULL;
                     free_work_item(current_work,
                                    &current_work_metadata);
                     current_work = new_work;
@@ -417,6 +524,7 @@ void create_jobs_task(void *pvParameters)
                     saw_clean_jobs |= work_has_clean_jobs(
                         current_work, current_work_metadata.kind);
                     extranonce_2 = 0;
+                    v1_extranonce_exhausted = false;
                     accepted_new_work = true;
                     if (generation_changed) {
                         has_dispatched_work = false;
@@ -463,6 +571,28 @@ void create_jobs_task(void *pvParameters)
                 dispatch_pending = true;
                 retry_not_before_us = 0;
             }
+
+            // A non-clean notification replaces the template that will be
+            // sent at the existing residency deadline. Prepare its first V1
+            // header now, while the previous template is still hashing.
+            if (!dispatch_pending && current_work != NULL &&
+                current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
+                !v1_extranonce_exhausted && prepared_v1_job == NULL) {
+                bm_job *candidate = prepare_work_v1(
+                    (stratum_v1_work *)current_work, extranonce_2);
+                if (candidate != NULL &&
+                    current_work_pool_generation ==
+                        ASIC_result_task_get_pool_generation()) {
+                    prepared_v1_job = candidate;
+                    prepared_v1_owner =
+                        (stratum_v1_work *)current_work;
+                    prepared_v1_extranonce = extranonce_2;
+                    prepared_v1_pool_generation =
+                        current_work_pool_generation;
+                } else if (candidate != NULL) {
+                    release_bm_job(candidate);
+                }
+            }
         } else if (apply_pending_control_updates(GLOBAL_STATE,
                                                  &difficulty)) {
             control_refresh_pending = true;
@@ -497,12 +627,16 @@ void create_jobs_task(void *pvParameters)
         if (active_kind != observed_active_kind ||
             (current_work != NULL &&
              current_work_metadata.kind != active_kind)) {
+            discard_prepared_v1_job(&prepared_v1_job);
+            prepared_v1_owner = NULL;
             free_work_item(current_work, &current_work_metadata);
             current_work = NULL;
             current_work_metadata =
                 (work_queue_item_metadata){0};
             observed_active_kind = active_kind;
             extranonce_2 = 0;
+            v1_extranonce_exhausted = false;
+            applied_v1_version_mask = UINT32_MAX;
             residency_deadline_us = 0;
             retry_not_before_us = 0;
             has_dispatched_work = false;
@@ -530,6 +664,8 @@ void create_jobs_task(void *pvParameters)
         if (current_work_pool_generation != live_pool_generation) {
             ESP_LOGD(TAG,
                      "Discarding pool-invalidated work before ASIC dispatch");
+            discard_prepared_v1_job(&prepared_v1_job);
+            prepared_v1_owner = NULL;
             free_work_item(current_work, &current_work_metadata);
             current_work = NULL;
             current_work_metadata =
@@ -563,6 +699,8 @@ void create_jobs_task(void *pvParameters)
             retry_not_before_us = 0;
         }
         if (!dispatch_pending && has_dispatched_work &&
+            !(current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
+              v1_extranonce_exhausted) &&
             !is_sv2_standard_channel(GLOBAL_STATE,
                                      current_work_metadata.kind) &&
             now_us >= residency_deadline_us) {
@@ -574,7 +712,7 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        if (!GLOBAL_STATE->ASIC_initalized) {
+        if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
             // Recovery can leave the scheduler alive while the ASIC is
             // temporarily unavailable. Avoid repeated allocation, hashing,
             // and warning logs until it is ready again.
@@ -584,12 +722,42 @@ void create_jobs_task(void *pvParameters)
         }
 
         uint32_t dispatch_version_mask =
-            GLOBAL_STATE->version_mask;
-        bool dispatched = dispatch_work(
-            GLOBAL_STATE, current_work, current_work_metadata.kind,
-            difficulty,
-            extranonce_2, sv2_version_cursor, sv2_ntime_offset,
-            dispatch_version_mask, expected_job_generation);
+            current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1
+                ? ((stratum_v1_work *)current_work)->version_mask
+                : GLOBAL_STATE->version_mask;
+        bool mask_ready = true;
+        if (current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
+            applied_v1_version_mask != dispatch_version_mask) {
+            mask_ready = ASIC_set_version_mask(
+                             GLOBAL_STATE, dispatch_version_mask) == ESP_OK;
+            if (mask_ready) {
+                applied_v1_version_mask = dispatch_version_mask;
+            }
+        }
+        bool prepared_v1_matches =
+            prepared_v1_job != NULL &&
+            prepared_v1_owner == (stratum_v1_work *)current_work &&
+            prepared_v1_extranonce == extranonce_2 &&
+            prepared_v1_pool_generation == current_work_pool_generation;
+        if (prepared_v1_job != NULL && !prepared_v1_matches) {
+            discard_prepared_v1_job(&prepared_v1_job);
+            prepared_v1_owner = NULL;
+        }
+
+        bool dispatched = false;
+        if (mask_ready && prepared_v1_matches) {
+            bm_job *ready_job = prepared_v1_job;
+            prepared_v1_job = NULL;
+            prepared_v1_owner = NULL;
+            dispatched = send_prepared_job(
+                GLOBAL_STATE, ready_job, expected_job_generation);
+        } else if (mask_ready) {
+            dispatched = dispatch_work(
+                GLOBAL_STATE, current_work, current_work_metadata.kind,
+                difficulty, extranonce_2, sv2_version_cursor,
+                sv2_ntime_offset, dispatch_version_mask,
+                expected_job_generation);
+        }
         if (!dispatched) {
             live_pool_generation =
                 ASIC_result_task_get_pool_generation();
@@ -597,6 +765,8 @@ void create_jobs_task(void *pvParameters)
                 current_work_pool_generation) {
                 ESP_LOGD(TAG,
                          "Discarding pool-invalidated work during ASIC dispatch");
+                discard_prepared_v1_job(&prepared_v1_job);
+                prepared_v1_owner = NULL;
                 free_work_item(current_work, &current_work_metadata);
                 current_work = NULL;
                 current_work_metadata =
@@ -622,10 +792,24 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        if (current_work_metadata.kind ==
-                WORK_QUEUE_ITEM_STRATUM_V1 ||
-            current_work_metadata.kind ==
-                WORK_QUEUE_ITEM_STRATUM_V2_EXTENDED) {
+        // Anchor the ASIC residency interval to the completed UART dispatch.
+        // Preparing the next V1 header below therefore uses host idle time
+        // without shortening the ASIC's nonce scan window.
+        int64_t dispatch_completed_us = esp_timer_get_time();
+
+        if (current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1) {
+            uint32_t extranonce_length =
+                ((stratum_v1_work *)current_work)->extranonce_2_len;
+            if (!extranonce_2_increment(&extranonce_2,
+                                        extranonce_length)) {
+                v1_extranonce_exhausted = true;
+                ESP_LOGW(TAG,
+                         "V1 extranonce2 space exhausted for job %s; waiting for fresh work",
+                         ((stratum_v1_work *)current_work)
+                             ->notification->job_id);
+            }
+        } else if (current_work_metadata.kind ==
+                   WORK_QUEUE_ITEM_STRATUM_V2_EXTENDED) {
             extranonce_2++;
         } else if (is_bm1397_sv2_standard_channel(
                        GLOBAL_STATE, current_work_metadata.kind)) {
@@ -659,36 +843,65 @@ void create_jobs_task(void *pvParameters)
         control_refresh_pending = false;
         retry_not_before_us = 0;
         interval_us = get_job_interval_us(GLOBAL_STATE);
-        residency_deadline_us = esp_timer_get_time() + interval_us;
+        residency_deadline_us = dispatch_completed_us + interval_us;
+
+        // Coinbase, merkle-root, and midstate generation are the expensive
+        // host-side portion of a V1 refresh. Build the next immutable job while
+        // the ASIC scans the one just sent so the following deadline only has
+        // to enqueue the UART packet.
+        if (current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
+            !v1_extranonce_exhausted &&
+            current_work_pool_generation ==
+                ASIC_result_task_get_pool_generation()) {
+            bm_job *candidate = prepare_work_v1(
+                (stratum_v1_work *)current_work, extranonce_2);
+            if (candidate != NULL &&
+                current_work_pool_generation ==
+                    ASIC_result_task_get_pool_generation()) {
+                prepared_v1_job = candidate;
+                prepared_v1_owner = (stratum_v1_work *)current_work;
+                prepared_v1_extranonce = extranonce_2;
+                prepared_v1_pool_generation =
+                    current_work_pool_generation;
+            } else if (candidate != NULL) {
+                release_bm_job(candidate);
+            }
+        }
     }
 }
 
 static bool generate_work(GlobalState *GLOBAL_STATE,
-                          mining_notify *notification,
-                          uint64_t extranonce_2, double difficulty,
-                          uint32_t expected_generation)
+                           stratum_v1_work *work,
+                           uint64_t extranonce_2,
+                           uint32_t expected_generation)
 {
-    char *extranonce_1 = NULL;
-    uint32_t extranonce_2_len = 0;
-    if (!stratum_v1_snapshot_extranonce(
-            GLOBAL_STATE, &extranonce_1, &extranonce_2_len)) {
-        ESP_LOGE(TAG, "Unable to snapshot Stratum V1 extranonce");
-        return false;
-    }
+    return send_prepared_job(
+        GLOBAL_STATE, prepare_work_v1(work, extranonce_2),
+        expected_generation);
+}
+
+static bm_job *prepare_work_v1(stratum_v1_work *work,
+                               uint64_t extranonce_2)
+{
+    mining_notify *notification = work->notification;
+    uint32_t extranonce_2_len = work->extranonce_2_len;
     if (extranonce_2_len > MAX_EXTRANONCE2_LEN) {
         ESP_LOGE(TAG, "extranonce_2_len %lu exceeds maximum %d, skipping job",
                  (unsigned long)extranonce_2_len, MAX_EXTRANONCE2_LEN);
-        free(extranonce_1);
-        return false;
+        return NULL;
     }
     char extranonce_2_str[MAX_EXTRANONCE2_STR];
-    extranonce_2_generate(extranonce_2, extranonce_2_len, extranonce_2_str);
+    if (!extranonce_2_generate(extranonce_2, extranonce_2_len,
+                               extranonce_2_str,
+                               sizeof(extranonce_2_str))) {
+        ESP_LOGE(TAG, "Unable to encode Stratum V1 extranonce2");
+        return NULL;
+    }
 
     uint8_t coinbase_tx_hash[32];
     calculate_coinbase_tx_hash(notification->coinbase_1,
-                               notification->coinbase_2, extranonce_1,
+                               notification->coinbase_2, work->extranonce_1,
                                extranonce_2_str, coinbase_tx_hash);
-    free(extranonce_1);
 
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
@@ -698,26 +911,14 @@ static bool generate_work(GlobalState *GLOBAL_STATE,
 
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new job");
-        return false;
+        return NULL;
     }
 
-    construct_bm_job(notification, merkle_root, GLOBAL_STATE->version_mask, difficulty, next_job);
-    next_job->version_mask = GLOBAL_STATE->version_mask;
-
-    // Check if ASIC is initialized before trying to send work
-    if (!GLOBAL_STATE->ASIC_initalized) {
-        // Clean up the job since we're not sending it
-        // Note: This job was never stored in active_jobs, so it's safe to free
-        ESP_LOGW(TAG, "ASIC not initialized, skipping job send");
-        release_bm_job(next_job);
-        return false;
-    }
-
-    if (!ASIC_send_work(GLOBAL_STATE, next_job, expected_generation)) {
-        release_bm_job(next_job);
-        return false;
-    }
-    return true;
+    construct_bm_job(notification, merkle_root, work->version_mask,
+                     work->difficulty, next_job);
+    next_job->version_mask = work->version_mask;
+    next_job->version_rolling_enabled = work->version_rolling_enabled;
+    return next_job;
 }
 
 // Construct bm_job directly from SV2 fields (no coinbase/merkle computation
@@ -789,7 +990,7 @@ static bool generate_work_sv2(GlobalState *GLOBAL_STATE, sv2_job_t *sv2_job,
 
     next_job->version_mask = version_mask;
 
-    if (!GLOBAL_STATE->ASIC_initalized) {
+    if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
         ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 job send");
         release_bm_job(next_job);
         return false;
@@ -908,7 +1109,7 @@ static bool generate_work_sv2_ext(GlobalState *GLOBAL_STATE, sv2_ext_job_t *ext_
 
     next_job->version_mask = version_mask;
 
-    if (!GLOBAL_STATE->ASIC_initalized) {
+    if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
         ESP_LOGW(TAG, "ASIC not initialized, skipping SV2 ext job send");
         release_bm_job(next_job);
         return false;

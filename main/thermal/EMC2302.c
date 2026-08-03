@@ -87,6 +87,9 @@ static uint16_t get_fan_speed(uint8_t reg_addr, uint8_t multiplier)
     }
 
     uint16_t tach_counter = (tach_data[0] << 5) | (tach_data[1] >> 3);
+    if (tach_counter == 0) {
+        return 0;
+    }
     uint32_t rpm = 3932160UL * multiplier / tach_counter;
 
     if (rpm > UINT16_MAX) {

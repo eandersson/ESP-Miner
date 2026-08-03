@@ -93,3 +93,27 @@ TEST_CASE("ASIC RX stream resynchronizes after noise and a corrupt frame", "[asi
     TEST_ASSERT_EQUAL_UINT32(1, stream.frames_received);
     TEST_ASSERT_EQUAL_UINT32(1, stream.crc_errors);
 }
+
+TEST_CASE("ASIC register lookup rejects addresses outside a sparse map", "[asic_rx]")
+{
+    static const register_type_t register_map[] = {
+        [0x04] = REGISTER_HASHRATE,
+        [0x4C] = REGISTER_ERROR_COUNT,
+    };
+
+    TEST_ASSERT_EQUAL(REGISTER_HASHRATE,
+                      asic_register_map_lookup(register_map,
+                                               sizeof(register_map) /
+                                                   sizeof(register_map[0]),
+                                               0x04));
+    TEST_ASSERT_EQUAL(REGISTER_INVALID,
+                      asic_register_map_lookup(register_map,
+                                               sizeof(register_map) /
+                                                   sizeof(register_map[0]),
+                                               0x05));
+    TEST_ASSERT_EQUAL(REGISTER_INVALID,
+                      asic_register_map_lookup(register_map,
+                                               sizeof(register_map) /
+                                                   sizeof(register_map[0]),
+                                               0xFF));
+}

@@ -24,8 +24,6 @@
 
 #define MAX_RETRY_ATTEMPTS 3
 #define MAX_CRITICAL_RETRY_ATTEMPTS 5
-#define MAX_EXTRANONCE_2_LEN 32
-
 #define PORT CONFIG_STRATUM_PORT
 #define STRATUM_URL CONFIG_STRATUM_URL
 #define STRATUM_TLS CONFIG_STRATUM_TLS
@@ -41,16 +39,80 @@
 #define STRATUM_DIFFICULTY CONFIG_STRATUM_DIFFICULTY
 
 #define TRANSPORT_TIMEOUT_MS 5000
+#define CONFIGURE_RESPONSE_TIMEOUT_US 10000000LL
 
 #define BUFFER_SIZE 1024
 
 static const char *TAG = "stratum_v1_task";
 static pthread_mutex_t v1_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t v1_extranonce_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t v1_writers_drained = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t v1_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int v1_active_writers = 0;
+static bool v1_connection_closing = true;
+
+static bool version_mask_meets_minimum(uint32_t mask)
+{
+    unsigned int bit_count = 0;
+    while (mask != 0) {
+        bit_count += mask & 1U;
+        mask >>= 1;
+    }
+    return bit_count >= STRATUM_VERSION_ROLLING_MIN_BIT_COUNT;
+}
 
 static void free_v1_queued_work(void *work)
 {
-    STRATUM_V1_free_mining_notify((mining_notify *)work);
+    stratum_v1_work *v1_work = (stratum_v1_work *)work;
+    if (v1_work == NULL) {
+        return;
+    }
+    if (v1_work->notification != NULL) {
+        STRATUM_V1_free_mining_notify(v1_work->notification);
+    }
+    free(v1_work->extranonce_1);
+    free(v1_work);
+}
+
+static mining_notify *clone_mining_notify(const mining_notify *source)
+{
+    if (source == NULL || source->job_id == NULL ||
+        source->prev_block_hash == NULL || source->coinbase_1 == NULL ||
+        source->coinbase_2 == NULL ||
+        (source->n_merkle_branches != 0 &&
+         source->merkle_branches == NULL) ||
+        source->n_merkle_branches > MAX_MERKLE_BRANCHES) {
+        return NULL;
+    }
+
+    mining_notify *copy = calloc(1, sizeof(*copy));
+    if (copy == NULL) {
+        return NULL;
+    }
+    copy->job_id = strdup(source->job_id);
+    copy->prev_block_hash = strdup(source->prev_block_hash);
+    copy->coinbase_1 = strdup(source->coinbase_1);
+    copy->coinbase_2 = strdup(source->coinbase_2);
+    copy->n_merkle_branches = source->n_merkle_branches;
+    copy->version = source->version;
+    copy->target = source->target;
+    copy->ntime = source->ntime;
+    copy->clean_jobs = source->clean_jobs;
+
+    size_t branch_bytes = source->n_merkle_branches * HASH_SIZE;
+    if (branch_bytes != 0) {
+        copy->merkle_branches = malloc(branch_bytes);
+        if (copy->merkle_branches != NULL) {
+            memcpy(copy->merkle_branches, source->merkle_branches,
+                   branch_bytes);
+        }
+    }
+    if (copy->job_id == NULL || copy->prev_block_hash == NULL ||
+        copy->coinbase_1 == NULL || copy->coinbase_2 == NULL ||
+        (branch_bytes != 0 && copy->merkle_branches == NULL)) {
+        STRATUM_V1_free_mining_notify(copy);
+        return NULL;
+    }
+    return copy;
 }
 
 static StratumApiV1Message stratum_api_v1_message = {};
@@ -76,14 +138,30 @@ void stratum_v1_close_connection(GlobalState *GLOBAL_STATE)
 {
     ESP_LOGE(TAG, "Shutting down socket and restarting...");
 
+    // Mark closing and close first so a stalled share writer wakes before job
+    // invalidation waits for the submit-generation barrier.
     pthread_mutex_lock(&v1_lifecycle_lock);
-    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    v1_connection_closing = true;
     esp_transport_handle_t transport = GLOBAL_STATE->transport;
+    if (transport != NULL) {
+        esp_transport_close(transport);
+    }
+    pthread_mutex_unlock(&v1_lifecycle_lock);
+
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+
+    pthread_mutex_lock(&v1_lifecycle_lock);
     GLOBAL_STATE->transport = NULL;
     pthread_mutex_unlock(&v1_lifecycle_lock);
 
     if (transport != NULL) {
-        esp_transport_close(transport);
+        // Keep the transport object alive until every writer that retained it
+        // observes the close and exits.
+        pthread_mutex_lock(&v1_lifecycle_lock);
+        while (v1_active_writers != 0) {
+            pthread_cond_wait(&v1_writers_drained, &v1_lifecycle_lock);
+        }
+        pthread_mutex_unlock(&v1_lifecycle_lock);
         esp_transport_destroy(transport);
     }
     vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -92,7 +170,12 @@ void stratum_v1_close_connection(GlobalState *GLOBAL_STATE)
 void stratum_v1_interrupt_connection(GlobalState *GLOBAL_STATE)
 {
     pthread_mutex_lock(&v1_lifecycle_lock);
+    v1_connection_closing = true;
     if (GLOBAL_STATE->transport != NULL) {
+        // Do not destroy here; the owning V1 task performs the writer-drain
+        // wait in stratum_v1_close_connection(). Keep the lifecycle lock held
+        // through close so the owner cannot detach and destroy this handle
+        // between the pointer load and the close call.
         esp_transport_close(GLOBAL_STATE->transport);
     }
     pthread_mutex_unlock(&v1_lifecycle_lock);
@@ -100,68 +183,143 @@ void stratum_v1_interrupt_connection(GlobalState *GLOBAL_STATE)
 
 static void stratum_v1_clean_jobs(GlobalState *GLOBAL_STATE)
 {
-    pthread_mutex_lock(&v1_lifecycle_lock);
     SYSTEM_clean_jobs_queue(GLOBAL_STATE);
-    pthread_mutex_unlock(&v1_lifecycle_lock);
 }
 
-bool stratum_v1_snapshot_extranonce(GlobalState *GLOBAL_STATE,
-                                    char **extranonce,
-                                    uint32_t *extranonce_2_len)
+static void stratum_v1_reset_connection_state(GlobalState *GLOBAL_STATE)
 {
-    if (extranonce == NULL || extranonce_2_len == NULL) {
-        return false;
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    pthread_mutex_lock(&v1_state_lock);
+    char *old_extranonce = GLOBAL_STATE->extranonce_str;
+    GLOBAL_STATE->extranonce_str = NULL;
+    GLOBAL_STATE->extranonce_2_len = 0;
+    GLOBAL_STATE->pool_difficulty = 1.0;
+    GLOBAL_STATE->stratum_v1_version_rolling_enabled = false;
+    GLOBAL_STATE->stratum_v1_version_mask = 0;
+    GLOBAL_STATE->version_mask = 0;
+    GLOBAL_STATE->new_stratum_version_rolling_msg = true;
+    pthread_mutex_unlock(&v1_state_lock);
+    pthread_mutex_unlock(&v1_lifecycle_lock);
+    free(old_extranonce);
+}
+
+static void stratum_v1_set_difficulty(GlobalState *GLOBAL_STATE,
+                                      double difficulty)
+{
+    pthread_mutex_lock(&v1_state_lock);
+    GLOBAL_STATE->pool_difficulty = difficulty;
+    pthread_mutex_unlock(&v1_state_lock);
+}
+
+static void stratum_v1_set_rolling_state(GlobalState *GLOBAL_STATE,
+                                         bool enabled, uint32_t mask)
+{
+    if (!enabled) {
+        mask = 0;
     }
 
-    pthread_mutex_lock(&v1_extranonce_lock);
-    char *copy = GLOBAL_STATE->extranonce_str != NULL
-                     ? strdup(GLOBAL_STATE->extranonce_str)
-                     : NULL;
-    uint32_t length = GLOBAL_STATE->extranonce_2_len;
-    pthread_mutex_unlock(&v1_extranonce_lock);
-
-    if (copy == NULL) {
-        return false;
-    }
-    *extranonce = copy;
-    *extranonce_2_len = length;
-    return true;
+    // A BIP310 state change is valid immediately. Publish it and invalidate
+    // every old job as one lifecycle operation so a submission cannot observe
+    // a new submit shape with an old job generation.
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    pthread_mutex_lock(&v1_state_lock);
+    GLOBAL_STATE->stratum_v1_version_rolling_enabled = enabled;
+    GLOBAL_STATE->stratum_v1_version_mask = mask;
+    GLOBAL_STATE->version_mask = mask;
+    GLOBAL_STATE->new_stratum_version_rolling_msg = true;
+    pthread_mutex_unlock(&v1_state_lock);
+    pthread_mutex_unlock(&v1_lifecycle_lock);
 }
 
 static void stratum_v1_replace_extranonce(GlobalState *GLOBAL_STATE,
                                           char *extranonce,
                                           uint32_t extranonce_2_len)
 {
-    pthread_mutex_lock(&v1_extranonce_lock);
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    pthread_mutex_lock(&v1_state_lock);
     char *old_extranonce = GLOBAL_STATE->extranonce_str;
     GLOBAL_STATE->extranonce_str = extranonce;
     GLOBAL_STATE->extranonce_2_len = extranonce_2_len;
-    pthread_mutex_unlock(&v1_extranonce_lock);
+    pthread_mutex_unlock(&v1_state_lock);
+    pthread_mutex_unlock(&v1_lifecycle_lock);
     free(old_extranonce);
+}
+
+static stratum_v1_work *stratum_v1_create_work(
+    GlobalState *GLOBAL_STATE, mining_notify *notification)
+{
+    stratum_v1_work *work = calloc(1, sizeof(*work));
+    if (work == NULL) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&v1_state_lock);
+    if (GLOBAL_STATE->extranonce_str != NULL) {
+        work->extranonce_1 = strdup(GLOBAL_STATE->extranonce_str);
+    }
+    work->extranonce_2_len = GLOBAL_STATE->extranonce_2_len;
+    work->difficulty = GLOBAL_STATE->pool_difficulty;
+    work->version_rolling_enabled =
+        GLOBAL_STATE->stratum_v1_version_rolling_enabled;
+    work->version_mask = work->version_rolling_enabled
+                             ? GLOBAL_STATE->stratum_v1_version_mask
+                             : 0;
+    pthread_mutex_unlock(&v1_state_lock);
+
+    if (work->extranonce_1 == NULL ||
+        work->extranonce_2_len > MAX_EXTRANONCE_2_LEN ||
+        !(work->difficulty > 0.0)) {
+        free(work->extranonce_1);
+        free(work);
+        return NULL;
+    }
+    work->notification = notification;
+    return work;
 }
 
 int stratum_v1_submit_share_safe(
     GlobalState *GLOBAL_STATE, uint32_t expected_generation, int uid,
     const char *user, const char *job_id, const char *extranonce_2,
-    uint32_t ntime, uint32_t nonce, uint32_t version_bits,
+    uint32_t ntime, uint32_t nonce, bool version_rolling_enabled,
+    uint32_t version_bits,
     uint64_t *sent_time_us)
 {
+    // SYSTEM_clean_jobs_queue takes this same lock before publishing a new
+    // generation. Keep the final check and wire write together so a clean job
+    // cannot turn an accepted queued result into a stale submission.
+    pthread_mutex_lock(&GLOBAL_STATE->stratum_v1_submit_lock);
     pthread_mutex_lock(&v1_lifecycle_lock);
     if (expected_generation != ASIC_result_task_get_job_generation() ||
-        GLOBAL_STATE->transport == NULL) {
+        GLOBAL_STATE->transport == NULL || v1_connection_closing) {
         pthread_mutex_unlock(&v1_lifecycle_lock);
+        pthread_mutex_unlock(&GLOBAL_STATE->stratum_v1_submit_lock);
         return -1;
     }
+    esp_transport_handle_t transport = GLOBAL_STATE->transport;
+    v1_active_writers++;
+    pthread_mutex_unlock(&v1_lifecycle_lock);
 
     int result = STRATUM_V1_submit_share(
-        GLOBAL_STATE->transport, uid, user, job_id, extranonce_2, ntime,
-        nonce, version_bits, sent_time_us);
+        transport, uid, user, job_id, extranonce_2, ntime,
+        nonce, version_rolling_enabled, version_bits, sent_time_us);
+
+    pthread_mutex_lock(&v1_lifecycle_lock);
+    v1_active_writers--;
+    if (v1_active_writers == 0) {
+        pthread_cond_broadcast(&v1_writers_drained);
+    }
     pthread_mutex_unlock(&v1_lifecycle_lock);
+    pthread_mutex_unlock(&GLOBAL_STATE->stratum_v1_submit_lock);
     return result;
 }
 
-static void decode_mining_notification(GlobalState * GLOBAL_STATE, const mining_notify *mining_notification)
+static void decode_mining_notification(GlobalState *GLOBAL_STATE,
+                                       const stratum_v1_work *work)
 {
+    const mining_notify *mining_notification = work->notification;
     mining_notification_result_t *result = heap_caps_malloc(sizeof(mining_notification_result_t), MALLOC_CAP_SPIRAM);
     if (!result) {
         ESP_LOGE(TAG, "Failed to allocate result in PSRAM");
@@ -174,8 +332,8 @@ static void decode_mining_notification(GlobalState * GLOBAL_STATE, const mining_
     bool decode_coinbase_tx = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].decode_coinbase_tx;
 
     if (coinbase_process_notification(mining_notification,
-                                     GLOBAL_STATE->extranonce_str,
-                                     GLOBAL_STATE->extranonce_2_len,
+                                     work->extranonce_1,
+                                     work->extranonce_2_len,
                                      user,
                                      decode_coinbase_tx,
                                      result) != ESP_OK) {
@@ -250,6 +408,48 @@ static void decode_mining_notification(GlobalState * GLOBAL_STATE, const mining_
     free(result);
 }
 
+static bool stratum_v1_enqueue_work(GlobalState *GLOBAL_STATE,
+                                    mining_notify *notification)
+{
+    stratum_v1_work *work =
+        stratum_v1_create_work(GLOBAL_STATE, notification);
+    if (work == NULL) {
+        ESP_LOGW(TAG,
+                 "Dropping V1 notification until valid extranonce and difficulty state is available");
+        STRATUM_V1_free_mining_notify(notification);
+        return false;
+    }
+
+    // Snapshot the generation before decoding. Decoding reads the immutable
+    // work but can take long enough for a concurrent reconnect/clean to run.
+    // If that happens, the stale-generation item is rejected by the scheduler
+    // after it is published.
+    uint32_t generation = ASIC_result_task_get_pool_generation();
+    decode_mining_notification(GLOBAL_STATE, work);
+    queue_enqueue(
+        &GLOBAL_STATE->stratum_queue, work,
+        (work_queue_item_metadata) {
+            .generation = generation,
+            .kind = WORK_QUEUE_ITEM_STRATUM_V1,
+            .free_fn = free_v1_queued_work,
+        });
+    return true;
+}
+
+static void stratum_v1_refresh_latest_work(
+    GlobalState *GLOBAL_STATE, const mining_notify *latest_notification)
+{
+    if (latest_notification == NULL) {
+        return;
+    }
+    mining_notify *refresh = clone_mining_notify(latest_notification);
+    if (refresh == NULL) {
+        ESP_LOGE(TAG, "Unable to refresh V1 work after connection-state update");
+        return;
+    }
+    stratum_v1_enqueue_work(GLOBAL_STATE, refresh);
+}
+
 void stratum_v1_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
@@ -261,6 +461,13 @@ void stratum_v1_task(void *pvParameters)
     STRATUM_V1_initialize_buffer();
     int retry_attempts = 0;
     int retry_critical_attempts = 0;
+    // Explicit protocol rejection is sticky for this pool task. Transport
+    // failures during negotiation only skip the next probe: this preserves a
+    // compatibility reconnect without permanently losing version rolling due
+    // to a transient socket drop.
+    stratum_v1_bip310_state_t bip310_state =
+        STRATUM_V1_BIP310_STATE_INITIALIZER;
+    mining_notify *latest_notification = NULL;
 
     ESP_LOGI(TAG, "Opening connection to pool: %s:%d", stratum_url, port);
     while (1) {
@@ -268,6 +475,11 @@ void stratum_v1_task(void *pvParameters)
         if (protocol_coordinator_v1_should_shutdown()) {
             ESP_LOGI(TAG, "Coordinator requested shutdown, exiting");
             stratum_v1_close_connection(GLOBAL_STATE);
+            if (latest_notification != NULL) {
+                STRATUM_V1_free_mining_notify(latest_notification);
+                latest_notification = NULL;
+            }
+            cleanup_stratum_buffer();
             protocol_coordinator_v1_exited();
             vTaskDelete(NULL);
             return;
@@ -291,6 +503,11 @@ void stratum_v1_task(void *pvParameters)
             // recovery — see protocol_coordinator.c.
             ESP_LOGW(TAG, "Max V1 retry attempts reached (%d), notifying coordinator", retry_attempts);
             stratum_v1_close_connection(GLOBAL_STATE);
+            if (latest_notification != NULL) {
+                STRATUM_V1_free_mining_notify(latest_notification);
+                latest_notification = NULL;
+            }
+            cleanup_stratum_buffer();
             protocol_coordinator_notify_failure();
             vTaskDelete(NULL);
             return;
@@ -351,6 +568,7 @@ void stratum_v1_task(void *pvParameters)
         stratum_socket_set_options(transport);
         pthread_mutex_lock(&v1_lifecycle_lock);
         GLOBAL_STATE->transport = transport;
+        v1_connection_closing = false;
         pthread_mutex_unlock(&v1_lifecycle_lock);
 
         const char *protocol = (conn_info.addr_family == AF_INET6) ? "IPv6" : "IPv4";
@@ -368,11 +586,45 @@ void stratum_v1_task(void *pvParameters)
                  "%s%s", protocol, tls_status);
 
         stratum_v1_reset_uid(GLOBAL_STATE);
-        stratum_v1_clean_jobs(GLOBAL_STATE);
+        stratum_v1_reset_connection_state(GLOBAL_STATE);
+        // Discard any complete or partial JSON lines and request timings from
+        // the prior socket. Buffered data is connection-scoped and must never
+        // cross a normal client.reconnect.
+        STRATUM_V1_initialize_buffer();
+        if (latest_notification != NULL) {
+            STRATUM_V1_free_mining_notify(latest_notification);
+            latest_notification = NULL;
+        }
 
         ///// Start Stratum Action
-        // mining.configure - ID: 1
-        STRATUM_V1_configure_version_rolling(GLOBAL_STATE->transport, stratum_get_next_uid(GLOBAL_STATE), &GLOBAL_STATE->version_mask);
+        int configure_message_id = -1;
+        bool configure_pending = false;
+        int64_t configure_sent_us = 0;
+        bool use_legacy_v1 =
+            !STRATUM_V1_bip310_should_probe(&bip310_state);
+        if (!use_legacy_v1) {
+            configure_message_id = stratum_get_next_uid(GLOBAL_STATE);
+            int configure_ret = STRATUM_V1_configure_version_rolling(
+                GLOBAL_STATE->transport, configure_message_id,
+                STRATUM_DEFAULT_VERSION_MASK,
+                STRATUM_VERSION_ROLLING_MIN_BIT_COUNT);
+            if (configure_ret < 0) {
+                // A partial/failed configure can leave the JSON stream
+                // unusable. Reconnect once in legacy mode instead of sending
+                // the same unsupported request forever.
+                ESP_LOGW(TAG,
+                         "Unable to send mining.configure; retrying in legacy V1 mode");
+                STRATUM_V1_bip310_transient_failure(&bip310_state);
+                retry_attempts++;
+                stratum_v1_close_connection(GLOBAL_STATE);
+                continue;
+            }
+            configure_pending = true;
+            configure_sent_us = esp_timer_get_time();
+        } else {
+            ESP_LOGI(TAG,
+                     "Using legacy Stratum V1 without BIP310 version rolling");
+        }
 
         // mining.subscribe - ID: 2
         STRATUM_V1_subscribe(GLOBAL_STATE->transport, stratum_get_next_uid(GLOBAL_STATE), GLOBAL_STATE->DEVICE_CONFIG.family.asic.name);
@@ -390,12 +642,24 @@ void stratum_v1_task(void *pvParameters)
             if (protocol_coordinator_v1_should_shutdown()) {
                 ESP_LOGI(TAG, "Coordinator requested shutdown during recv loop, exiting");
                 stratum_v1_close_connection(GLOBAL_STATE);
+                if (latest_notification != NULL) {
+                    STRATUM_V1_free_mining_notify(latest_notification);
+                    latest_notification = NULL;
+                }
+                cleanup_stratum_buffer();
                 protocol_coordinator_v1_exited();
                 vTaskDelete(NULL);
+                return;
             }
 
             char *line = STRATUM_V1_receive_jsonrpc_line(GLOBAL_STATE->transport);
             if (!line) {
+                if (configure_pending) {
+                    ESP_LOGW(TAG,
+                             "Pool closed before mining.configure completed; falling back to legacy V1");
+                    STRATUM_V1_bip310_transient_failure(&bip310_state);
+                    configure_pending = false;
+                }
                 ESP_LOGE(TAG, "Failed to receive JSON-RPC line, reconnecting...");
                 retry_attempts++;
                 stratum_v1_close_connection(GLOBAL_STATE);
@@ -414,6 +678,19 @@ void stratum_v1_task(void *pvParameters)
 
             bool reconnect_requested = false;
             if (!STRATUM_V1_parse(&stratum_api_v1_message, line)) {
+                if (configure_pending &&
+                    stratum_api_v1_message.message_id ==
+                        configure_message_id) {
+                    ESP_LOGW(TAG,
+                             "Pool returned an invalid mining.configure response; using legacy V1");
+                    configure_pending = false;
+                } else if (configure_pending && configure_sent_us > 0 &&
+                           receive_time_us - configure_sent_us >=
+                               CONFIGURE_RESPONSE_TIMEOUT_US) {
+                    ESP_LOGW(TAG,
+                             "mining.configure response timed out; continuing this connection in legacy V1 mode");
+                    configure_pending = false;
+                }
                 ESP_LOGE(TAG, "Failed to parse Stratum message, ignoring");
                 STRATUM_V1_reset_message(&stratum_api_v1_message);
                 free(line);
@@ -429,6 +706,18 @@ void stratum_v1_task(void *pvParameters)
                 case MINING_NOTIFY:
                     GLOBAL_STATE->SYSTEM_MODULE.work_received++;
                     SYSTEM_notify_new_ntime(GLOBAL_STATE, stratum_api_v1_message.mining_notification->ntime);
+                    mining_notify *latest_copy = clone_mining_notify(
+                        stratum_api_v1_message.mining_notification);
+                    if (latest_copy != NULL) {
+                        if (latest_notification != NULL) {
+                            STRATUM_V1_free_mining_notify(
+                                latest_notification);
+                        }
+                        latest_notification = latest_copy;
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "Unable to retain latest V1 notification for immediate control updates");
+                    }
                     if (stratum_api_v1_message.mining_notification->clean_jobs) {
                         // A clean notification invalidates work already running on
                         // the ASIC as well as work still waiting in the queue. Do
@@ -436,64 +725,116 @@ void stratum_v1_task(void *pvParameters)
                         // normally has the current item dequeued while it waits.
                         stratum_v1_clean_jobs(GLOBAL_STATE);
                     }
-                    // queue_enqueue performs the capacity check while holding the
-                    // queue lock. Avoid racing create_jobs_task via queue.count.
-                    queue_enqueue(
-                        &GLOBAL_STATE->stratum_queue,
-                        stratum_api_v1_message.mining_notification,
-                        (work_queue_item_metadata) {
-                            .generation =
-                                ASIC_result_task_get_pool_generation(),
-                            .kind = WORK_QUEUE_ITEM_STRATUM_V1,
-                            .free_fn = free_v1_queued_work,
-                        });
-                    decode_mining_notification(GLOBAL_STATE, stratum_api_v1_message.mining_notification);
+                    stratum_v1_enqueue_work(
+                        GLOBAL_STATE,
+                        stratum_api_v1_message.mining_notification);
                     stratum_api_v1_message.mining_notification = NULL;
                     break;
 
                 case MINING_SET_DIFFICULTY:
                     ESP_LOGI(TAG, "Set pool difficulty: %.2f", stratum_api_v1_message.new_difficulty);
-                    GLOBAL_STATE->pool_difficulty = stratum_api_v1_message.new_difficulty;
-                    GLOBAL_STATE->new_set_mining_difficulty_msg = true;
+                    // V1 set_difficulty applies to the next notify. Keeping it
+                    // in the connection snapshot prevents a later update from
+                    // changing already-issued work.
+                    stratum_v1_set_difficulty(
+                        GLOBAL_STATE,
+                        stratum_api_v1_message.new_difficulty);
                     break;
 
                 case MINING_SET_VERSION_MASK:
-                    ESP_LOGI(TAG, "Set version mask: %08lx", stratum_api_v1_message.version_mask);
-                    GLOBAL_STATE->version_mask = stratum_api_v1_message.version_mask;
-                    GLOBAL_STATE->new_stratum_version_rolling_msg = true;
+                    if (!GLOBAL_STATE->stratum_v1_version_rolling_enabled) {
+                        ESP_LOGW(TAG,
+                                 "Ignoring mining.set_version_mask before successful BIP310 negotiation");
+                        break;
+                    }
+                    uint32_t updated_mask =
+                        stratum_api_v1_message.version_mask &
+                        STRATUM_DEFAULT_VERSION_MASK;
+                    if (updated_mask !=
+                        stratum_api_v1_message.version_mask) {
+                        ESP_LOGW(TAG,
+                                 "Pool version mask %08lx exceeds hardware mask; using %08lx",
+                                 (unsigned long)stratum_api_v1_message.version_mask,
+                                 (unsigned long)updated_mask);
+                    }
+                    ESP_LOGI(TAG, "Set version mask: %08lx",
+                             (unsigned long)updated_mask);
+                    if (!version_mask_meets_minimum(updated_mask)) {
+                        ESP_LOGW(TAG,
+                                 "Pool version mask does not satisfy the negotiated minimum bit count; disabling version rolling");
+                        STRATUM_V1_bip310_mark_unsupported(&bip310_state);
+                        stratum_v1_set_rolling_state(GLOBAL_STATE, false, 0);
+                        stratum_v1_refresh_latest_work(
+                            GLOBAL_STATE, latest_notification);
+                        break;
+                    }
+                    stratum_v1_set_rolling_state(GLOBAL_STATE, true,
+                                                 updated_mask);
+                    stratum_v1_refresh_latest_work(GLOBAL_STATE,
+                                                   latest_notification);
                     break;
 
                 case STRATUM_RESULT_CONFIGURE:
+                    if (!configure_pending ||
+                        stratum_api_v1_message.message_id !=
+                            configure_message_id) {
+                        ESP_LOGW(TAG,
+                                 "Ignoring unexpected mining.configure result id %d",
+                                 stratum_api_v1_message.message_id);
+                        break;
+                    }
+                    configure_pending = false;
                     if (stratum_api_v1_message.response_success) {
-                        ESP_LOGI(TAG, "Configure result accepted, version mask: %08lx", stratum_api_v1_message.version_mask);
-                        GLOBAL_STATE->version_mask = stratum_api_v1_message.version_mask;
-                        GLOBAL_STATE->new_stratum_version_rolling_msg = true;
+                        uint32_t negotiated_mask =
+                            stratum_api_v1_message.version_mask &
+                            STRATUM_DEFAULT_VERSION_MASK;
+                        if (negotiated_mask !=
+                            stratum_api_v1_message.version_mask) {
+                            ESP_LOGW(TAG,
+                                     "Pool returned unsupported version bits %08lx; using intersection %08lx",
+                                     (unsigned long)stratum_api_v1_message.version_mask,
+                                     (unsigned long)negotiated_mask);
+                        }
+                        if (!version_mask_meets_minimum(negotiated_mask)) {
+                            ESP_LOGW(TAG,
+                                     "Pool accepted BIP310 with fewer than %u usable version bits; continuing in legacy V1 mode",
+                                     (unsigned int)STRATUM_VERSION_ROLLING_MIN_BIT_COUNT);
+                            STRATUM_V1_bip310_mark_unsupported(&bip310_state);
+                            stratum_v1_set_rolling_state(
+                                GLOBAL_STATE, false, 0);
+                            stratum_v1_refresh_latest_work(
+                                GLOBAL_STATE, latest_notification);
+                            break;
+                        }
+                        ESP_LOGI(TAG,
+                                 "Configure result accepted, version mask: %08lx",
+                                 (unsigned long)negotiated_mask);
+                        STRATUM_V1_bip310_mark_supported(&bip310_state);
+                        stratum_v1_set_rolling_state(
+                            GLOBAL_STATE, true, negotiated_mask);
+                        stratum_v1_refresh_latest_work(
+                            GLOBAL_STATE, latest_notification);
                         protocol_coordinator_notify_success();
                     } else {
-                        ESP_LOGE(TAG, "Configure result rejected: %s", stratum_api_v1_message.error_str);
+                        STRATUM_V1_bip310_mark_unsupported(&bip310_state);
+                        ESP_LOGW(TAG,
+                                 "Configure result rejected; continuing in legacy V1 mode: %s",
+                                 stratum_api_v1_message.error_str != NULL
+                                     ? stratum_api_v1_message.error_str
+                                     : "unknown");
                     }
                     break;
 
                 case MINING_SET_EXTRANONCE:
                 case STRATUM_RESULT_SUBSCRIBE:
-                    if (stratum_api_v1_message.method == MINING_SET_EXTRANONCE) {
-                        // A new extranonce1 changes every coinbase. Invalidate
-                        // both queued and device-resident jobs before publishing
-                        // it so retained work cannot mix the old and new values.
-                        stratum_v1_clean_jobs(GLOBAL_STATE);
-                    }
-                    // Validate extranonce_2_len to prevent buffer overflow
-                    if (stratum_api_v1_message.extranonce_2_len > MAX_EXTRANONCE_2_LEN) {
-                        ESP_LOGW(TAG, "Extranonce_2_len %d exceeds maximum %d, clamping to maximum",
-                                 stratum_api_v1_message.extranonce_2_len, MAX_EXTRANONCE_2_LEN);
-                        stratum_api_v1_message.extranonce_2_len = MAX_EXTRANONCE_2_LEN;
-                    }
                     ESP_LOGI(TAG, "Set extranonce: %s, extranonce_2_len: %d", stratum_api_v1_message.extranonce_str, stratum_api_v1_message.extranonce_2_len);
                     stratum_v1_replace_extranonce(
                         GLOBAL_STATE,
                         stratum_api_v1_message.extranonce_str,
                         stratum_api_v1_message.extranonce_2_len);
                     stratum_api_v1_message.extranonce_str = NULL;
+                    stratum_v1_refresh_latest_work(GLOBAL_STATE,
+                                                   latest_notification);
                     break;
 
                 case MINING_PING:
@@ -511,8 +852,22 @@ void stratum_v1_task(void *pvParameters)
 
                 case CLIENT_GET_VERSION:
                     STRATUM_V1_send_version(GLOBAL_STATE->transport, stratum_api_v1_message.message_id);
-                    break;                case STRATUM_RESULT:
+                    break;
+
+                case STRATUM_RESULT:
                     {
+                        if (configure_pending &&
+                            stratum_api_v1_message.message_id ==
+                                configure_message_id) {
+                            configure_pending = false;
+                            STRATUM_V1_bip310_mark_unsupported(&bip310_state);
+                            ESP_LOGW(TAG,
+                                     "mining.configure rejected; continuing in legacy V1 mode: %s",
+                                     stratum_api_v1_message.error_str != NULL
+                                         ? stratum_api_v1_message.error_str
+                                         : "unsupported");
+                            break;
+                        }
                         float response_time_ms = STRATUM_V1_get_response_time_ms(stratum_api_v1_message.message_id, receive_time_us);
                         if (response_time_ms >= 0) {
                             if (stratum_api_v1_message.response_success) {
@@ -548,6 +903,13 @@ void stratum_v1_task(void *pvParameters)
                         }
                     }
                     break;
+            }
+            if (configure_pending && configure_sent_us > 0 &&
+                receive_time_us - configure_sent_us >=
+                    CONFIGURE_RESPONSE_TIMEOUT_US) {
+                ESP_LOGW(TAG,
+                         "mining.configure response timed out; continuing this connection in legacy V1 mode");
+                configure_pending = false;
             }
             STRATUM_V1_reset_message(&stratum_api_v1_message);
             if (reconnect_requested) {

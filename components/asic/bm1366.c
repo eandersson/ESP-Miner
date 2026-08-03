@@ -8,6 +8,7 @@
 #include "utils.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "frequency_transition_bmXX.h"
@@ -35,6 +36,8 @@
 #define CMD_INACTIVE 0x03
 
 #define MISC_CONTROL 0x18
+#define BM1366_MIN_FREQUENCY_MHZ 50.0f
+#define BM1366_MAX_FREQUENCY_MHZ 1200.0f
 
 static const register_type_t REGISTER_MAP[] = {
     [0x4C] = REGISTER_ERROR_COUNT,
@@ -78,6 +81,24 @@ static const char * TAG = "bm1366";
 static task_result result;
 
 static int address_interval;
+
+#define BM1366_INIT_REQUIRE_SENT(expression, step)                         \
+    do {                                                                  \
+        if (!(expression)) {                                              \
+            ESP_LOGE(TAG, "ASIC initialization TX failed at %s", step);  \
+            return 0;                                                     \
+        }                                                                 \
+    } while (0)
+
+#define BM1366_INIT_REQUIRE_OK(expression, step)                           \
+    do {                                                                  \
+        esp_err_t init_err = (expression);                                \
+        if (init_err != ESP_OK) {                                         \
+            ESP_LOGE(TAG, "ASIC initialization failed at %s: %s", step,  \
+                     esp_err_to_name(init_err));                           \
+            return 0;                                                     \
+        }                                                                 \
+    } while (0)
 
 /// @brief
 /// @param ftdi
@@ -123,80 +144,112 @@ static bool _send_simple(const uint8_t * data, uint8_t total_length)
     return SERIAL_send(buf, total_length, BM1366_SERIALTX_DEBUG);
 }
 
-static void _send_chain_inactive(void)
+static bool _send_chain_inactive(void)
 {
     unsigned char read_address[2] = {0x00, 0x00};
     // send serial data
-    _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_INACTIVE), read_address, 2, BM1366_SERIALTX_DEBUG);
+    return _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_INACTIVE), read_address,
+                        2, BM1366_SERIALTX_DEBUG);
 }
 
-static void _set_chip_address(uint8_t chipAddr)
+static bool _set_chip_address(uint8_t chipAddr)
 {
     ESP_LOGI(TAG, "Set chip address: 0x%02x", chipAddr);
 
     unsigned char read_address[2] = {chipAddr, 0x00};
     // send serial data
-    _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_SETADDRESS), read_address, 2, BM1366_SERIALTX_DEBUG);
+    return _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_SETADDRESS),
+                        read_address, 2, BM1366_SERIALTX_DEBUG);
 }
 
-void BM1366_set_version_mask(uint32_t version_mask) 
+esp_err_t BM1366_set_version_mask(uint32_t version_mask)
 {
     int versions_to_roll = version_mask >> 13;
     uint8_t version_byte0 = (versions_to_roll >> 8);
     uint8_t version_byte1 = (versions_to_roll & 0xFF); 
     uint8_t version_cmd[] = {0x00, 0xA4, 0x90, 0x00, version_byte0, version_byte1};
-    _send_BM1366(TYPE_CMD | GROUP_ALL | CMD_WRITE, version_cmd, 6, BM1366_SERIALTX_DEBUG);
+    return _send_BM1366(TYPE_CMD | GROUP_ALL | CMD_WRITE, version_cmd, 6,
+                        BM1366_SERIALTX_DEBUG) ? ESP_OK : ESP_FAIL;
 }
 
-void BM1366_set_hash_counting_number(uint32_t hcn) {
+static esp_err_t BM1366_set_hash_counting_number(uint32_t hcn)
+{
+    if (hcn == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     uint8_t set_10_hash_counting[6] = {0x00, 0x10, 0x00, 0x00, 0x00, 0x00};
     set_10_hash_counting[2] = (hcn >> 24) & 0xFF;
     set_10_hash_counting[3] = (hcn >> 16) & 0xFF;
     set_10_hash_counting[4] = (hcn >> 8) & 0xFF;
     set_10_hash_counting[5] = hcn & 0xFF;
-    _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE), set_10_hash_counting, 6, BM1366_SERIALTX_DEBUG);
+    return _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE),
+                        set_10_hash_counting, 6,
+                        BM1366_SERIALTX_DEBUG) ? ESP_OK : ESP_FAIL;
 }
 
-void BM1366_set_nonce_space(double nonce_percent, float frequency, uint16_t asic_count, uint16_t cores) 
+esp_err_t BM1366_set_nonce_space(double nonce_percent, float frequency,
+                                 uint16_t asic_count, uint16_t cores)
 {
+    if (!isfinite(nonce_percent) || nonce_percent <= 0.0 ||
+        nonce_percent > 1.0 || !isfinite(frequency) || frequency <= 0.0f ||
+        asic_count == 0 || cores == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     uint32_t hcn = calculate_bm_hcn(frequency, asic_count, cores,
                                     nonce_percent, FREQ_MULT, 0.0);
     if (hcn == 0) {
         ESP_LOGE(TAG, "Invalid nonce-space parameters: frequency=%g count=%u cores=%u",
                  frequency, asic_count, cores);
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
-    BM1366_set_hash_counting_number(hcn);
+    return BM1366_set_hash_counting_number(hcn);
 }
 
-float BM1366_send_hash_frequency(float target_freq)
+esp_err_t BM1366_send_hash_frequency(float target_freq,
+                                     float *applied_frequency)
 {
+    if (applied_frequency == NULL || !isfinite(target_freq) ||
+        target_freq < BM1366_MIN_FREQUENCY_MHZ ||
+        target_freq > BM1366_MAX_FREQUENCY_MHZ) {
+        return ESP_ERR_INVALID_ARG;
+    }
     uint8_t fb_divider, refdiv, postdiv1, postdiv2;
     float new_freq;
-    
-    pll_get_parameters(target_freq, 144, 235, &fb_divider, &refdiv, &postdiv1, &postdiv2, &new_freq);
+
+    esp_err_t err = pll_get_parameters(target_freq, 144, 235, &fb_divider,
+                                       &refdiv, &postdiv1, &postdiv2,
+                                       &new_freq);
+    if (err != ESP_OK) {
+        return err;
+    }
     
     uint8_t vdo_scale = (fb_divider * FREQ_MULT / refdiv >= 2400) ? 0x50 : 0x40;
     uint8_t postdiv = (((postdiv1 - 1) & 0xf) << 4) | ((postdiv2 - 1) & 0xf);
     uint8_t freqbuf[6] = {0x00, 0x08, vdo_scale, fb_divider, refdiv, postdiv};
 
-    _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE), freqbuf, 6, BM1366_SERIALTX_DEBUG);
+    if (!_send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE), freqbuf, 6,
+                      BM1366_SERIALTX_DEBUG)) {
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "Setting Frequency to %g MHz (%g)", target_freq, new_freq);
 
-    return new_freq;
+    *applied_frequency = new_freq;
+    return ESP_OK;
 }
 
 uint8_t BM1366_init(GlobalState * GLOBAL_STATE)
 {
     // set version mask
     for (int i = 0; i < 3; i++) {
-        BM1366_set_version_mask(STRATUM_DEFAULT_VERSION_MASK);
+        BM1366_INIT_REQUIRE_OK(
+            BM1366_set_version_mask(STRATUM_DEFAULT_VERSION_MASK),
+            "version mask");
     }
 
     // read register 00 on all chips
     unsigned char init3[7] = {0x55, 0xAA, 0x52, 0x05, 0x00, 0x00, 0x0A};
-    _send_simple(init3, 7);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init3, 7), "chip ID request");
 
     uint16_t asic_count = GLOBAL_STATE->DEVICE_CONFIG.family.asic_count;
     int chip_counter = count_asic_chips(asic_count, BM1366_CHIP_ID, BM1366_CHIP_ID_RESPONSE_LENGTH);
@@ -206,42 +259,51 @@ uint8_t BM1366_init(GlobalState * GLOBAL_STATE)
     }
 
     unsigned char init4[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0xA8, 0x00, 0x07, 0x00, 0x00, 0x03};
-    _send_simple(init4, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init4, 11), "global A8 setup");
 
     unsigned char init5[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0x18, 0xFF, 0x0F, 0xC1, 0x00, 0x00};
-    _send_simple(init5, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init5, 11), "misc control setup");
 
     //{0x55, 0xAA, 0x53, 0x05, 0x00, 0x00, 0x03};
-    _send_chain_inactive();
+    BM1366_INIT_REQUIRE_SENT(_send_chain_inactive(), "chain inactive");
 
     // split the chip address space evenly
     address_interval = 256 / chip_counter;
     for (uint8_t i = 0; i < chip_counter; i++) {
         //{ 0x55, 0xAA, 0x40, 0x05, 0x00, 0x00, 0x1C };
-        _set_chip_address(i * address_interval);
+        BM1366_INIT_REQUIRE_SENT(_set_chip_address(i * address_interval),
+                                 "chip address");
     }
 
     unsigned char init135[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0x3C, 0x80, 0x00, 0x85, 0x40, 0x0C};
-    _send_simple(init135, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init135, 11),
+                             "core register setup 1");
 
     unsigned char init136[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0x3C, 0x80, 0x00, 0x80, 0x20, 0x19};
-    _send_simple(init136, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init136, 11),
+                             "core register setup 2");
 
     uint16_t difficulty = GLOBAL_STATE->DEVICE_CONFIG.family.asic.difficulty;
 
     //set difficulty mask
     uint8_t difficulty_mask[6];
     get_difficulty_mask(difficulty, difficulty_mask);
-    _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE), difficulty_mask, 6, BM1366_SERIALTX_DEBUG);    
+    BM1366_INIT_REQUIRE_SENT(
+        _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE), difficulty_mask,
+                     6, BM1366_SERIALTX_DEBUG),
+        "ticket difficulty");
 
     unsigned char init138[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0x54, 0x00, 0x00, 0x00, 0x03, 0x1D};
-    _send_simple(init138, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init138, 11),
+                             "analog mux setup");
 
     unsigned char init139[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0x58, 0x02, 0x11, 0x11, 0x11, 0x06};
-    _send_simple(init139, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init139, 11),
+                             "IO driver setup");
 
     unsigned char init171[11] = {0x55, 0xAA, 0x41, 0x09, 0x00, 0x2C, 0x00, 0x7C, 0x00, 0x03, 0x03};
-    _send_simple(init171, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init171, 11),
+                             "chip register setup");
 
     //S19XP Dump sends baudrate change here.. we wait until later.
     // unsigned char init173[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0x28, 0x11, 0x30, 0x02, 0x00, 0x03};
@@ -249,26 +311,46 @@ uint8_t BM1366_init(GlobalState * GLOBAL_STATE)
 
     for (uint8_t i = 0; i < chip_counter; i++) {
         unsigned char set_a8_register[6] = {i * address_interval, 0xA8, 0x00, 0x07, 0x01, 0xF0};
-        _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE), set_a8_register, 6, BM1366_SERIALTX_DEBUG);
+        BM1366_INIT_REQUIRE_SENT(
+            _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE),
+                         set_a8_register, 6, BM1366_SERIALTX_DEBUG),
+            "per-chip A8 setup");
         unsigned char set_18_register[6] = {i * address_interval, 0x18, 0xF0, 0x00, 0xC1, 0x00};
-        _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE), set_18_register, 6, BM1366_SERIALTX_DEBUG);
+        BM1366_INIT_REQUIRE_SENT(
+            _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE),
+                         set_18_register, 6, BM1366_SERIALTX_DEBUG),
+            "per-chip misc control");
         unsigned char set_3c_register_first[6] = {i * address_interval, 0x3C, 0x80, 0x00, 0x85, 0x40};
-        _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE), set_3c_register_first, 6, BM1366_SERIALTX_DEBUG);
+        BM1366_INIT_REQUIRE_SENT(
+            _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE),
+                         set_3c_register_first, 6, BM1366_SERIALTX_DEBUG),
+            "per-chip core setup 1");
         unsigned char set_3c_register_second[6] = {i * address_interval, 0x3C, 0x80, 0x00, 0x80, 0x20};
-        _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE), set_3c_register_second, 6, BM1366_SERIALTX_DEBUG);
+        BM1366_INIT_REQUIRE_SENT(
+            _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE),
+                         set_3c_register_second, 6, BM1366_SERIALTX_DEBUG),
+            "per-chip core setup 2");
         unsigned char set_3c_register_third[6] = {i * address_interval, 0x3C, 0x80, 0x00, 0x82, 0xAA};
-        _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE), set_3c_register_third, 6, BM1366_SERIALTX_DEBUG);
+        BM1366_INIT_REQUIRE_SENT(
+            _send_BM1366((TYPE_CMD | GROUP_SINGLE | CMD_WRITE),
+                         set_3c_register_third, 6, BM1366_SERIALTX_DEBUG),
+            "per-chip core setup 3");
     }
 
-    do_frequency_transition(GLOBAL_STATE, BM1366_send_hash_frequency);
+    BM1366_INIT_REQUIRE_OK(
+        do_frequency_transition(GLOBAL_STATE, BM1366_send_hash_frequency),
+        "frequency transition");
 
     float frequency = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value;
     int cores = GLOBAL_STATE->DEVICE_CONFIG.family.asic.core_count;
 
-    BM1366_set_nonce_space(1.0, frequency, asic_count, cores);
+    BM1366_INIT_REQUIRE_OK(
+        BM1366_set_nonce_space(1.0, frequency, asic_count, cores),
+        "nonce space");
 
     unsigned char init795[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF, 0x1C};
-    _send_simple(init795, 11);
+    BM1366_INIT_REQUIRE_SENT(_send_simple(init795, 11),
+                             "final version setup");
 
     return chip_counter;
 }
@@ -283,21 +365,34 @@ uint8_t BM1366_init(GlobalState * GLOBAL_STATE)
 
 // Baud formula = 25M/((denominator+1)*8)
 // The denominator is 5 bits found in the misc_control (bits 9-13)
-int BM1366_set_default_baud(void)
+esp_err_t BM1366_set_default_baud(int *baud)
 {
+    if (baud == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     // default divider of 26 (11010) for 115,749
     unsigned char baudrate[9] = {0x00, MISC_CONTROL, 0x00, 0x00, 0b01111010, 0b00110001}; // baudrate - misc_control
-    _send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE), baudrate, 6, BM1366_SERIALTX_DEBUG);
-    return 115749;
+    if (!_send_BM1366((TYPE_CMD | GROUP_ALL | CMD_WRITE), baudrate, 6,
+                      BM1366_SERIALTX_DEBUG)) {
+        return ESP_FAIL;
+    }
+    *baud = 115749;
+    return ESP_OK;
 }
 
-int BM1366_set_max_baud(void)
+esp_err_t BM1366_set_max_baud(int *baud)
 {
+    if (baud == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     ESP_LOGI(TAG, "Setting max baud of 1000000");
 
     unsigned char reg28[11] = {0x55, 0xAA, 0x51, 0x09, 0x00, 0x28, 0x11, 0x30, 0x02, 0x00, 0x03};
-    _send_simple(reg28, 11);
-    return 1000000;
+    if (!_send_simple(reg28, 11)) {
+        return ESP_FAIL;
+    }
+    *baud = 1000000;
+    return ESP_OK;
 }
 
 static uint8_t id = 0;
@@ -307,6 +402,9 @@ bool BM1366_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
 {
     if (GLOBAL_STATE == NULL || next_bm_job == NULL ||
         GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us == NULL ||
         GLOBAL_STATE->valid_jobs == NULL) {
         ESP_LOGE(TAG, "Cannot send job before job tracking is initialized");
         return false;
@@ -335,21 +433,35 @@ bool BM1366_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
     job.job_id = next_id;
     bm_job *replaced_job =
         GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id];
+    bm_job *prior_retired_job =
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs[job.job_id];
+    int64_t replaced_dispatch_us =
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us[job.job_id];
     GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = NULL;
+    GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us[job.job_id] = 0;
     GLOBAL_STATE->valid_jobs[job.job_id] = 0;
+    if (replaced_job != NULL) {
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs[job.job_id] = replaced_job;
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us[job.job_id] =
+            replaced_dispatch_us;
+    }
 
     bool sent = _send_BM1366((TYPE_JOB | GROUP_SINGLE | CMD_WRITE),
                              (const uint8_t *)&job, sizeof(job),
                              BM1366_DEBUG_WORK);
     if (sent) {
         GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us[job.job_id] =
+            esp_timer_get_time();
         GLOBAL_STATE->valid_jobs[job.job_id] = 1;
         id = next_id;
     }
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
-    if (replaced_job != NULL && replaced_job != next_bm_job) {
-        release_bm_job(replaced_job);
+    if (replaced_job != NULL && prior_retired_job != NULL &&
+        prior_retired_job != replaced_job &&
+        prior_retired_job != next_bm_job) {
+        release_bm_job(prior_retired_job);
     }
 
     if (!sent) {
@@ -378,7 +490,9 @@ task_result * BM1366_process_work(GlobalState * GLOBAL_STATE)
     }
 
     if (!asic_result.is_job_response) {
-        result.register_type = REGISTER_MAP[asic_result.cmd.register_address];
+        result.register_type = asic_register_map_lookup(
+            REGISTER_MAP, sizeof(REGISTER_MAP) / sizeof(REGISTER_MAP[0]),
+            asic_result.cmd.register_address);
         if (result.register_type == REGISTER_INVALID) {
             ESP_LOGW(TAG, "Unknown register read: %02x", asic_result.cmd.register_address);
             return NULL;

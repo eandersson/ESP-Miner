@@ -21,6 +21,7 @@ typedef struct bm_job
     uint8_t midstate2[32];
     uint8_t midstate3[32];
     double pool_diff;
+    bool version_rolling_enabled;
     char *jobid;
     char *extranonce2;
 } bm_job;
@@ -54,7 +55,9 @@ double hash_to_pdiff(const uint8_t hash[32]);
 
 double test_nonce_value(const bm_job *job, const uint32_t nonce, const uint32_t rolled_version);
 
-void extranonce_2_generate(uint64_t extranonce_2, uint32_t length, char dest[static length * 2 + 1]);
+bool extranonce_2_generate(uint64_t extranonce_2, uint32_t length,
+                           char *dest, size_t dest_size);
+bool extranonce_2_increment(uint64_t *extranonce_2, uint32_t length);
 
 uint32_t increment_bitmask(const uint32_t value, const uint32_t mask);
 size_t version_mask_midstate_count(uint32_t version_mask);

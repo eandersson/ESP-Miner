@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <math.h>
 #include "esp_log.h"
 #include "esp_check.h"
 
@@ -96,6 +97,12 @@ uint16_t EMC2103_get_fan_speed(void)
 
     reading = tach_lsb | (tach_msb << 8);
     reading >>= 3;
+    // 0xFFF8 is the controller's stalled/open tach value. After the three
+    // fractional bits are removed it becomes 0x1FFF; treating that as a real
+    // period reports roughly 960 RPM and defeats the fan-stall watchdog.
+    if (reading == 0 || reading == 0x1FFF) {
+        return 0;
+    }
 
     //RPM = (3,932,160 * m)/reading
     //m is the multipler, which is default 2
@@ -117,13 +124,13 @@ static float get_external_temp(int i, uint8_t msb_register, uint8_t lsb_register
     err = i2c_bitaxe_register_read(EMC2103_dev_handle, msb_register, &temp_msb, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read external temperature %d MSB: %s", i, esp_err_to_name(err));
-        return -1;
+        return NAN;
     }
     
     err = i2c_bitaxe_register_read(EMC2103_dev_handle, lsb_register, &temp_lsb, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read external temperature %d LSB: %s", i, esp_err_to_name(err));
-        return -1;
+        return NAN;
     }
 
     // Combine MSB and LSB, and then right shift to get 11 bits
@@ -131,6 +138,7 @@ static float get_external_temp(int i, uint8_t msb_register, uint8_t lsb_register
 
     if (reading == EMC2103_TEMP_DIODE_FAULT) {
         ESP_LOGE(TAG, "EMC2103 TEMP_DIODE%d_FAULT: %04X", i, reading);
+        return NAN;
     }
 
     reading >>= 5;  // Now, `reading` contains an 11-bit signed value

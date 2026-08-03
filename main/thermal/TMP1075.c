@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <math.h>
 #include "esp_log.h"
 #include "i2c_bitaxe.h"
 
@@ -29,14 +30,14 @@ float TMP1075_read_temperature(int device_index)
 {
     if (device_index < 0 || device_index >= 2) {
         ESP_LOGE(TAG, "Invalid device index");
-        return -1;
+        return NAN;
     }
     
     uint8_t data[2];
     esp_err_t err = i2c_bitaxe_register_read(tmp1075_dev_handle[device_index], TMP1075_TEMP_REG, data, 2);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read temperature from device index %d: %s", device_index, esp_err_to_name(err));
-        return -1;
+        return NAN;
     }
 
     int16_t raw_temp = ((int16_t)data[0] << 8) | data[1];

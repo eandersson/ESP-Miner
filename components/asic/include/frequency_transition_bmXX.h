@@ -2,6 +2,7 @@
 #define FREQUENCY_TRANSITION_H
 
 #include <stdbool.h>
+#include "esp_err.h"
 
 typedef struct GlobalState GlobalState;
 
@@ -15,7 +16,8 @@ extern const char *FREQUENCY_TRANSITION_TAG;
  * 
  * @param frequency The frequency to set in MHz
  */
-typedef float (*set_hash_frequency_fn)(float frequency);
+typedef esp_err_t (*set_hash_frequency_fn)(float frequency,
+                                           float *applied_frequency);
 
 /**
  * @brief Transition the ASIC frequency to a target value
@@ -26,6 +28,7 @@ typedef float (*set_hash_frequency_fn)(float frequency);
  * @param GLOBAL_STATE Pointer to the GlobalState structure
  * @param set_frequency_fn Function pointer to the appropriate ASIC's set_hash_frequency function
  */
-void do_frequency_transition(GlobalState * GLOBAL_STATE, set_hash_frequency_fn set_frequency_fn);
+esp_err_t do_frequency_transition(GlobalState *GLOBAL_STATE,
+                                  set_hash_frequency_fn set_frequency_fn);
 
 #endif // FREQUENCY_TRANSITION_H

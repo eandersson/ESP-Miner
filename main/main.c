@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -25,6 +26,7 @@
 #include "connect.h"
 #include "asic_reset.h"
 #include "asic_init.h"
+#include "vcore.h"
 #include "task_monitor.h"
 #include "filesystem.h"
 #include "log_buffer.h"
@@ -36,6 +38,25 @@ static GlobalState GLOBAL_STATE;
 static const char * TAG = "bitaxe";
 
 #define ASIC_TASK_CORE 1
+#define POWER_PREFLIGHT_TIMEOUT_MS 5000U
+
+static void fail_asic_closed(const char *status)
+{
+    GLOBAL_STATE.SYSTEM_MODULE.hardware_fault = true;
+    GLOBAL_STATE.SYSTEM_MODULE.asic_status = status;
+    snprintf(GLOBAL_STATE.SYSTEM_MODULE.hardware_fault_msg,
+             sizeof(GLOBAL_STATE.SYSTEM_MODULE.hardware_fault_msg), "%s",
+             status);
+    asic_lifecycle_set(&GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
+    if (asic_hold_reset_low() != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to assert ASIC reset while failing closed");
+    }
+    if (VCORE_set_voltage(&GLOBAL_STATE, 0.0f) != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to disable VCORE while failing closed");
+    }
+    GLOBAL_STATE.POWER_MANAGEMENT_MODULE.expected_hashrate = 0.0f;
+    asic_lifecycle_set(&GLOBAL_STATE, ASIC_LIFECYCLE_STOPPED);
+}
 
 static void heap_alloc_failed_hook(size_t requested_size, uint32_t caps, const char *function_name)
 {
@@ -150,6 +171,13 @@ void app_main(void)
     if (system_init_ret == ESP_OK) {
         if (xTaskCreate(POWER_MANAGEMENT_task, "power management", 8192, (void *) &GLOBAL_STATE, 10, NULL) != pdPASS) {
             ESP_LOGE(TAG, "Error creating power management task");
+            fail_asic_closed("Power management task creation failed");
+            __atomic_store_n(
+                &GLOBAL_STATE.POWER_MANAGEMENT_MODULE.startup_preflight_succeeded,
+                false, __ATOMIC_RELAXED);
+            __atomic_store_n(
+                &GLOBAL_STATE.POWER_MANAGEMENT_MODULE.startup_preflight_complete,
+                true, __ATOMIC_RELEASE);
         }
         if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
             if (xTaskCreate(FAN_CONTROLLER_task, "fan_controller", 8192, (void *) &GLOBAL_STATE, 5, NULL) != pdPASS) {
@@ -202,7 +230,19 @@ void app_main(void)
     }
 
     if (system_init_ret == ESP_OK) {
-        if (asic_initialize(&GLOBAL_STATE, ASIC_INIT_COLD_BOOT, 0) == 0) {
+        bool power_ready = POWER_MANAGEMENT_wait_for_preflight(
+            &GLOBAL_STATE, POWER_PREFLIGHT_TIMEOUT_MS);
+        if (!power_ready || GLOBAL_STATE.SYSTEM_MODULE.hardware_fault) {
+            ESP_LOGE(TAG,
+                     "ASIC cold start blocked: power preflight did not complete successfully");
+            fail_asic_closed("VCORE startup preflight failed");
+            if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+                return;
+            }
+            self_test_show_message(
+                &GLOBAL_STATE, GLOBAL_STATE.SYSTEM_MODULE.asic_status);
+            system_init_ret = ESP_FAIL;
+        } else if (asic_initialize(&GLOBAL_STATE, ASIC_INIT_COLD_BOOT, 0) == 0) {
             if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
                 return;
             }
@@ -210,26 +250,45 @@ void app_main(void)
             self_test_show_message(&GLOBAL_STATE, GLOBAL_STATE.SYSTEM_MODULE.asic_status);
             system_init_ret = ESP_FAIL;
         } else {
+            bool critical_task_failure = false;
             if (xTaskCreatePinnedToCore(create_jobs_task, "stratum miner",
                                         8192, (void *)&GLOBAL_STATE, 20,
                                         NULL, ASIC_TASK_CORE) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating stratum miner task");
+                critical_task_failure = true;
             }
             // Keep the latency-sensitive UART path on core 1. ESP-IDF's Wi-Fi
             // task is pinned to core 0, so this prevents radio work and ASIC RX
             // from preempting each other during bursts.
-            if (xTaskCreatePinnedToCore(ASIC_result_rx_task, "asic result rx", 4096, (void *) &GLOBAL_STATE, 18, NULL, ASIC_TASK_CORE) != pdPASS) {
+            if (xTaskCreatePinnedToCore(ASIC_result_rx_task, "asic result rx", 4096, (void *) &GLOBAL_STATE, 21, NULL, ASIC_TASK_CORE) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating asic result rx task");
+                critical_task_failure = true;
             }
             if (xTaskCreatePinnedToCore(ASIC_result_task, "asic result", 8192, (void *) &GLOBAL_STATE, 15, NULL, ASIC_TASK_CORE) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating asic result task");
+                critical_task_failure = true;
+            }
+            if (xTaskCreateWithCaps(ASIC_v1_share_submit_task, "v1 share tx", 6144, (void *) &GLOBAL_STATE, 8, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+                ESP_LOGE(TAG, "Error creating Stratum V1 share submit task");
+                critical_task_failure = true;
             }
 
             if (xTaskCreateWithCaps(hashrate_monitor_task, "hashrate monitor", 8192, (void *) &GLOBAL_STATE, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating hashrate monitor task");
+                critical_task_failure = true;
             }
             if (xTaskCreateWithCaps(statistics_task, "statistics", 8192, (void *) &GLOBAL_STATE, 3, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating statistics task");
+            }
+
+            if (critical_task_failure) {
+                fail_asic_closed("Critical ASIC task creation failed");
+                if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+                    return;
+                }
+                self_test_show_message(
+                    &GLOBAL_STATE, GLOBAL_STATE.SYSTEM_MODULE.asic_status);
+                system_init_ret = ESP_FAIL;
             }
         }
     }

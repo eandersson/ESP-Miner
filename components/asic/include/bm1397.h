@@ -29,10 +29,11 @@ uint8_t BM1397_init(GlobalState * GLOBAL_STATE);
 // Takes ownership of next_bm_job only when true is returned.
 bool BM1397_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
                       uint32_t expected_generation);
-void BM1397_set_version_mask(uint32_t version_mask);
-int BM1397_set_max_baud(void);
-int BM1397_set_default_baud(void);
-float BM1397_send_hash_frequency(float frequency);
+esp_err_t BM1397_set_version_mask(uint32_t version_mask);
+esp_err_t BM1397_set_max_baud(int *baud);
+esp_err_t BM1397_set_default_baud(int *baud);
+esp_err_t BM1397_send_hash_frequency(float frequency,
+                                     float *applied_frequency);
 task_result * BM1397_process_work(GlobalState * GLOBAL_STATE);
 void BM1397_read_registers(void);
 

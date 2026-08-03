@@ -63,6 +63,10 @@ typedef struct task_result
     uint64_t timestamp_us;
 } task_result;
 
+register_type_t asic_register_map_lookup(const register_type_t *register_map,
+                                         size_t register_map_size,
+                                         uint8_t register_address);
+
 unsigned char _reverse_bits(unsigned char num);
 int _largest_power_of_two(int num);
 int _next_power_of_two(int num);

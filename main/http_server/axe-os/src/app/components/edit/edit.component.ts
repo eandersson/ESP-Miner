@@ -78,8 +78,8 @@ export class EditComponent implements OnInit, OnDestroy, OnChanges {
         this.saveOverclockSetting(1);
         console.log(
           '🎉 The ancient seals have been broken!\n' +
-          '⚡ Unlimited power flows through your miner...\n' +
-          '🔧 You can now set custom frequency and voltage values.\n' +
+          '⚡ Validated custom tuning is enabled for this miner.\n' +
+          '🔧 You can now choose values within the board envelope.\n' +
           '⚠️ Remember: with great power comes great responsibility!'
         );
       } else {

@@ -17,6 +17,10 @@
 #include "cjson_utils.h"
 #include "statistics_task.h"
 #include "stratum_v2_task.h"
+#include "asic_common.h"
+#include "asic_result_task.h"
+#include "serial.h"
+#include "asic_init.h"
 
 
 static const char *get_reset_reason_str(esp_reset_reason_t reason)
@@ -54,6 +58,17 @@ static void system_api_add_telemetry(cJSON *root, GlobalState *g) {
     cJSON_AddFloatToObject(root, "vrTemp", g->POWER_MANAGEMENT_MODULE.vr_temp);
     cJSON_AddFloatToObject(root, "coreVoltageActual", g->POWER_MANAGEMENT_MODULE.core_voltage);
     cJSON_AddFloatToObject(root, "actualFrequency", g->POWER_MANAGEMENT_MODULE.actual_frequency);
+    cJSON_AddFloatToObject(root, "requestedFrequency", g->POWER_MANAGEMENT_MODULE.requested_frequency);
+    cJSON_AddNumberToObject(root, "requestedCoreVoltage", g->POWER_MANAGEMENT_MODULE.requested_voltage_mv);
+    cJSON_AddFloatToObject(root, "thermalFrequencyCap", g->POWER_MANAGEMENT_MODULE.thermal_frequency_cap);
+    cJSON_AddNumberToObject(root, "thermalThrottled", g->POWER_MANAGEMENT_MODULE.thermal_throttled ? 1 : 0);
+    cJSON_AddNumberToObject(root, "chipTempValid", g->POWER_MANAGEMENT_MODULE.chip_temp_valid ? 1 : 0);
+    cJSON_AddNumberToObject(root, "chipTemp2Valid", g->POWER_MANAGEMENT_MODULE.chip_temp2_valid ? 1 : 0);
+    cJSON_AddNumberToObject(root, "chipTempAgeMs", g->POWER_MANAGEMENT_MODULE.chip_temp_age_ms);
+    cJSON_AddNumberToObject(root, "chipTemp2AgeMs", g->POWER_MANAGEMENT_MODULE.chip_temp2_age_ms);
+    cJSON_AddNumberToObject(root, "asicResponseAgeMs", g->POWER_MANAGEMENT_MODULE.asic_response_age_ms);
+    cJSON_AddNumberToObject(root, "asicProgressAgeMs", g->POWER_MANAGEMENT_MODULE.asic_progress_age_ms);
+    cJSON_AddNumberToObject(root, "asicLifecycle", asic_lifecycle_get(g));
     cJSON_AddFloatToObject(root, "expectedHashrate", g->POWER_MANAGEMENT_MODULE.expected_hashrate);
     cJSON_AddNumberToObject(root, "fanspeed", g->POWER_MANAGEMENT_MODULE.fan_perc);
     cJSON_AddNumberToObject(root, "fanrpm", g->POWER_MANAGEMENT_MODULE.fan_rpm);
@@ -75,6 +90,37 @@ static void system_api_add_telemetry(cJSON *root, GlobalState *g) {
     cJSON_AddNumberToObject(root, "responseShareBatch", g->SYSTEM_MODULE.response_share_batch);
     cJSON_AddFloatToObject(root, "processTime", g->SYSTEM_MODULE.process_time);
     cJSON_AddNumberToObject(root, "workReceived", g->SYSTEM_MODULE.work_received);
+
+    asic_rx_stats_t rx_stats = {0};
+    asic_result_stats_t result_stats = {0};
+    serial_stats_t serial_stats = {0};
+    get_work_rx_stats(&rx_stats);
+    ASIC_result_task_get_stats(&result_stats);
+    SERIAL_get_stats(&serial_stats);
+    cJSON_AddNumberToObject(root, "asicRxFrames", rx_stats.frames_received);
+    cJSON_AddNumberToObject(root, "asicRxCrcErrors", rx_stats.crc_errors);
+    cJSON_AddNumberToObject(root, "asicRxDiscardedBytes", rx_stats.discarded_bytes);
+    cJSON_AddNumberToObject(root, "asicRxTimeouts", rx_stats.timeouts);
+    cJSON_AddNumberToObject(root, "asicRxUartErrors", rx_stats.uart_errors);
+    cJSON_AddNumberToObject(root, "asicUartTxFailures", serial_stats.tx_failures);
+    cJSON_AddNumberToObject(root, "asicUartTxPartialWrites", serial_stats.tx_partial_writes);
+    cJSON_AddNumberToObject(root, "asicUartRxFailures", serial_stats.rx_failures);
+    cJSON_AddNumberToObject(root, "asicUartRxBufferPeak", serial_stats.rx_buffer_high_watermark);
+    cJSON_AddNumberToObject(root, "asicUartFifoOverflows", serial_stats.fifo_overflows);
+    cJSON_AddNumberToObject(root, "asicUartBufferFullEvents", serial_stats.buffer_full_events);
+    cJSON_AddNumberToObject(root, "asicUartParityErrors", serial_stats.parity_errors);
+    cJSON_AddNumberToObject(root, "asicUartFrameErrors", serial_stats.frame_errors);
+    cJSON_AddNumberToObject(root, "asicUartBaudFailures", serial_stats.baud_failures);
+    cJSON_AddNumberToObject(root, "asicRegistersProcessed", result_stats.registers_processed);
+    cJSON_AddNumberToObject(root, "asicNoncesProcessed", result_stats.nonces_processed);
+    cJSON_AddNumberToObject(root, "asicNoncesDropped", result_stats.nonces_dropped);
+    cJSON_AddNumberToObject(root, "asicNonceQueuePeak", result_stats.nonce_queue_high_watermark);
+    cJSON_AddNumberToObject(root, "asicNonceLatencyMaxMs", result_stats.nonce_max_latency_ms);
+    cJSON_AddNumberToObject(root, "asicAmbiguousResults", result_stats.ambiguous_jobs);
+    cJSON_AddNumberToObject(root, "asicSharesQueued", result_stats.shares_enqueued);
+    cJSON_AddNumberToObject(root, "asicSharesSubmitted", result_stats.shares_submitted);
+    cJSON_AddNumberToObject(root, "asicSharesDropped", result_stats.shares_dropped);
+    cJSON_AddNumberToObject(root, "asicShareQueuePeak", result_stats.share_queue_high_watermark);
 
     // Dynamic Block Info
     cJSON_AddNumberToObject(root, "blockFound", g->SYSTEM_MODULE.block_found);

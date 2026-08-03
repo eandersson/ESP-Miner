@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <limits.h>
+#include <math.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <esp_heap_caps.h>
@@ -827,6 +828,45 @@ static void update_pool_nvs(const cJSON *pool_item, int i) {
     SYSTEM_load_pool_from_nvs(GLOBAL_STATE, i);
 }
 
+static bool validate_asic_setpoint(const cJSON *item,
+                                   const uint16_t *options,
+                                   bool custom_values_enabled,
+                                   const char *name)
+{
+    if (item == NULL) {
+        return true;
+    }
+    if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
+        options == NULL) {
+        ESP_LOGW(TAG, "Invalid ASIC %s value", name);
+        return false;
+    }
+
+    double minimum = 0.0;
+    double maximum = 0.0;
+    bool exact_match = false;
+    for (size_t i = 0; i < 64 && options[i] != 0; i++) {
+        double option = options[i];
+        if (minimum == 0.0 || option < minimum) minimum = option;
+        if (option > maximum) maximum = option;
+        if (fabs(item->valuedouble - option) < 0.001) {
+            exact_match = true;
+        }
+    }
+
+    bool valid = minimum > 0.0 && maximum >= minimum &&
+                 item->valuedouble >= minimum &&
+                 item->valuedouble <= maximum &&
+                 (custom_values_enabled || exact_match);
+    if (!valid) {
+        ESP_LOGW(TAG,
+                 "ASIC %s %.3f is outside the selected board envelope %.0f-%.0f%s",
+                 name, item->valuedouble, minimum, maximum,
+                 custom_values_enabled ? "" : " or is not a listed value");
+    }
+    return valid;
+}
+
 bool check_settings_and_update(const cJSON * const root, char **redirect_url)
 {
     bool result = true;
@@ -919,6 +959,32 @@ bool check_settings_and_update(const cJSON * const root, char **redirect_url)
             ESP_LOGW(TAG, "Invalid display rotation: '%d'", item->valueint);
             result = false;
         }
+    }
+
+    cJSON *overclock_item = cJSON_GetObjectItem(root, "overclockEnabled");
+    bool custom_values_enabled =
+        overclock_item != NULL &&
+                (cJSON_IsBool(overclock_item) || cJSON_IsNumber(overclock_item))
+            ? (cJSON_IsTrue(overclock_item) || overclock_item->valueint != 0)
+            : nvs_config_get_bool(NVS_CONFIG_OVERCLOCK_ENABLED);
+    cJSON *frequency_item = cJSON_GetObjectItem(root, "frequency");
+    cJSON *voltage_item = cJSON_GetObjectItem(root, "coreVoltage");
+    if (!validate_asic_setpoint(
+            frequency_item,
+            GLOBAL_STATE->DEVICE_CONFIG.family.asic.frequency_options,
+            custom_values_enabled, "frequency")) {
+        result = false;
+    }
+    if (voltage_item != NULL && cJSON_IsNumber(voltage_item) &&
+        voltage_item->valuedouble != (double)voltage_item->valueint) {
+        ESP_LOGW(TAG, "ASIC voltage must be an integer number of millivolts");
+        result = false;
+    }
+    if (!validate_asic_setpoint(
+            voltage_item,
+            GLOBAL_STATE->DEVICE_CONFIG.family.asic.voltage_options,
+            custom_values_enabled, "voltage")) {
+        result = false;
     }
 
     // Validate pools array separately

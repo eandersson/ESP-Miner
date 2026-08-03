@@ -236,24 +236,59 @@ TEST_CASE("Version mask helpers report distinct work cardinality", "[mining]")
 TEST_CASE("Test extranonce 2 generation", "[mining extranonce2]")
 {
     char first[9];
-    extranonce_2_generate(0, 4, first);
+    TEST_ASSERT_TRUE(extranonce_2_generate(0, 4, first, sizeof(first)));
     TEST_ASSERT_EQUAL_STRING("00000000", first);
 
     char second[9];
-    extranonce_2_generate(1, 4, second);
+    TEST_ASSERT_TRUE(extranonce_2_generate(1, 4, second, sizeof(second)));
     TEST_ASSERT_EQUAL_STRING("01000000", second);
 
     char third[9];
-    extranonce_2_generate(2, 4, third);
+    TEST_ASSERT_TRUE(extranonce_2_generate(2, 4, third, sizeof(third)));
     TEST_ASSERT_EQUAL_STRING("02000000", third);
 
     char fourth[9];
-    extranonce_2_generate(UINT_MAX - 1, 4, fourth);
+    TEST_ASSERT_TRUE(extranonce_2_generate(UINT_MAX - 1, 4, fourth,
+                                          sizeof(fourth)));
     TEST_ASSERT_EQUAL_STRING("feffffff", fourth);
 
     char fifth[13];
-    extranonce_2_generate(UINT_MAX / 2, 6, fifth);
+    TEST_ASSERT_TRUE(extranonce_2_generate(UINT_MAX / 2, 6, fifth,
+                                          sizeof(fifth)));
     TEST_ASSERT_EQUAL_STRING("ffffff7f0000", fifth);
+}
+
+TEST_CASE("Extranonce2 generation validates capacity", "[mining extranonce2]")
+{
+    char empty[1];
+    char too_small[8];
+
+    TEST_ASSERT_TRUE(extranonce_2_generate(0, 0, empty, sizeof(empty)));
+    TEST_ASSERT_EQUAL_STRING("", empty);
+    TEST_ASSERT_FALSE(extranonce_2_generate(1, 4, too_small,
+                                           sizeof(too_small)));
+    TEST_ASSERT_FALSE(extranonce_2_generate(
+        1, MAX_EXTRANONCE_2_LEN + 1, too_small, sizeof(too_small)));
+}
+
+TEST_CASE("Extranonce2 counter never wraps", "[mining extranonce2]")
+{
+    uint64_t value = 0;
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 0));
+    TEST_ASSERT_EQUAL_UINT64(0, value);
+
+    value = UINT8_MAX - 1;
+    TEST_ASSERT_TRUE(extranonce_2_increment(&value, 1));
+    TEST_ASSERT_EQUAL_UINT64(UINT8_MAX, value);
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 1));
+    TEST_ASSERT_EQUAL_UINT64(UINT8_MAX, value);
+
+    value = UINT16_MAX;
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 2));
+    value = UINT64_MAX;
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 8));
+    TEST_ASSERT_FALSE(extranonce_2_increment(
+        &value, MAX_EXTRANONCE_2_LEN));
 }
 
 TEST_CASE("Test nonce diff checking", "[mining test_nonce][not-on-qemu]")

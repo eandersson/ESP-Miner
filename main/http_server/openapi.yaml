@@ -435,6 +435,43 @@ components:
         actualFrequency:
           type: number
           description: Real-time ASIC frequency in MHz
+        requestedFrequency:
+          type: number
+          description: Validated ASIC frequency requested from the power governor
+        requestedCoreVoltage:
+          type: integer
+          description: Validated ASIC core voltage requested from the power governor, in millivolts
+        thermalFrequencyCap:
+          type: number
+          description: Temporary maximum frequency imposed by the thermal governor, in MHz
+        thermalThrottled:
+          type: integer
+          enum: [0, 1]
+          description: Whether the thermal governor is currently limiting frequency
+        chipTempValid:
+          type: integer
+          enum: [0, 1]
+          description: Whether the primary ASIC temperature sample is currently valid
+        chipTemp2Valid:
+          type: integer
+          enum: [0, 1]
+          description: Whether the secondary ASIC temperature sample is currently valid
+        chipTempAgeMs:
+          type: integer
+          description: Age of the most recent valid primary ASIC temperature sample
+        chipTemp2AgeMs:
+          type: integer
+          description: Age of the most recent valid secondary ASIC temperature sample
+        asicResponseAgeMs:
+          type: integer
+          description: Age of the most recent valid ASIC register response
+        asicProgressAgeMs:
+          type: integer
+          description: Age of the most recent advancing ASIC hash counter
+        asicLifecycle:
+          type: integer
+          enum: [0, 1, 2, 3]
+          description: ASIC lifecycle state (0=stopped, 1=starting, 2=running, 3=stopping)
         hashRate:
           type: number
           description: Current hashrate in Gh/s
@@ -686,6 +723,78 @@ components:
         workReceived:
           type: integer
           description: Total number of mining jobs received from the pool
+        asicRxFrames:
+          type: integer
+          description: Valid ASIC UART frames received
+        asicRxCrcErrors:
+          type: integer
+          description: ASIC UART frames rejected by CRC validation
+        asicRxDiscardedBytes:
+          type: integer
+          description: Bytes discarded while resynchronizing the ASIC UART stream
+        asicRxTimeouts:
+          type: integer
+          description: ASIC UART receive timeouts
+        asicRxUartErrors:
+          type: integer
+          description: ASIC UART driver errors
+        asicUartTxFailures:
+          type: integer
+          description: ASIC UART packets that could not be queued for transmission
+        asicUartTxPartialWrites:
+          type: integer
+          description: ASIC UART packets only partially accepted by the driver
+        asicUartRxFailures:
+          type: integer
+          description: ASIC UART receive calls that failed
+        asicUartRxBufferPeak:
+          type: integer
+          description: Peak number of bytes observed in the ASIC UART receive buffer
+        asicUartFifoOverflows:
+          type: integer
+          description: ASIC UART hardware FIFO overflow events
+        asicUartBufferFullEvents:
+          type: integer
+          description: ASIC UART driver ring-buffer full events
+        asicUartParityErrors:
+          type: integer
+          description: ASIC UART parity errors
+        asicUartFrameErrors:
+          type: integer
+          description: ASIC UART framing errors
+        asicUartBaudFailures:
+          type: integer
+          description: Failed ASIC UART baud-rate transitions
+        asicRegistersProcessed:
+          type: integer
+          description: Register responses handled directly by the RX task
+        asicNoncesProcessed:
+          type: integer
+          description: ASIC nonce results processed
+        asicNoncesDropped:
+          type: integer
+          description: ASIC nonce results dropped because the nonce queue was full
+        asicNonceQueuePeak:
+          type: integer
+          description: ASIC nonce queue high-water mark
+        asicNonceLatencyMaxMs:
+          type: integer
+          description: Maximum observed nonce queue latency in milliseconds
+        asicAmbiguousResults:
+          type: integer
+          description: Delayed results that could not be assigned uniquely to a job generation
+        asicSharesQueued:
+          type: integer
+          description: Valid Stratum V1 shares queued for submission
+        asicSharesSubmitted:
+          type: integer
+          description: Stratum V1 shares successfully written to the pool transport
+        asicSharesDropped:
+          type: integer
+          description: Valid Stratum V1 shares dropped before transport submission
+        asicShareQueuePeak:
+          type: integer
+          description: Stratum V1 share queue high-water mark
         partitions:
           type: array
           description: List of available app partitions and their firmware versions
@@ -936,10 +1045,11 @@ components:
             - "esp-miner-1"
         coreVoltage:
           type: integer
-          description: ASIC core voltage in millivolts
+          description: ASIC core voltage in millivolts; the accepted range is defined by the selected board's voltageOptions
           minimum: 1
+          maximum: 65535
           examples:
-            - 850
+            - 1200
         asicJobInterval:
           type: integer
           description: Maximum uninterrupted ASIC job residency in milliseconds for version-rolling chips
@@ -948,9 +1058,10 @@ components:
           examples:
             - 30000
         frequency:
-          type: integer
-          description: ASIC frequency in MHz
-          minimum: 1
+          type: number
+          description: ASIC frequency in MHz; accepted range is restricted further by the selected board
+          minimum: 50
+          maximum: 800
           examples:
             - 450
         rotation:

@@ -321,3 +321,120 @@ TEST_CASE("Parse stratum configure result", "[stratum]")
     TEST_ASSERT_TRUE(stratum_api_v1_message.response_success);
     TEST_ASSERT_EQUAL_HEX32(0x1fffe000, stratum_api_v1_message.version_mask);
 }
+
+TEST_CASE("Parse rejected BIP310 configure results", "[stratum][bip310]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":false},\"error\":null}"));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_CONFIGURE, message.method);
+    TEST_ASSERT_FALSE(message.response_success);
+    TEST_ASSERT_NOT_NULL(message.error_str);
+
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":\"mask unavailable\"},\"error\":null}"));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_CONFIGURE, message.method);
+    TEST_ASSERT_FALSE(message.response_success);
+    TEST_ASSERT_EQUAL_STRING("mask unavailable", message.error_str);
+    STRATUM_V1_reset_message(&message);
+}
+
+TEST_CASE("Reject malformed BIP310 masks", "[stratum][bip310]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":true},\"error\":null}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":true,\"version-rolling.mask\":\"1fffe00z\"},\"error\":null}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":null,\"method\":\"mining.set_version_mask\",\"params\":[\"ffff\"]}"));
+    STRATUM_V1_reset_message(&message);
+}
+
+TEST_CASE("Validate Stratum extranonce fields", "[stratum][extranonce]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"\",0]}"));
+    TEST_ASSERT_EQUAL_INT(0, message.extranonce_2_len);
+
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abc\",4]}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abcd\",-1]}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abcd\",33]}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abcd\",1.5]}"));
+    STRATUM_V1_reset_message(&message);
+}
+
+TEST_CASE("Format BIP310 and legacy V1 requests", "[stratum][bip310]")
+{
+    char request[512];
+    TEST_ASSERT_GREATER_THAN(
+        0, STRATUM_V1_format_configure_request(
+               request, sizeof(request), 1, 0x1fffe000,
+               STRATUM_VERSION_ROLLING_MIN_BIT_COUNT));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":1,\"method\":\"mining.configure\",\"params\":[[\"version-rolling\"],{\"version-rolling.mask\":\"1fffe000\",\"version-rolling.min-bit-count\":2}]}\n",
+        request);
+
+    TEST_ASSERT_GREATER_THAN(
+        0, STRATUM_V1_format_submit_request(
+               request, sizeof(request), 7, "worker", "job", "01000000",
+               0x12345678, 0x90abcdef, false, 0));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":7,\"method\":\"mining.submit\",\"params\":[\"worker\",\"job\",\"01000000\",\"12345678\",\"90abcdef\"]}\n",
+        request);
+
+    TEST_ASSERT_GREATER_THAN(
+        0, STRATUM_V1_format_submit_request(
+               request, sizeof(request), 8, "worker", "job", "01000000",
+               0x12345678, 0x90abcdef, true, 0x00002000));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":8,\"method\":\"mining.submit\",\"params\":[\"worker\",\"job\",\"01000000\",\"12345678\",\"90abcdef\",\"00002000\"]}\n",
+        request);
+}
+
+TEST_CASE("Transient BIP310 failure skips exactly one probe", "[stratum][bip310]")
+{
+    stratum_v1_bip310_state_t state =
+        STRATUM_V1_BIP310_STATE_INITIALIZER;
+
+    TEST_ASSERT_TRUE(STRATUM_V1_bip310_should_probe(&state));
+    STRATUM_V1_bip310_transient_failure(&state);
+    TEST_ASSERT_FALSE(STRATUM_V1_bip310_should_probe(&state));
+    TEST_ASSERT_TRUE(STRATUM_V1_bip310_should_probe(&state));
+}
+
+TEST_CASE("Explicit BIP310 rejection remains in legacy mode", "[stratum][bip310]")
+{
+    stratum_v1_bip310_state_t state =
+        STRATUM_V1_BIP310_STATE_INITIALIZER;
+
+    STRATUM_V1_bip310_mark_unsupported(&state);
+    TEST_ASSERT_FALSE(STRATUM_V1_bip310_should_probe(&state));
+    STRATUM_V1_bip310_transient_failure(&state);
+    TEST_ASSERT_FALSE(STRATUM_V1_bip310_should_probe(&state));
+}
+
+TEST_CASE("Successful BIP310 negotiation restores probing state", "[stratum][bip310]")
+{
+    stratum_v1_bip310_state_t state =
+        STRATUM_V1_BIP310_STATE_INITIALIZER;
+
+    STRATUM_V1_bip310_mark_unsupported(&state);
+    STRATUM_V1_bip310_mark_supported(&state);
+    TEST_ASSERT_TRUE(STRATUM_V1_bip310_should_probe(&state));
+}

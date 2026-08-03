@@ -202,11 +202,18 @@ void construct_bm_job(mining_notify *params, const uint8_t merkle_root[32], cons
     }
 }
 
-void extranonce_2_generate(uint64_t extranonce_2, uint32_t length, char dest[static length * 2 + 1])
+bool extranonce_2_generate(uint64_t extranonce_2, uint32_t length,
+                           char *dest, size_t dest_size)
 {
-    // Allocate buffer to hold the extranonce_2 value in bytes
-    uint8_t extranonce_2_bytes[length];
-    memset(extranonce_2_bytes, 0, length);
+    if (dest == NULL || length > MAX_EXTRANONCE_2_LEN ||
+        dest_size < (size_t)length * 2 + 1) {
+        return false;
+    }
+
+    // A fixed-size buffer also handles a valid zero-byte extranonce without a
+    // zero-length VLA. The scheduler prevents the uint64_t counter from
+    // wrapping, so each generated value is unique for the current template.
+    uint8_t extranonce_2_bytes[MAX_EXTRANONCE_2_LEN] = {0};
     
     // Copy the extranonce_2 value into the buffer, handling endianness
     // Copy up to the size of uint64_t or the requested length, whichever is smaller
@@ -214,7 +221,27 @@ void extranonce_2_generate(uint64_t extranonce_2, uint32_t length, char dest[sta
     memcpy(extranonce_2_bytes, &extranonce_2, copy_len);
     
     // Convert the bytes to hex string
-    bin2hex(extranonce_2_bytes, length, dest, length * 2 + 1);
+    bin2hex(extranonce_2_bytes, length, dest, dest_size);
+    return true;
+}
+
+bool extranonce_2_increment(uint64_t *extranonce_2, uint32_t length)
+{
+    if (extranonce_2 == NULL || length > MAX_EXTRANONCE_2_LEN ||
+        length == 0) {
+        return false;
+    }
+
+    uint64_t maximum = UINT64_MAX;
+    if (length < sizeof(uint64_t)) {
+        maximum = (UINT64_C(1) << (length * CHAR_BIT)) - 1;
+    }
+    if (*extranonce_2 >= maximum) {
+        return false;
+    }
+
+    (*extranonce_2)++;
+    return true;
 }
 
 double hash_to_pdiff(const uint8_t hash[32])
