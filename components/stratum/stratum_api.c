@@ -843,7 +843,7 @@ int STRATUM_V1_submit_share(esp_transport_handle_t transport, int send_uid,
         submit_msg, sizeof(submit_msg), send_uid, username, job_id,
         extranonce_2, ntime, nonce, version_rolling_enabled, version_bits);
     if (submit_len < 0) {
-        return -1;
+        return STRATUM_V1_SUBMIT_FORMAT_ERROR;
     }
 
     int ret = stratum_socket_write_all(transport, submit_msg,

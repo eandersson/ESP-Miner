@@ -1,5 +1,6 @@
 #include "unity.h"
 #include "stratum_api.h"
+#include <string.h>
 
 TEST_CASE("Parse stratum method", "[stratum]")
 {
@@ -414,6 +415,23 @@ TEST_CASE("Format BIP310 and legacy V1 requests", "[stratum][bip310]")
     TEST_ASSERT_EQUAL_STRING(
         "{\"id\":8,\"method\":\"mining.submit\",\"params\":[\"worker\",\"job\",\"01000000\",\"12345678\",\"90abcdef\",\"00002000\"]}\n",
         request);
+}
+
+TEST_CASE("Oversized V1 submit is a formatting error", "[stratum][submit]")
+{
+    char oversized_job[1024];
+    memset(oversized_job, 'a', sizeof(oversized_job) - 1);
+    oversized_job[sizeof(oversized_job) - 1] = '\0';
+    uint64_t sent_time_us = UINT64_MAX;
+
+    TEST_ASSERT_EQUAL_INT(
+        STRATUM_V1_SUBMIT_FORMAT_ERROR,
+        STRATUM_V1_submit_share(
+            NULL, 9, "worker", oversized_job, "01000000", 0x12345678,
+            0x90abcdef, false, 0, &sent_time_us));
+    // The target Unity configuration has 64-bit assertions disabled.
+    TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, (uint32_t)(sent_time_us >> 32));
+    TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, (uint32_t)sent_time_us);
 }
 
 TEST_CASE("Transient BIP310 failure skips exactly one probe", "[stratum][bip310]")

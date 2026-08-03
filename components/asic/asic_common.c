@@ -111,6 +111,9 @@ int count_asic_chips(uint16_t asic_count, uint16_t chip_id, int chip_id_response
 
     int chip_counter = 0;
     while (true) {
+        // Reaching the configured count does not prove enumeration is done.
+        // Keep the full inter-frame timeout so a delayed unexpected ASIC is
+        // detected before the chain is accepted.
         esp_err_t receive_result = receive_stream_frame(
             &chip_id_stream, buffer, chip_id_response_length, 1000, NULL);
         if (receive_result == ESP_ERR_TIMEOUT) {

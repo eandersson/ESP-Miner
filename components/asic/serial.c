@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -35,6 +36,9 @@ static atomic_uint_fast32_t parity_errors;
 static atomic_uint_fast32_t frame_errors;
 static atomic_uint_fast32_t break_events;
 static atomic_uint_fast32_t baud_failures;
+static atomic_uint_fast32_t tx_epoch;
+static pthread_mutex_t tx_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool tx_paused;
 
 static void update_atomic_max(atomic_uint_fast32_t *maximum, uint32_t value)
 {
@@ -159,6 +163,13 @@ esp_err_t SERIAL_set_baud(int baud)
         return ESP_ERR_INVALID_STATE;
     }
 
+    pthread_mutex_lock(&tx_lock);
+    if (tx_paused) {
+        pthread_mutex_unlock(&tx_lock);
+        atomic_fetch_add(&baud_failures, 1);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(TAG, "Changing UART baud to %i", baud);
 
     // Make sure that we are done writing before setting a new baudrate.
@@ -167,6 +178,7 @@ esp_err_t SERIAL_set_baud(int baud)
         atomic_fetch_add(&baud_failures, 1);
         ESP_LOGE(TAG, "ASIC UART did not drain before baud change: %s",
                  esp_err_to_name(err));
+        pthread_mutex_unlock(&tx_lock);
         return err;
     }
 
@@ -174,9 +186,11 @@ esp_err_t SERIAL_set_baud(int baud)
     if (err != ESP_OK) {
         atomic_fetch_add(&baud_failures, 1);
         ESP_LOGE(TAG, "Unable to change ASIC UART baud: %s", esp_err_to_name(err));
+        pthread_mutex_unlock(&tx_lock);
         return err;
     }
 
+    pthread_mutex_unlock(&tx_lock);
     return ESP_OK;
 }
 
@@ -195,6 +209,19 @@ bool SERIAL_send(const uint8_t *data, size_t len, bool debug)
         return false;
     }
 
+    // Capture the epoch before waiting on the mutex. A pause/resume transition
+    // invalidates callers that were queued before shutdown, even if they do
+    // not get scheduled again until the next ASIC startup.
+    uint_fast32_t send_epoch = atomic_load_explicit(
+        &tx_epoch, memory_order_acquire);
+    pthread_mutex_lock(&tx_lock);
+    if (tx_paused ||
+        send_epoch != atomic_load_explicit(&tx_epoch, memory_order_acquire)) {
+        pthread_mutex_unlock(&tx_lock);
+        ESP_LOGD(TAG, "ASIC UART write skipped across shutdown transition");
+        return false;
+    }
+
     if (debug)
     {
         printf("tx: ");
@@ -208,18 +235,46 @@ bool SERIAL_send(const uint8_t *data, size_t len, bool debug)
         ESP_LOGE(TAG, "UART write failed for %u-byte packet",
                  (unsigned int)len);
         atomic_fetch_add(&tx_failures, 1);
+        pthread_mutex_unlock(&tx_lock);
         return false;
     }
     if ((size_t)written != len) {
         ESP_LOGE(TAG, "Incomplete UART write: %d of %u bytes accepted",
                  written, (unsigned int)len);
         atomic_fetch_add(&tx_partial_writes, 1);
+        pthread_mutex_unlock(&tx_lock);
         return false;
     }
 
     atomic_fetch_add(&tx_packets, 1);
     atomic_fetch_add(&tx_bytes, (uint32_t)len);
+    pthread_mutex_unlock(&tx_lock);
     return true;
+}
+
+esp_err_t SERIAL_pause_tx(uint32_t drain_timeout_ms)
+{
+    pthread_mutex_lock(&tx_lock);
+    tx_paused = true;
+    atomic_fetch_add_explicit(&tx_epoch, 1, memory_order_acq_rel);
+
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (uart_is_driver_installed(UART_NUM_1)) {
+        err = uart_wait_tx_done(UART_NUM_1,
+                                pdMS_TO_TICKS(drain_timeout_ms));
+    }
+    pthread_mutex_unlock(&tx_lock);
+    return err;
+}
+
+void SERIAL_resume_tx(void)
+{
+    pthread_mutex_lock(&tx_lock);
+    // Bump again so a caller that started while TX was paused cannot become
+    // valid merely because it remained unscheduled until after this resume.
+    atomic_fetch_add_explicit(&tx_epoch, 1, memory_order_acq_rel);
+    tx_paused = false;
+    pthread_mutex_unlock(&tx_lock);
 }
 
 /// @brief waits for a serial response from the device

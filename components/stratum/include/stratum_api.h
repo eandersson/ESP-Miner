@@ -16,6 +16,11 @@
 #define MAX_POOL_MESSAGE_LEN 256
 #define STRATUM_VERSION_ROLLING_MIN_BIT_COUNT 2
 
+// STRATUM_V1_submit_share() could not encode the request in its bounded
+// buffer. Kept distinct from the stratum_socket write results so callers do
+// not tear down a healthy connection for a local formatting failure.
+#define STRATUM_V1_SUBMIT_FORMAT_ERROR (-3)
+
 typedef enum
 {
     STRATUM_V1_BIP310_PROBE = 0,

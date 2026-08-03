@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "esp_transport.h"
 #include <stdbool.h>
+#include <errno.h>
 #include <string.h>
 #include <pthread.h>
 #include "utils.h"
@@ -138,8 +139,9 @@ void stratum_v1_close_connection(GlobalState *GLOBAL_STATE)
 {
     ESP_LOGE(TAG, "Shutting down socket and restarting...");
 
-    // Mark closing and close first so a stalled share writer wakes before job
-    // invalidation waits for the submit-generation barrier.
+    // Mark closing and close first so a stalled share writer wakes promptly.
+    // Job invalidation advances the generation and drains queued shares
+    // independently; it deliberately does not wait for the submit lock.
     pthread_mutex_lock(&v1_lifecycle_lock);
     v1_connection_closing = true;
     esp_transport_handle_t transport = GLOBAL_STATE->transport;
@@ -304,16 +306,17 @@ int stratum_v1_submit_share_safe(
     uint32_t version_bits, double share_difficulty, double job_difficulty,
     uint64_t *sent_time_us)
 {
-    // SYSTEM_clean_jobs_queue takes this same lock before publishing a new
-    // generation. Keep the final check and wire write together so a clean job
-    // cannot turn an accepted queued result into a stale submission.
+    // Serializes submits so at most one wire write is in flight. The final
+    // generation check under this lock rejects any share whose job was
+    // invalidated before the write started; invalidation itself does not
+    // wait on this lock (see SYSTEM_clean_jobs_queue).
     pthread_mutex_lock(&GLOBAL_STATE->stratum_v1_submit_lock);
     pthread_mutex_lock(&v1_lifecycle_lock);
     if (expected_generation != ASIC_result_task_get_job_generation() ||
         GLOBAL_STATE->transport == NULL || v1_connection_closing) {
         pthread_mutex_unlock(&v1_lifecycle_lock);
         pthread_mutex_unlock(&GLOBAL_STATE->stratum_v1_submit_lock);
-        return -1;
+        return STRATUM_V1_SUBMIT_STALE;
     }
 
     pthread_mutex_lock(&v1_state_lock);
@@ -334,14 +337,25 @@ int stratum_v1_submit_share_safe(
     int result = STRATUM_V1_submit_share(
         transport, uid, user, job_id, extranonce_2, ntime,
         nonce, version_rolling_enabled, version_bits, sent_time_us);
+    int submit_errno = errno;
 
     pthread_mutex_lock(&v1_lifecycle_lock);
+    if ((result == STRATUM_SOCKET_WRITE_ERROR ||
+         result == STRATUM_SOCKET_WRITE_TRUNCATED) &&
+        GLOBAL_STATE->transport == transport && !v1_connection_closing) {
+        // Bind the failure to the exact handle used above. Interrupting later
+        // in the worker can race the owner through reconnect and close a newly
+        // installed transport instead of this failed one.
+        v1_connection_closing = true;
+        esp_transport_close(transport);
+    }
     v1_active_writers--;
     if (v1_active_writers == 0) {
         pthread_cond_broadcast(&v1_writers_drained);
     }
     pthread_mutex_unlock(&v1_lifecycle_lock);
     pthread_mutex_unlock(&GLOBAL_STATE->stratum_v1_submit_lock);
+    errno = submit_errno;
     return result;
 }
 
@@ -795,6 +809,20 @@ void stratum_v1_task(void *pvParameters)
                         stratum_v1_set_rolling_state(GLOBAL_STATE, false, 0);
                         stratum_v1_refresh_latest_work(
                             GLOBAL_STATE, latest_notification);
+                        break;
+                    }
+                    pthread_mutex_lock(&v1_state_lock);
+                    bool mask_unchanged =
+                        GLOBAL_STATE->stratum_v1_version_rolling_enabled &&
+                        GLOBAL_STATE->stratum_v1_version_mask == updated_mask;
+                    pthread_mutex_unlock(&v1_state_lock);
+                    if (mask_unchanged) {
+                        // Some pools re-broadcast the active mask
+                        // periodically. Nothing observable changes, so skip
+                        // the full job invalidation and template refresh a
+                        // real mask change requires.
+                        ESP_LOGD(TAG,
+                                 "Ignoring redundant identical version mask");
                         break;
                     }
                     stratum_v1_set_rolling_state(GLOBAL_STATE, true,

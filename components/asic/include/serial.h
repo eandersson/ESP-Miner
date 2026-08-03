@@ -39,6 +39,16 @@ typedef struct
  * It does not imply an application-level acknowledgement from the ASIC.
  */
 bool SERIAL_send(const uint8_t *data, size_t len, bool debug);
+/**
+ * Reject new ASIC UART writes and wait for already accepted TX data to drain.
+ *
+ * Calls that were already waiting to enter SERIAL_send() are invalidated so
+ * they cannot leak into a later resume/startup cycle.
+ */
+esp_err_t SERIAL_pause_tx(uint32_t drain_timeout_ms);
+
+/** Re-enable ASIC UART writes for a new initialization epoch. */
+void SERIAL_resume_tx(void);
 esp_err_t SERIAL_init(void);
 void SERIAL_debug_rx(void);
 int16_t SERIAL_rx(uint8_t *, uint16_t, uint16_t);

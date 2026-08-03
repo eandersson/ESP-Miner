@@ -17,8 +17,13 @@ typedef struct
     bool version_rolling_enabled;
 } stratum_v1_work;
 
+// Negative and distinct from the stratum_socket write results (-1/-2) and
+// STRATUM_V1_SUBMIT_FORMAT_ERROR (-3), so the submit worker can distinguish
+// policy outcomes from local formatting and transport failures. STALE covers
+// a share whose generation moved or whose connection is already closing.
 enum {
-    STRATUM_V1_SUBMIT_FILTERED = 0,
+    STRATUM_V1_SUBMIT_FILTERED = -4,
+    STRATUM_V1_SUBMIT_STALE = -5,
 };
 
 void stratum_v1_task(void *pvParameters);

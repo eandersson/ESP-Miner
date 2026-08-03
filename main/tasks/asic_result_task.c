@@ -133,8 +133,13 @@ static void drain_share_queue(void)
     }
 
     queued_v1_share_t share;
+    uint32_t drained = 0;
     while (xQueueReceive(stratum_v1_share_queue, &share, 0) == pdTRUE) {
         free_queued_v1_share(&share);
+        drained++;
+    }
+    if (drained > 0) {
+        atomic_fetch_add(&stale_share_count, drained);
     }
 }
 
@@ -793,14 +798,35 @@ void ASIC_v1_share_submit_task(void *pvParameters)
             atomic_fetch_add(&dropped_share_count, 1);
             ESP_LOGD(TAG,
                      "Filtered queued V1 share below updated pool difficulty");
+        } else if (ret == STRATUM_V1_SUBMIT_STALE) {
+            atomic_fetch_add(&stale_share_count, 1);
+        } else if (ret == STRATUM_V1_SUBMIT_FORMAT_ERROR) {
+            uint32_t dropped =
+                (uint32_t)atomic_fetch_add(&dropped_share_count, 1) + 1;
+            if ((dropped & (dropped - 1)) == 0) {
+                ESP_LOGE(TAG,
+                         "Unable to format V1 share request; keeping connection "
+                         "(%lu valid share(s) dropped)",
+                         (unsigned long)dropped);
+            }
         } else if (ret == STRATUM_SOCKET_WRITE_TRUNCATED) {
+            // Some bytes reached the stream, but the newline-terminated JSON
+            // request did not. Closing the stream prevents the pool from
+            // interpreting a later request as the missing suffix.
+            atomic_fetch_add(&dropped_share_count, 1);
             ESP_LOGE(TAG,
                      "Partial share written to socket; dropping connection");
-            stratum_v1_interrupt_connection(GLOBAL_STATE);
-        } else if (ret < 0) {
-            ESP_LOGW(TAG,
-                     "Unable to write share to socket (ret=%d, errno=%d: %s)",
+        } else if (ret == STRATUM_SOCKET_WRITE_ERROR) {
+            // No request bytes reached the stream. A timeout is the common
+            // half-dead-uplink signature (NAT expiry, AP drop), but any
+            // zero-byte transport failure makes the connection unusable.
+            atomic_fetch_add(&dropped_share_count, 1);
+            ESP_LOGE(TAG,
+                     "Share write failed (ret=%d, errno=%d: %s); dropping connection",
                      ret, errno, strerror(errno));
+        } else if (ret < 0) {
+            atomic_fetch_add(&dropped_share_count, 1);
+            ESP_LOGE(TAG, "Unexpected V1 share submit result: %d", ret);
         } else {
             atomic_fetch_add(&submitted_share_count, 1);
             if (sent_time_us >= share.result_timestamp_us) {

@@ -18,6 +18,7 @@
 #include "utils.h"
 #include "asic_init.h"
 #include "asic_reset.h"
+#include "serial.h"
 #include "hashrate_monitor_task.h"
 
 #define POLL_RATE_MS 100
@@ -35,6 +36,10 @@
 #define THROTTLE_STEP_MHZ 25.0f
 #define THROTTLE_INTERVAL_MS 5000U
 #define THROTTLE_RELEASE_INTERVAL_MS 30000U
+#define THROTTLE_RELEASE_FAST_INTERVAL_MS 10000U
+#define THROTTLE_RELEASE_FAST_TEMP_C 68.0f
+#define TPS546_RELEASE_FAST_TEMP_C 90.0f
+#define THROTTLE_WARM_RESET_SAMPLES 20U
 #define HARD_THERMAL_REDUCTION_MHZ 100.0f
 
 #define TEMP_FAILURE_TIMEOUT_MS 3000U
@@ -45,6 +50,7 @@
 #define VCORE_TOLERANCE_PERCENT 12
 #define VCORE_VERIFY_ATTEMPTS 3
 #define VCORE_VERIFY_DELAY_MS 75
+#define ASIC_TX_DRAIN_TIMEOUT_MS 100U
 
 #define LIVENESS_START_GRACE_MS 30000U
 #define LIVENESS_RESPONSE_TIMEOUT_MS 15000U
@@ -84,7 +90,11 @@ typedef struct {
     TickType_t stable_since;
     TickType_t invalid_temp_since;
     TickType_t throttle_last_step;
-    TickType_t throttle_cool_since;
+    TickType_t throttle_last_cool_sample;
+    uint32_t throttle_cool_accumulated_ms;
+    unsigned int throttle_warm_samples;
+    bool throttle_release_band_initialized;
+    bool throttle_release_fast_band;
     TickType_t next_cooling_sample;
     unsigned int cooling_cycles;
     unsigned int vcore_read_failures;
@@ -397,25 +407,35 @@ static void mining_stop(GlobalState *GLOBAL_STATE, power_control_t *control)
     ESP_LOGI(TAG, "Stopping mining");
     asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
 
-    // Legacy producers are already gated by the lifecycle compatibility flag,
-    // so no new jobs race the safe frequency wind-down.
+    // Reset and power-off follow immediately below, so walking the PLL ladder
+    // down first only delays the stop by ~100 ms per 6.25 MHz step (the
+    // emergency path already cuts at operating frequency). Publish the 50 MHz
+    // trackers directly so the next start ramps from the bottom, exactly as
+    // the ladder used to leave them.
     GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value = ASIC_MIN_FREQUENCY_MHZ;
+    GLOBAL_STATE->POWER_MANAGEMENT_MODULE.actual_frequency = ASIC_MIN_FREQUENCY_MHZ;
     GLOBAL_STATE->POWER_MANAGEMENT_MODULE.expected_hashrate = 0.0f;
-    esp_err_t transition_err = ASIC_set_frequency(GLOBAL_STATE);
-    if (transition_err == ESP_OK) {
-        transition_err = ASIC_set_nonce_space(GLOBAL_STATE);
-    }
-    if (transition_err != ESP_OK) {
-        ESP_LOGE(TAG, "ASIC safe wind-down transition failed: %s; cutting power",
-                 esp_err_to_name(transition_err));
-    }
     control->applied_frequency_mhz = ASIC_MIN_FREQUENCY_MHZ;
 
-    if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to disable VCORE cleanly");
+    // A producer can pass its first lifecycle check immediately before
+    // STOPPING is published. Serialize with the ASIC send critical section;
+    // senders recheck the lifecycle after acquiring this lock and abort if
+    // they were queued behind us.
+    pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
+    esp_err_t drain_err = SERIAL_pause_tx(ASIC_TX_DRAIN_TIMEOUT_MS);
+    if (drain_err != ESP_OK) {
+        ESP_LOGW(TAG, "ASIC UART did not drain before shutdown: %s",
+                 esp_err_to_name(drain_err));
     }
     if (asic_hold_reset_low() != ESP_OK) {
         ESP_LOGE(TAG, "Unable to hold ASIC reset low");
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
+
+    // With the ASIC held in reset it is safe to remove the core rail. Cutting
+    // VCORE first would brown out a device still clocked at its operating PLL.
+    if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to disable VCORE cleanly");
     }
     control->applied_voltage_mv = 0;
 
@@ -438,6 +458,12 @@ static void mining_emergency_stop(GlobalState *GLOBAL_STATE,
     ESP_LOGE(TAG, "Emergency ASIC stop");
     asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
     GLOBAL_STATE->POWER_MANAGEMENT_MODULE.expected_hashrate = 0.0f;
+
+    // Close the TX gate without waiting for bytes already on the wire. This
+    // prevents a producer that passed its RUNNING check on the other core from
+    // enqueueing a command after reset/power removal. Safety shutdown still
+    // skips both the PLL ladder and a graceful UART drain.
+    (void)SERIAL_pause_tx(0);
 
     // Safety faults must not spend seconds traversing the PLL ladder. Assert
     // reset and remove power immediately; graceful ramp-down is reserved for
@@ -489,7 +515,9 @@ static uint8_t mining_start(GlobalState *GLOBAL_STATE, power_control_t *control)
                                   power->thermal_frequency_cap);
     power->actual_frequency = ASIC_MIN_FREQUENCY_MHZ;
     power->expected_hashrate = expected_hashrate(GLOBAL_STATE);
-    uint8_t chip_count = asic_initialize(GLOBAL_STATE, ASIC_INIT_RECOVERY, 2000);
+    // Consumers are gated on the lifecycle state for this whole window, so
+    // the pre-RUNNING settle is pure downtime; cold boot already runs with 0.
+    uint8_t chip_count = asic_initialize(GLOBAL_STATE, ASIC_INIT_RECOVERY, 500);
 
     if (chip_count == 0) {
         ESP_LOGE(TAG, "Mining start failed - ASIC not detected");
@@ -597,7 +625,10 @@ static void update_soft_thermal_governor(GlobalState *GLOBAL_STATE,
                 (!vr_valid || power->vr_temp <= TPS546_RELEASE_TEMP_C);
 
     if (hot) {
-        control->throttle_cool_since = 0;
+        control->throttle_last_cool_sample = 0;
+        control->throttle_cool_accumulated_ms = 0;
+        control->throttle_warm_samples = 0;
+        control->throttle_release_band_initialized = false;
         if (control->throttle_last_step == 0 ||
             ticks_elapsed(now, control->throttle_last_step,
                           THROTTLE_INTERVAL_MS)) {
@@ -617,21 +648,75 @@ static void update_soft_thermal_governor(GlobalState *GLOBAL_STATE,
         return;
     }
 
-    if (!cool || !power->thermal_throttled) {
-        control->throttle_cool_since = 0;
+    if (!power->thermal_throttled) {
+        control->throttle_last_cool_sample = 0;
+        control->throttle_cool_accumulated_ms = 0;
+        control->throttle_warm_samples = 0;
+        control->throttle_release_band_initialized = false;
         return;
     }
 
-    if (control->throttle_cool_since == 0) {
-        control->throttle_cool_since = now;
-    } else if (ticks_elapsed(now, control->throttle_cool_since,
-                             THROTTLE_RELEASE_INTERVAL_MS)) {
+    if (!cool) {
+        // Only intervals between consecutive qualified-cool samples count.
+        // One noisy sample pauses rather than erases cooling credit, but warm
+        // samples are not forgiven by intervening cool samples: repeated
+        // alternating warm/cool input therefore still resets the window.
+        control->throttle_last_cool_sample = 0;
+        if (control->throttle_warm_samples < THROTTLE_WARM_RESET_SAMPLES) {
+            control->throttle_warm_samples++;
+        }
+        if (control->throttle_warm_samples >= THROTTLE_WARM_RESET_SAMPLES) {
+            control->throttle_cool_accumulated_ms = 0;
+            control->throttle_warm_samples = 0;
+            control->throttle_release_band_initialized = false;
+        }
+        return;
+    }
+
+    bool fast_release_band =
+        hottest_temp <= THROTTLE_RELEASE_FAST_TEMP_C &&
+        (!vr_valid || power->vr_temp <= TPS546_RELEASE_FAST_TEMP_C);
+    if (!control->throttle_release_band_initialized ||
+        control->throttle_release_fast_band != fast_release_band) {
+        // Slow-band credit cannot satisfy the shorter fast-band interval (or
+        // vice versa). A band transition starts a new qualified window.
+        control->throttle_release_band_initialized = true;
+        control->throttle_release_fast_band = fast_release_band;
+        control->throttle_last_cool_sample = now;
+        control->throttle_cool_accumulated_ms = 0;
+        control->throttle_warm_samples = 0;
+        return;
+    }
+
+    if (control->throttle_last_cool_sample != 0) {
+        uint32_t elapsed_ms = pdTICKS_TO_MS(
+            now - control->throttle_last_cool_sample);
+        // A long scheduling or invalid-sensor gap is not evidence of cooling.
+        if (elapsed_ms <= POLL_RATE_MS * 2U) {
+            if (UINT32_MAX - control->throttle_cool_accumulated_ms <
+                elapsed_ms) {
+                control->throttle_cool_accumulated_ms = UINT32_MAX;
+            } else {
+                control->throttle_cool_accumulated_ms += elapsed_ms;
+            }
+        }
+    }
+    control->throttle_last_cool_sample = now;
+
+    // Restore faster when there is clear headroom below the release band; the
+    // slow interval only governs the last few degrees before the hysteresis
+    // window. Attack stays faster than release in both bands.
+    uint32_t release_interval_ms = fast_release_band
+                                       ? THROTTLE_RELEASE_FAST_INTERVAL_MS
+                                       : THROTTLE_RELEASE_INTERVAL_MS;
+    if (control->throttle_cool_accumulated_ms >= release_interval_ms) {
         power->thermal_frequency_cap =
             fminf(power->requested_frequency,
                   power->thermal_frequency_cap + THROTTLE_STEP_MHZ);
         power->thermal_throttled =
             power->thermal_frequency_cap < power->requested_frequency;
-        control->throttle_cool_since = now;
+        control->throttle_cool_accumulated_ms = 0;
+        control->throttle_warm_samples = 0;
         ESP_LOGI(TAG, "Thermal headroom restored: temporary frequency cap %.2f MHz",
                  power->thermal_frequency_cap);
     }
@@ -834,6 +919,12 @@ void POWER_MANAGEMENT_task(void *pvParameters)
         }
 
         if (!chip_temps_valid) {
+            // Do not bridge a release interval across a period with no valid
+            // ASIC temperature sample.
+            control.throttle_last_cool_sample = 0;
+            control.throttle_cool_accumulated_ms = 0;
+            control.throttle_warm_samples = 0;
+            control.throttle_release_band_initialized = false;
             if (control.invalid_temp_since == 0) {
                 control.invalid_temp_since = now;
                 ESP_LOGW(TAG, "ASIC temperature sensor unavailable; fan forced to fail-safe speed");
@@ -907,10 +998,19 @@ void POWER_MANAGEMENT_task(void *pvParameters)
             }
         }
 
-        if (chip_temps_valid) {
+        bool governor_inputs_valid = chip_temps_valid &&
+            (!GLOBAL_STATE->DEVICE_CONFIG.TPS546 || vr_valid);
+        if (governor_inputs_valid) {
             update_soft_thermal_governor(GLOBAL_STATE, &control, hottest_temp,
                                          vr_valid && GLOBAL_STATE->DEVICE_CONFIG.TPS546,
                                          now);
+        } else {
+            // An invalid regulator temperature is also a blind interval on
+            // boards whose release policy depends on that sensor.
+            control.throttle_last_cool_sample = 0;
+            control.throttle_cool_accumulated_ms = 0;
+            control.throttle_warm_samples = 0;
+            control.throttle_release_band_initialized = false;
         }
 
         float target_frequency = fminf(power->requested_frequency,

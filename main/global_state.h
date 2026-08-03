@@ -187,8 +187,8 @@ typedef struct GlobalState
 
     uint8_t * valid_jobs;
     pthread_mutex_t valid_jobs_lock;
-    // Serializes a V1 share write with job-generation invalidation without
-    // holding valid_jobs_lock across a potentially slow network operation.
+    // Serializes V1 share writers. Job-generation invalidation deliberately
+    // does not take this lock, so one already in-flight stale write may finish.
     pthread_mutex_t stratum_v1_submit_lock;
 
     double pool_difficulty;

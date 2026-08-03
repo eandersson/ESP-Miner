@@ -478,6 +478,12 @@ bool BM1370_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
     // UART accepted the complete packet. Holding the lock across this short
     // enqueue makes send/publication atomic with clean-job invalidation.
     pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
+    if (__atomic_load_n(&GLOBAL_STATE->asic_lifecycle, __ATOMIC_ACQUIRE) !=
+        ASIC_LIFECYCLE_RUNNING) {
+        pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
+        ESP_LOGD(TAG, "Discarding job while ASIC is stopping");
+        return false;
+    }
     if (ASIC_result_task_get_job_generation() != expected_generation) {
         pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
         ESP_LOGW(TAG, "Discarding job from stale generation %lu",

@@ -344,16 +344,17 @@ void SYSTEM_clean_jobs_queue(GlobalState * GLOBAL_STATE)
 {
     ESP_LOGI(TAG, "Clean Jobs: clearing queue");
 
-    // A V1 submit holds this lock from its final generation check through the
-    // socket write. Taking it here makes invalidation and submission ordered,
-    // so a clean notification cannot race a stale share onto the wire. This is
-    // deliberately separate from valid_jobs_lock so ASIC RX/dispatch continue
-    // while a pool socket is slow.
-    pthread_mutex_lock(&GLOBAL_STATE->stratum_v1_submit_lock);
-
+    // Invalidation deliberately does NOT take stratum_v1_submit_lock: a V1
+    // submit re-reads the job generation under that lock before its wire
+    // write, so any submit starting after the bump below is rejected anyway.
+    // Waiting here would park clean-jobs handling (and every pool message
+    // behind it) for up to a full 5 s socket-write timeout. The only cost of
+    // not waiting is one already-in-flight write of a share the pool will
+    // reject as stale.
+    //
     // Publish the new generation before touching the stratum queue. ASIC send
-    // paths use this same lock and reject an old generation before UART TX, so
-    // current_work cannot be resent once invalidation becomes visible.
+    // paths reject an old generation before UART TX, so current_work cannot
+    // be resent once invalidation becomes visible.
     pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
     ASIC_result_task_invalidate_pool_jobs();
     for (int i = 0; i < 128; i++) {
@@ -391,7 +392,6 @@ void SYSTEM_clean_jobs_queue(GlobalState * GLOBAL_STATE)
     // removal of pre-clean queued work atomic from the scheduler's viewpoint.
     queue_clear(&GLOBAL_STATE->stratum_queue);
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
-    pthread_mutex_unlock(&GLOBAL_STATE->stratum_v1_submit_lock);
 
     // Reset hashrate measurements to prevent a spike on reconnection
     hashrate_monitor_reset_measurements(GLOBAL_STATE);

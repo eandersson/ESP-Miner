@@ -63,6 +63,11 @@ uint8_t asic_initialize(GlobalState *GLOBAL_STATE, asic_init_mode_t mode, uint32
         return asic_fail_closed(GLOBAL_STATE, "ASIC reset failed");
     }
 
+    // Normal shutdown gates every UART producer. Start a fresh TX epoch only
+    // after reset is complete; stale callers queued before shutdown retain the
+    // old epoch and are rejected by SERIAL_send().
+    SERIAL_resume_tx();
+
     // Check actual UART state for safety
     bool uart_initialized = SERIAL_is_initialized();
     
