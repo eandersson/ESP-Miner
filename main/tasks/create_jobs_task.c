@@ -23,6 +23,7 @@
 #include "asic_result_task.h"
 #include "asic_init.h"
 #include "asic_reset.h"
+#include "serial.h"
 #include "vcore.h"
 #include "utils.h"
 
@@ -47,9 +48,12 @@ static void scheduler_fail_closed(GlobalState *GLOBAL_STATE,
     // scheduler cannot start, immediately revoke RUNNING and remove power so
     // the rest of the system cannot present an idle chip as mining-ready.
     asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    (void)SERIAL_pause_tx(0);
     if (asic_hold_reset_low() != ESP_OK) {
         ESP_LOGE(TAG, "Unable to hold ASIC reset after scheduler failure");
     }
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
     if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
         ESP_LOGE(TAG, "Unable to disable VCORE after scheduler failure");
     }
@@ -237,7 +241,7 @@ static bool apply_pending_control_updates(GlobalState *GLOBAL_STATE,
         if (now_us >= next_mask_retry_us) {
             ESP_LOGI(TAG, "Set chip version rolls %i",
                      (int)(GLOBAL_STATE->version_mask >> 13));
-            esp_err_t err = ASIC_set_version_mask(
+            esp_err_t err = ASIC_set_version_mask_if_running(
                 GLOBAL_STATE, GLOBAL_STATE->version_mask);
             if (err == ESP_OK) {
                 GLOBAL_STATE->new_stratum_version_rolling_msg = false;
@@ -728,7 +732,7 @@ void create_jobs_task(void *pvParameters)
         bool mask_ready = true;
         if (current_work_metadata.kind == WORK_QUEUE_ITEM_STRATUM_V1 &&
             applied_v1_version_mask != dispatch_version_mask) {
-            mask_ready = ASIC_set_version_mask(
+            mask_ready = ASIC_set_version_mask_if_running(
                              GLOBAL_STATE, dispatch_version_mask) == ESP_OK;
             if (mask_ready) {
                 applied_v1_version_mask = dispatch_version_mask;

@@ -10,6 +10,7 @@
 #include "connect.h"
 #include "work_queue.h"
 #include "asic_result_task.h"
+#include "asic_init.h"
 #include <esp_sntp.h>
 #include "esp_timer.h"
 #include "esp_transport.h"
@@ -528,7 +529,7 @@ void stratum_v1_task(void *pvParameters)
             return;
         }
 
-        if (!GLOBAL_STATE->ASIC_initalized) {
+        if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             continue;
         }
@@ -709,7 +710,7 @@ void stratum_v1_task(void *pvParameters)
                 break;
             }
 
-            if (!GLOBAL_STATE->ASIC_initalized) {
+            if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
                 free(line);
                 ESP_LOGI(TAG, "Mining paused, disconnecting from pool");
                 retry_attempts = 0;

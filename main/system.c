@@ -216,6 +216,7 @@ void SYSTEM_init_system(GlobalState * GLOBAL_STATE)
     GLOBAL_STATE->sv2_conn = NULL;
 
     // Initialize mutexes
+    pthread_mutex_init(&GLOBAL_STATE->asic_command_lock, NULL);
     pthread_mutex_init(&GLOBAL_STATE->valid_jobs_lock, NULL);
     pthread_mutex_init(&GLOBAL_STATE->stratum_v1_submit_lock, NULL);
     GLOBAL_STATE->stratum_mux = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;

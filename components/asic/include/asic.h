@@ -15,6 +15,8 @@ esp_err_t ASIC_set_max_baud(GlobalState *GLOBAL_STATE, int *baud);
 bool ASIC_send_work(GlobalState * GLOBAL_STATE, bm_job * next_job,
                     uint32_t expected_generation);
 esp_err_t ASIC_set_version_mask(GlobalState *GLOBAL_STATE, uint32_t mask);
+esp_err_t ASIC_set_version_mask_if_running(GlobalState *GLOBAL_STATE,
+                                           uint32_t mask);
 esp_err_t ASIC_restore_version_mask(GlobalState *GLOBAL_STATE);
 esp_err_t ASIC_set_frequency(GlobalState *GLOBAL_STATE);
 esp_err_t ASIC_set_nonce_space(GlobalState *GLOBAL_STATE);

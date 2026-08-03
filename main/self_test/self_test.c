@@ -13,7 +13,9 @@
 #include "power.h"
 #include "nvs_config.h"
 #include "global_state.h"
+#include "asic_init.h"
 #include "asic_reset.h"
+#include "serial.h"
 #include "device_config.h"
 #include "hashrate_monitor_task.h"
 #include "asic_result_task.h"
@@ -786,8 +788,18 @@ static void tests_done(GlobalState * GLOBAL_STATE, bool isTestPassed)
 {
     GLOBAL_STATE->SELF_TEST_MODULE.is_finished = true;
     self_test_stop_nonce_measurement(GLOBAL_STATE);
-    VCORE_set_voltage(GLOBAL_STATE, 0.0f);
-    asic_hold_reset_low();
+    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    (void)SERIAL_pause_tx(0);
+    if (asic_hold_reset_low() != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to hold ASIC reset low after self-test");
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+    if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to disable VCORE after self-test");
+    }
+    GLOBAL_STATE->POWER_MANAGEMENT_MODULE.expected_hashrate = 0.0f;
+    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPED);
 
     if (isTestPassed) {
         if (isFactoryTest) {

@@ -31,4 +31,13 @@ typedef esp_err_t (*set_hash_frequency_fn)(float frequency,
 esp_err_t do_frequency_transition(GlobalState *GLOBAL_STATE,
                                   set_hash_frequency_fn set_frequency_fn);
 
+/**
+ * @brief Transition frequency while requiring the ASIC to remain RUNNING
+ *
+ * Each PLL write is serialized with stop/reset, while delays between steps
+ * remain interruptible by an emergency shutdown.
+ */
+esp_err_t do_runtime_frequency_transition(
+    GlobalState *GLOBAL_STATE, set_hash_frequency_fn set_frequency_fn);
+
 #endif // FREQUENCY_TRANSITION_H

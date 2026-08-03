@@ -21,6 +21,7 @@ typedef enum {
 uint8_t asic_initialize(GlobalState *GLOBAL_STATE, asic_init_mode_t mode, uint32_t stabilization_delay_ms);
 
 void asic_lifecycle_set(GlobalState *GLOBAL_STATE, asic_lifecycle_state_t state);
+bool asic_lifecycle_try_set_running(GlobalState *GLOBAL_STATE);
 asic_lifecycle_state_t asic_lifecycle_get(const GlobalState *GLOBAL_STATE);
 bool asic_lifecycle_is_running(const GlobalState *GLOBAL_STATE);
 

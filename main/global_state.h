@@ -186,6 +186,9 @@ typedef struct GlobalState
     int extranonce_2_len;
 
     uint8_t * valid_jobs;
+    // Serializes runtime ASIC commands with stop/reset transitions. Lock
+    // ordering is asic_command_lock -> valid_jobs_lock -> UART TX lock.
+    pthread_mutex_t asic_command_lock;
     pthread_mutex_t valid_jobs_lock;
     // Serializes V1 share writers. Job-generation invalidation deliberately
     // does not take this lock, so one already in-flight stale write may finish.

@@ -13,33 +13,69 @@
 
 static const char *TAG = "asic_init";
 
+static bool asic_start_cancelled(const GlobalState *GLOBAL_STATE,
+                                 asic_init_mode_t mode)
+{
+    if (GLOBAL_STATE->SYSTEM_MODULE.hardware_fault ||
+        GLOBAL_STATE->SELF_TEST_MODULE.is_finished) {
+        return true;
+    }
+    return mode == ASIC_INIT_RECOVERY &&
+           (GLOBAL_STATE->SYSTEM_MODULE.mining_paused ||
+            GLOBAL_STATE->SYSTEM_MODULE.pools_unavailable);
+}
+
 static uint8_t asic_fail_closed(GlobalState *GLOBAL_STATE,
                                 const char *status)
 {
     GLOBAL_STATE->SYSTEM_MODULE.asic_status = status;
     asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
-    if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to disable VCORE after ASIC initialization failure");
-    }
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    (void)SERIAL_pause_tx(0);
     if (asic_hold_reset_low() != ESP_OK) {
         ESP_LOGE(TAG, "Unable to hold ASIC reset low after initialization failure");
     }
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+    if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to disable VCORE after ASIC initialization failure");
+    }
+    GLOBAL_STATE->POWER_MANAGEMENT_MODULE.expected_hashrate = 0.0f;
     asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPED);
     return 0;
 }
 
 void asic_lifecycle_set(GlobalState *GLOBAL_STATE, asic_lifecycle_state_t state)
 {
-    // Keep the misspelled legacy flag synchronized until all consumers have
-    // migrated.  Publish it after RUNNING and clear it before any other state
-    // so legacy job producers fail closed during transitions.
-    if (state != ASIC_LIFECYCLE_RUNNING) {
-        __atomic_store_n(&GLOBAL_STATE->ASIC_initalized, false, __ATOMIC_RELEASE);
-    }
-    __atomic_store_n(&GLOBAL_STATE->asic_lifecycle, state, __ATOMIC_RELEASE);
     if (state == ASIC_LIFECYCLE_RUNNING) {
-        __atomic_store_n(&GLOBAL_STATE->ASIC_initalized, true, __ATOMIC_RELEASE);
+        (void)asic_lifecycle_try_set_running(GLOBAL_STATE);
+        return;
     }
+
+    // The lifecycle is authoritative. Publish the closed state first so
+    // command producers fail immediately, then synchronize the misspelled
+    // compatibility flag retained for external users.
+    __atomic_store_n(&GLOBAL_STATE->asic_lifecycle, state, __ATOMIC_RELEASE);
+    __atomic_store_n(&GLOBAL_STATE->ASIC_initalized, false, __ATOMIC_RELEASE);
+}
+
+bool asic_lifecycle_try_set_running(GlobalState *GLOBAL_STATE)
+{
+    asic_lifecycle_state_t expected = ASIC_LIFECYCLE_STARTING;
+    if (!__atomic_compare_exchange_n(
+            &GLOBAL_STATE->asic_lifecycle, &expected,
+            ASIC_LIFECYCLE_RUNNING, false, __ATOMIC_ACQ_REL,
+            __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+
+    __atomic_store_n(&GLOBAL_STATE->ASIC_initalized, true, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&GLOBAL_STATE->asic_lifecycle, __ATOMIC_ACQUIRE) !=
+        ASIC_LIFECYCLE_RUNNING) {
+        __atomic_store_n(&GLOBAL_STATE->ASIC_initalized, false,
+                         __ATOMIC_RELEASE);
+        return false;
+    }
+    return true;
 }
 
 asic_lifecycle_state_t asic_lifecycle_get(const GlobalState *GLOBAL_STATE)
@@ -56,17 +92,45 @@ uint8_t asic_initialize(GlobalState *GLOBAL_STATE, asic_init_mode_t mode, uint32
 {
     const char *mode_str = (mode == ASIC_INIT_COLD_BOOT) ? "cold boot" : "recovery";
     ESP_LOGI(TAG, "Starting ASIC initialization (%s mode)", mode_str);
-    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STARTING);
 
-    if (asic_reset() != ESP_OK) {
-        ESP_LOGE(TAG, "ASIC reset failed!");
-        return asic_fail_closed(GLOBAL_STATE, "ASIC reset failed");
+    // Recovery callers reserve STARTING before raising VCORE. Cold boot owns
+    // the initial STOPPED -> STARTING transition here. Serialize reset and TX
+    // reopening with every shutdown path, and recheck after the 200 ms reset
+    // pulse in case another task requested a stop while we held the gate.
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    asic_lifecycle_state_t lifecycle = asic_lifecycle_get(GLOBAL_STATE);
+    bool entry_valid = !asic_start_cancelled(GLOBAL_STATE, mode) &&
+        ((mode == ASIC_INIT_COLD_BOOT &&
+          lifecycle == ASIC_LIFECYCLE_STOPPED) ||
+         (mode == ASIC_INIT_RECOVERY &&
+          lifecycle == ASIC_LIFECYCLE_STARTING));
+    if (entry_valid && mode == ASIC_INIT_COLD_BOOT) {
+        asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STARTING);
     }
 
-    // Normal shutdown gates every UART producer. Start a fresh TX epoch only
-    // after reset is complete; stale callers queued before shutdown retain the
-    // old epoch and are rejected by SERIAL_send().
-    SERIAL_resume_tx();
+    esp_err_t reset_err = entry_valid ? asic_reset() : ESP_ERR_INVALID_STATE;
+    bool reset_still_valid = reset_err == ESP_OK &&
+        asic_lifecycle_get(GLOBAL_STATE) == ASIC_LIFECYCLE_STARTING &&
+        !asic_start_cancelled(GLOBAL_STATE, mode);
+    if (reset_still_valid) {
+        // Start a fresh TX epoch only after reset is complete. Stale callers
+        // queued before shutdown retain the old epoch and are rejected.
+        SERIAL_resume_tx();
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+
+    if (!reset_still_valid) {
+        bool reset_failed = entry_valid && reset_err != ESP_OK;
+        if (reset_failed) {
+            ESP_LOGE(TAG, "ASIC reset failed!");
+        } else {
+            ESP_LOGW(TAG, "ASIC initialization cancelled during reset");
+        }
+        return asic_fail_closed(
+            GLOBAL_STATE,
+            reset_failed ? "ASIC reset failed"
+                         : "ASIC initialization cancelled");
+    }
 
     // Check actual UART state for safety
     bool uart_initialized = SERIAL_is_initialized();
@@ -176,10 +240,23 @@ uint8_t asic_initialize(GlobalState *GLOBAL_STATE, asic_init_mode_t mode, uint32
         vTaskDelay(stabilization_delay_ms / portTICK_PERIOD_MS);
     }
 
-    // Reset liveness ages before publishing RUNNING. Consumers are held off by
-    // the lifecycle state for the entire stabilization interval.
-    hashrate_monitor_reset_measurements(GLOBAL_STATE);
-    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_RUNNING);
+    // Reset liveness ages before publishing RUNNING. The compare/exchange
+    // prevents a concurrent STOPPING/STOPPED transition from being overwritten
+    // after the stabilization interval.
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    bool ready_to_run = !asic_start_cancelled(GLOBAL_STATE, mode) &&
+                        asic_lifecycle_get(GLOBAL_STATE) ==
+                            ASIC_LIFECYCLE_STARTING;
+    if (ready_to_run) {
+        hashrate_monitor_reset_measurements(GLOBAL_STATE);
+        ready_to_run = asic_lifecycle_try_set_running(GLOBAL_STATE);
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+    if (!ready_to_run) {
+        ESP_LOGW(TAG, "ASIC initialization cancelled before RUNNING");
+        return asic_fail_closed(GLOBAL_STATE,
+                                "ASIC initialization cancelled");
+    }
 
     ESP_LOGI(TAG, "ASIC initialized successfully with %d chip(s) (%s mode)", chip_count, mode_str);
     return chip_count;

@@ -48,9 +48,12 @@ static void fail_asic_closed(const char *status)
              sizeof(GLOBAL_STATE.SYSTEM_MODULE.hardware_fault_msg), "%s",
              status);
     asic_lifecycle_set(&GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
+    pthread_mutex_lock(&GLOBAL_STATE.asic_command_lock);
+    (void)SERIAL_pause_tx(0);
     if (asic_hold_reset_low() != ESP_OK) {
         ESP_LOGE(TAG, "Unable to assert ASIC reset while failing closed");
     }
+    pthread_mutex_unlock(&GLOBAL_STATE.asic_command_lock);
     if (VCORE_set_voltage(&GLOBAL_STATE, 0.0f) != ESP_OK) {
         ESP_LOGE(TAG, "Unable to disable VCORE while failing closed");
     }
