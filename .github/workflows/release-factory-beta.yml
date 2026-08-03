@@ -28,7 +28,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '24.14.0'
+          node-version: 'v24.19.0'
       - name: Build web dist
         working-directory: ./main/http_server/axe-os
         run: |
