@@ -16,20 +16,11 @@
 #include "scoreboard.h"
 #include "esp_transport.h"
 #include "system.h"
+#include "power/asic_init.h"
 
 typedef struct bm_job bm_job;
 typedef struct sv2_conn sv2_conn;
 typedef struct sv2_noise_ctx sv2_noise_ctx;
-
-// ASIC lifecycle is deliberately more expressive than ASIC_initalized.  The
-// compatibility boolean is kept for older consumers, but is true only while
-// this state is RUNNING so no work is submitted during a reset or ramp-down.
-typedef enum {
-    ASIC_LIFECYCLE_STOPPED = 0,
-    ASIC_LIFECYCLE_STARTING,
-    ASIC_LIFECYCLE_RUNNING,
-    ASIC_LIFECYCLE_STOPPING,
-} asic_lifecycle_state_t;
 
 #define STRATUM_USER CONFIG_STRATUM_USER
 #define FALLBACK_STRATUM_USER CONFIG_FALLBACK_STRATUM_USER

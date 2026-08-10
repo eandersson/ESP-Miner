@@ -1,6 +1,8 @@
 #ifndef MINING_H_
 #define MINING_H_
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct mining_notify mining_notify;

@@ -16,6 +16,7 @@
 #include "sv2_protocol.h"
 #include "hashrate_monitor_task.h"
 #include "asic.h"
+#include "serial.h"
 #include "freertos/task.h"
 #include "scoreboard.h"
 #include "self_test.h"

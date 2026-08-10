@@ -1,9 +1,20 @@
 #ifndef ASIC_INIT_H_
 #define ASIC_INIT_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef struct GlobalState GlobalState;
+
+// ASIC lifecycle is deliberately more expressive than ASIC_initalized. The
+// compatibility boolean is kept for older consumers, but is true only while
+// this state is RUNNING so no work is submitted during a reset or ramp-down.
+typedef enum {
+    ASIC_LIFECYCLE_STOPPED = 0,
+    ASIC_LIFECYCLE_STARTING,
+    ASIC_LIFECYCLE_RUNNING,
+    ASIC_LIFECYCLE_STOPPING,
+} asic_lifecycle_state_t;
 
 typedef enum {
     ASIC_INIT_COLD_BOOT,    // Fresh system startup - calls SERIAL_init()

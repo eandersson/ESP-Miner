@@ -21,6 +21,7 @@
 #include "nvs_config.h"
 #include "self_test.h"
 #include "asic.h"
+#include "serial.h"
 #include "bap/bap.h"
 #include "device_config.h"
 #include "connect.h"

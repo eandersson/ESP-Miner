@@ -5,6 +5,7 @@
 #include <lwip/tcpip.h>
 #include "stratum_v1_task.h"
 #include "stratum_api.h"
+#include "mining.h"
 #include "stratum_socket.h"
 #include "protocol_coordinator.h"
 #include "connect.h"
