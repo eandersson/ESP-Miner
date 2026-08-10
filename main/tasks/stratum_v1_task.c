@@ -44,6 +44,7 @@
 #define TRANSPORT_TIMEOUT_MS 5000
 #define CONFIGURE_RESPONSE_TIMEOUT_US 10000000LL
 #define SETUP_RESPONSE_TIMEOUT_US 10000000LL
+#define SHUTDOWN_POLL_INTERVAL_MS 100U
 
 #define BUFFER_SIZE 1024
 
@@ -54,6 +55,22 @@ static pthread_mutex_t v1_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int v1_active_writers = 0;
 static bool v1_connection_closing = true;
 
+static bool stratum_v1_delay_or_shutdown(uint32_t delay_ms)
+{
+    while (delay_ms > 0) {
+        if (protocol_coordinator_v1_should_shutdown()) {
+            return true;
+        }
+
+        uint32_t chunk_ms = delay_ms > SHUTDOWN_POLL_INTERVAL_MS
+                                ? SHUTDOWN_POLL_INTERVAL_MS
+                                : delay_ms;
+        vTaskDelay(pdMS_TO_TICKS(chunk_ms));
+        delay_ms -= chunk_ms;
+    }
+    return protocol_coordinator_v1_should_shutdown();
+}
+
 typedef struct
 {
     int subscribe_message_id;
@@ -61,8 +78,18 @@ typedef struct
     int64_t deadline_us;
     bool extranonce_ready;
     bool authorized;
+    bool unidentified_success_received;
+    bool post_auth_actions_sent;
     bool success_notified;
 } stratum_v1_setup_state_t;
+
+static bool stratum_v1_setup_id_matches(
+    const StratumApiV1Message *message, int pending_message_id)
+{
+    return message != NULL && message->has_message_id &&
+           pending_message_id >= 0 &&
+           message->message_id == pending_message_id;
+}
 
 static bool stratum_v1_setup_timed_out(
     const stratum_v1_setup_state_t *setup, int64_t now_us)
@@ -83,7 +110,7 @@ static void stratum_v1_maybe_complete_setup(
     if (retry_attempts != NULL) {
         *retry_attempts = 0;
     }
-    ESP_LOGI(TAG, "Stratum V1 subscription and authorization succeeded");
+    ESP_LOGI(TAG, "Stratum V1 subscription and pool setup succeeded");
     protocol_coordinator_notify_success();
 }
 
@@ -163,6 +190,35 @@ static int stratum_get_next_uid(GlobalState * GLOBAL_STATE)
     return uid;
 }
 
+static void stratum_v1_mark_authorized(
+    GlobalState *GLOBAL_STATE, stratum_v1_setup_state_t *setup,
+    const PoolConfig *session_pool, const char *evidence)
+{
+    if (GLOBAL_STATE == NULL || setup == NULL || session_pool == NULL) {
+        return;
+    }
+
+    if (!setup->authorized && evidence != NULL) {
+        ESP_LOGI(TAG, "%s", evidence);
+    }
+    setup->authorized = true;
+
+    if (setup->post_auth_actions_sent) {
+        return;
+    }
+    setup->post_auth_actions_sent = true;
+
+    if (session_pool->difficulty > 0) {
+        STRATUM_V1_suggest_difficulty(
+            GLOBAL_STATE->transport, stratum_get_next_uid(GLOBAL_STATE),
+            session_pool->difficulty);
+    }
+    if (session_pool->extranonce_subscribe) {
+        STRATUM_V1_extranonce_subscribe(
+            GLOBAL_STATE->transport, stratum_get_next_uid(GLOBAL_STATE));
+    }
+}
+
 
 static void stratum_v1_reset_uid(GlobalState *GLOBAL_STATE)
 {
@@ -203,7 +259,9 @@ void stratum_v1_close_connection(GlobalState *GLOBAL_STATE)
         pthread_mutex_unlock(&v1_lifecycle_lock);
         esp_transport_destroy(transport);
     }
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // Normal reconnects retain the short pacing delay, but a coordinator stop
+    // must not spend one second of its bounded acknowledgement window here.
+    stratum_v1_delay_or_shutdown(1000);
 }
 
 void stratum_v1_interrupt_connection(GlobalState *GLOBAL_STATE)
@@ -563,7 +621,7 @@ void stratum_v1_task(void *pvParameters)
         }
 
         if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            stratum_v1_delay_or_shutdown(1000);
             continue;
         }
 
@@ -604,7 +662,7 @@ void stratum_v1_task(void *pvParameters)
             ESP_LOGE(TAG, "Unable to snapshot pool %u configuration",
                      (unsigned int)pool_idx);
             retry_attempts++;
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            stratum_v1_delay_or_shutdown(1000);
             continue;
         }
         const char *stratum_url = session_pool.url;
@@ -615,7 +673,13 @@ void stratum_v1_task(void *pvParameters)
             ESP_LOGE(TAG, "Address resolution failed for %s", stratum_url);
             retry_attempts++;
             SYSTEM_release_pool_config_snapshot(&session_pool);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            stratum_v1_delay_or_shutdown(1000);
+            continue;
+        }
+        if (protocol_coordinator_v1_should_shutdown()) {
+            // DNS is synchronous, so observe a stop that arrived while the
+            // resolver was blocked before starting another blocking operation.
+            SYSTEM_release_pool_config_snapshot(&session_pool);
             continue;
         }
 
@@ -636,10 +700,16 @@ void stratum_v1_task(void *pvParameters)
             }
             retry_attempts++;
             SYSTEM_release_pool_config_snapshot(&session_pool);
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
+            stratum_v1_delay_or_shutdown(5000);
             continue;
         }
         retry_critical_attempts = 0;
+
+        if (protocol_coordinator_v1_should_shutdown()) {
+            esp_transport_destroy(transport);
+            SYSTEM_release_pool_config_snapshot(&session_pool);
+            continue;
+        }
 
         // Use the already-resolved IP to avoid a second DNS lookup inside esp_transport_connect.
         // This prevents long DNS timeouts from blocking the lwIP stack and starving the HTTP server.
@@ -649,6 +719,15 @@ void stratum_v1_task(void *pvParameters)
         ESP_LOGI(TAG, "Transport initialized, connecting to %s:%d (%s)", stratum_url, port, conn_info.host_ip);
         esp_err_t ret = esp_transport_connect(
             transport, conn_info.host_ip, port, TRANSPORT_TIMEOUT_MS);
+        if (protocol_coordinator_v1_should_shutdown()) {
+            // The transport is not published until connect succeeds, so the
+            // coordinator cannot interrupt this call through the live handle.
+            // Tear it down locally as soon as the bounded connect returns.
+            esp_transport_close(transport);
+            esp_transport_destroy(transport);
+            SYSTEM_release_pool_config_snapshot(&session_pool);
+            continue;
+        }
         if (ret != ESP_OK) {
             retry_attempts++;
             ESP_LOGE(TAG, "Transport unable to connect to %s:%d (errno %d). Attempt: %d", stratum_url, port, ret, retry_attempts);
@@ -657,7 +736,7 @@ void stratum_v1_task(void *pvParameters)
             esp_transport_destroy(transport);
             SYSTEM_release_pool_config_snapshot(&session_pool);
             // instead of restarting, retry this every 5 seconds
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
+            stratum_v1_delay_or_shutdown(5000);
             continue;
         }
 
@@ -666,6 +745,14 @@ void stratum_v1_task(void *pvParameters)
         GLOBAL_STATE->transport = transport;
         v1_connection_closing = false;
         pthread_mutex_unlock(&v1_lifecycle_lock);
+
+        if (protocol_coordinator_v1_should_shutdown()) {
+            // Close through the owning path now that the handle is published;
+            // this also observes any share writer that raced with publication.
+            stratum_v1_close_connection(GLOBAL_STATE);
+            SYSTEM_release_pool_config_snapshot(&session_pool);
+            continue;
+        }
 
         const char *protocol = (conn_info.addr_family == AF_INET6) ? "IPv6" : "IPv4";
         const char *tls_status;
@@ -827,6 +914,8 @@ void stratum_v1_task(void *pvParameters)
             bool reconnect_requested = false;
             if (!STRATUM_V1_parse(&stratum_api_v1_message, line)) {
                 if (configure_pending &&
+                    stratum_api_v1_message.is_response &&
+                    stratum_api_v1_message.has_message_id &&
                     stratum_api_v1_message.message_id ==
                         configure_message_id) {
                     ESP_LOGW(TAG,
@@ -839,14 +928,21 @@ void stratum_v1_task(void *pvParameters)
                              "mining.configure response timed out; continuing this connection in legacy V1 mode");
                     configure_pending = false;
                 }
-                if (stratum_api_v1_message.message_id ==
-                        setup.subscribe_message_id ||
-                    stratum_api_v1_message.message_id ==
-                        setup.authorize_message_id) {
+                bool invalid_subscribe_response =
+                    stratum_api_v1_message.is_response &&
+                    stratum_v1_setup_id_matches(
+                        &stratum_api_v1_message,
+                        setup.subscribe_message_id);
+                bool invalid_authorize_response =
+                    stratum_api_v1_message.is_response &&
+                    stratum_v1_setup_id_matches(
+                        &stratum_api_v1_message,
+                        setup.authorize_message_id);
+                if (invalid_subscribe_response ||
+                    invalid_authorize_response) {
                     ESP_LOGE(
                         TAG, "Invalid %s response; reconnecting",
-                        stratum_api_v1_message.message_id ==
-                                setup.subscribe_message_id
+                        invalid_subscribe_response
                             ? "mining.subscribe"
                             : "mining.authorize");
                     if (configure_pending) {
@@ -873,6 +969,13 @@ void stratum_v1_task(void *pvParameters)
                 case MINING_NOTIFY:
                     GLOBAL_STATE->SYSTEM_MODULE.work_received++;
                     SYSTEM_notify_new_ntime(GLOBAL_STATE, stratum_api_v1_message.mining_notification->ntime);
+                    // Some V1 pools never return mining.authorize. A valid job
+                    // proves that the pool accepted this session. Setup
+                    // completion still waits for a usable extranonce if the
+                    // notification arrived before subscribe completed.
+                    stratum_v1_mark_authorized(
+                        GLOBAL_STATE, &setup, &session_pool,
+                        "Pool is streaming work; treating authorization as implicit");
                     mining_notify *latest_copy = clone_mining_notify(
                         stratum_api_v1_message.mining_notification);
                     if (latest_copy != NULL) {
@@ -1011,13 +1114,29 @@ void stratum_v1_task(void *pvParameters)
                 case MINING_SET_EXTRANONCE:
                 case STRATUM_RESULT_SUBSCRIBE:
                     if (stratum_api_v1_message.method ==
-                            STRATUM_RESULT_SUBSCRIBE &&
-                        stratum_api_v1_message.message_id !=
-                            setup.subscribe_message_id) {
-                        ESP_LOGW(TAG,
-                                 "Ignoring unexpected mining.subscribe result id %d",
-                                 stratum_api_v1_message.message_id);
-                        break;
+                        STRATUM_RESULT_SUBSCRIBE) {
+                        if (setup.subscribe_message_id < 0 &&
+                            setup.extranonce_ready) {
+                            ESP_LOGW(
+                                TAG,
+                                "Ignoring duplicate mining.subscribe result");
+                            break;
+                        }
+                        if (setup.subscribe_message_id >= 0 &&
+                            stratum_api_v1_message.has_message_id &&
+                            !stratum_v1_setup_id_matches(
+                                &stratum_api_v1_message,
+                                setup.subscribe_message_id)) {
+                            ESP_LOGW(TAG,
+                                     "Ignoring unexpected mining.subscribe result id %d",
+                                     stratum_api_v1_message.message_id);
+                            break;
+                        }
+
+                        // The array shape is unique to mining.subscribe, so an
+                        // id-less/null/non-numeric-ID response is still safe to
+                        // associate with the pending subscription.
+                        setup.subscribe_message_id = -1;
                     }
                     if (stratum_api_v1_message.extranonce_str == NULL ||
                         stratum_api_v1_message.extranonce_2_len < 0 ||
@@ -1044,6 +1163,17 @@ void stratum_v1_task(void *pvParameters)
                         stratum_api_v1_message.extranonce_2_len);
                     stratum_api_v1_message.extranonce_str = NULL;
                     setup.extranonce_ready = true;
+                    // A valid subscribe array or mining.set_extranonce proves
+                    // that the subscription completed. Retire the request ID
+                    // so a later unrelated message reusing this small value
+                    // cannot be mistaken for setup traffic.
+                    setup.subscribe_message_id = -1;
+                    if (setup.unidentified_success_received &&
+                        !setup.authorized) {
+                        stratum_v1_mark_authorized(
+                            GLOBAL_STATE, &setup, &session_pool,
+                            "Treating an id-less successful response as implicit authorization");
+                    }
                     stratum_v1_refresh_latest_work(GLOBAL_STATE,
                                                    latest_notification,
                                                    &session_pool);
@@ -1069,6 +1199,7 @@ void stratum_v1_task(void *pvParameters)
                 case STRATUM_RESULT:
                     {
                         if (configure_pending &&
+                            stratum_api_v1_message.has_message_id &&
                             stratum_api_v1_message.message_id ==
                                 configure_message_id) {
                             configure_pending = false;
@@ -1080,16 +1211,17 @@ void stratum_v1_task(void *pvParameters)
                                           : "unsupported");
                             break;
                         }
-                        if (stratum_api_v1_message.message_id ==
-                            setup.subscribe_message_id) {
-                            if (!stratum_api_v1_message.response_success ||
-                                !setup.extranonce_ready) {
+                        if (stratum_v1_setup_id_matches(
+                                &stratum_api_v1_message,
+                                setup.subscribe_message_id)) {
+                            setup.subscribe_message_id = -1;
+                            if (!stratum_api_v1_message.response_success) {
                                 ESP_LOGE(
                                     TAG,
-                                    "mining.subscribe was rejected or returned no extranonce: %s",
+                                    "mining.subscribe was rejected: %s",
                                     stratum_api_v1_message.error_str != NULL
                                         ? stratum_api_v1_message.error_str
-                                        : "invalid result");
+                                        : "unknown");
                                 if (configure_pending) {
                                     STRATUM_V1_bip310_transient_failure(
                                         &bip310_state);
@@ -1098,14 +1230,33 @@ void stratum_v1_task(void *pvParameters)
                                 stratum_v1_close_connection(GLOBAL_STATE);
                                 reconnect_requested = true;
                             } else {
-                                ESP_LOGI(
-                                    TAG,
-                                    "mining.subscribe accepted after mining.set_extranonce established the extranonce");
+                                // A few pools acknowledge subscribe with true
+                                // and deliver the actual fields separately via
+                                // mining.set_extranonce. Do not reject that
+                                // valid extension; the setup deadline still
+                                // requires a usable extranonce or work stream.
+                                if (setup.extranonce_ready) {
+                                    ESP_LOGI(TAG,
+                                             "mining.subscribe accepted");
+                                } else {
+                                    ESP_LOGI(
+                                        TAG,
+                                        "mining.subscribe accepted; awaiting extranonce");
+                                }
+                                if (setup.extranonce_ready &&
+                                    setup.unidentified_success_received &&
+                                    !setup.authorized) {
+                                    stratum_v1_mark_authorized(
+                                        GLOBAL_STATE, &setup, &session_pool,
+                                        "Treating an id-less successful response as implicit authorization");
+                                }
                             }
                             break;
                         }
-                        if (stratum_api_v1_message.message_id ==
-                            setup.authorize_message_id) {
+                        if (stratum_v1_setup_id_matches(
+                                &stratum_api_v1_message,
+                                setup.authorize_message_id)) {
+                            setup.authorize_message_id = -1;
                             if (!stratum_api_v1_message.response_success) {
                                 ESP_LOGE(
                                     TAG, "mining.authorize rejected: %s",
@@ -1122,23 +1273,25 @@ void stratum_v1_task(void *pvParameters)
                                 break;
                             }
 
-                            setup.authorized = true;
-                            ESP_LOGI(TAG, "mining.authorize accepted");
-                            uint16_t difficulty = session_pool.difficulty;
-                            if (difficulty > 0) {
-                                STRATUM_V1_suggest_difficulty(
-                                    GLOBAL_STATE->transport,
-                                    stratum_get_next_uid(GLOBAL_STATE),
-                                    difficulty);
-                            }
-                            bool extranonce_subscribe =
-                                session_pool.extranonce_subscribe;
-                            if (extranonce_subscribe) {
-                                STRATUM_V1_extranonce_subscribe(
-                                    GLOBAL_STATE->transport,
-                                    stratum_get_next_uid(GLOBAL_STATE));
-                            }
+                            stratum_v1_mark_authorized(
+                                GLOBAL_STATE, &setup, &session_pool,
+                                "mining.authorize accepted");
                             break;
+                        }
+                        if (!stratum_api_v1_message.has_message_id &&
+                            stratum_api_v1_message.response_success) {
+                            // With no usable ID we cannot assign the reply to a
+                            // request immediately. Retain only positive evidence;
+                            // an id-less rejection remains ambiguous and the
+                            // setup deadline arbitrates it. Once subscribe has
+                            // produced a usable extranonce, this is compatible
+                            // with pools that omit IDs from authorize replies.
+                            setup.unidentified_success_received = true;
+                            if (setup.extranonce_ready && !setup.authorized) {
+                                stratum_v1_mark_authorized(
+                                    GLOBAL_STATE, &setup, &session_pool,
+                                    "Treating an id-less successful response as implicit authorization");
+                            }
                         }
                         float response_time_ms = STRATUM_V1_get_response_time_ms(stratum_api_v1_message.message_id, receive_time_us);
                         if (response_time_ms >= 0) {

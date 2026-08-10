@@ -117,6 +117,27 @@ TEST_CASE("Test mining.subcribe result parsing", "[mining.subscribe]")
     TEST_ASSERT_EQUAL_INT(8, stratum_api_v1_message.extranonce_2_len);
 }
 
+TEST_CASE("Parse mining.subscribe with string or absent response id", "[mining.subscribe]")
+{
+    const char *result =
+        "{\"result\":[[[\"mining.notify\",\"695482c0\"]],\"4de05269\",8],\"id\":\"2\",\"error\":null}";
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(&message, result));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_SUBSCRIBE, message.method);
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(2, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+    STRATUM_V1_reset_message(&message);
+
+    result =
+        "{\"result\":[[[\"mining.notify\",\"695482c0\"]],\"4de05269\",8],\"id\":null,\"error\":null}";
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(&message, result));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_SUBSCRIBE, message.method);
+    TEST_ASSERT_FALSE(message.has_message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+    STRATUM_V1_reset_message(&message);
+}
+
 TEST_CASE("Parse stratum mining.subscribe result malformed", "[mining.subscribe]")
 {
     // Only 2 array items — extranonce2_len is missing
@@ -150,6 +171,36 @@ TEST_CASE("Parse stratum result success", "[stratum]")
     TEST_ASSERT_EQUAL(5, stratum_api_v1_message.message_id);
     TEST_ASSERT_EQUAL(STRATUM_RESULT, stratum_api_v1_message.method);
     TEST_ASSERT_TRUE(stratum_api_v1_message.response_success);
+}
+
+TEST_CASE("Parse response identity and shape metadata", "[stratum]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message, "{\"id\":\"3\",\"error\":null,\"result\":true}"));
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(3, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message, "{\"id\":null,\"error\":null,\"result\":true}"));
+    TEST_ASSERT_FALSE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(-1, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":2,\"method\":\"mining.unknown\",\"params\":[]}"));
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(2, message.message_id);
+    TEST_ASSERT_FALSE(message.is_response);
+
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":2,\"error\":null,\"result\":{\"unexpected\":true}}"));
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(2, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
 }
 
 TEST_CASE("Parse stratum result success with large id", "[stratum]")

@@ -54,12 +54,12 @@ static coordinator_state_t s_state = COORD_STATE_IDLE;
 static QueueHandle_t s_event_queue = NULL;
 static volatile bool s_v1_should_shutdown = false;
 static volatile bool s_v2_should_shutdown = false;
-static atomic_bool s_pool_config_changed = ATOMIC_VAR_INIT(false);
+static _Atomic uint32_t s_changed_pool_mask = ATOMIC_VAR_INIT(0);
 
 // Protocol tracking
-static stratum_protocol_t s_primary_protocol;
-static stratum_protocol_t s_fallback_protocol;
-static stratum_protocol_t s_running_protocol;
+static stratum_protocol_t s_primary_protocol = STRATUM_PROTOCOL_V1;
+static stratum_protocol_t s_fallback_protocol = STRATUM_PROTOCOL_V1;
+static stratum_protocol_t s_running_protocol = STRATUM_PROTOCOL_V1;
 static bool s_heartbeat_enabled = false;
 
 // Number of consecutive pools (primary and/or fallback) that have exhausted
@@ -75,11 +75,15 @@ void protocol_coordinator_init(GlobalState *gs)
 {
     s_global_state = gs;
     s_event_queue = xQueueCreate(8, sizeof(coordinator_event_t));
+    s_state = COORD_STATE_IDLE;
     s_v1_should_shutdown = false;
     s_v2_should_shutdown = false;
+    s_primary_protocol = STRATUM_PROTOCOL_V1;
+    s_fallback_protocol = STRATUM_PROTOCOL_V1;
+    s_running_protocol = STRATUM_PROTOCOL_V1;
     s_heartbeat_enabled = false;
     s_consecutive_pool_failures = 0;
-    atomic_store_explicit(&s_pool_config_changed, false,
+    atomic_store_explicit(&s_changed_pool_mask, 0,
                           memory_order_release);
 }
 
@@ -99,11 +103,16 @@ void protocol_coordinator_notify_success(void)
     }
 }
 
-void protocol_coordinator_notify_pool_config_changed(void)
+void protocol_coordinator_notify_pool_config_changed(int pool_index)
 {
-    bool already_pending = atomic_exchange_explicit(
-        &s_pool_config_changed, true, memory_order_acq_rel);
-    if (already_pending) {
+    if (pool_index < 0 || pool_index >= MAX_POOLS) {
+        return;
+    }
+
+    uint32_t bit = UINT32_C(1) << (unsigned)pool_index;
+    uint32_t previous = atomic_fetch_or_explicit(
+        &s_changed_pool_mask, bit, memory_order_acq_rel);
+    if (previous != 0) {
         return;
     }
 
@@ -488,41 +497,55 @@ static bool refresh_pool_protocols(GlobalState *gs)
 {
     uint16_t prim_idx = gs->SYSTEM_MODULE.primary_pool_index;
     uint16_t sec_idx = gs->SYSTEM_MODULE.secondary_pool_index;
-    PoolConfig primary = {0};
-    PoolConfig fallback = {0};
+    stratum_protocol_t primary_protocol;
+    stratum_protocol_t fallback_protocol;
 
-    if (!SYSTEM_get_pool_config_snapshot(gs, prim_idx, &primary) ||
-        !SYSTEM_get_pool_config_snapshot(gs, sec_idx, &fallback)) {
+    if (!SYSTEM_get_pool_protocols(gs, prim_idx, sec_idx,
+                                   &primary_protocol,
+                                   &fallback_protocol)) {
         ESP_LOGE(TAG, "Unable to snapshot pool protocols");
-        SYSTEM_release_pool_config_snapshot(&primary);
-        SYSTEM_release_pool_config_snapshot(&fallback);
         return false;
     }
 
-    s_primary_protocol = primary.protocol;
-    s_fallback_protocol = fallback.protocol;
-    SYSTEM_release_pool_config_snapshot(&primary);
-    SYSTEM_release_pool_config_snapshot(&fallback);
+    if ((primary_protocol != STRATUM_PROTOCOL_V1 &&
+         primary_protocol != STRATUM_PROTOCOL_V2) ||
+        (fallback_protocol != STRATUM_PROTOCOL_V1 &&
+         fallback_protocol != STRATUM_PROTOCOL_V2)) {
+        ESP_LOGE(TAG, "Pool protocol snapshot contains an invalid value");
+        return false;
+    }
+
+    // Publish only after both snapshots and both values have been validated,
+    // so a failed refresh leaves the last known-safe protocols intact.
+    s_primary_protocol = primary_protocol;
+    s_fallback_protocol = fallback_protocol;
     return true;
 }
 
-static void apply_pool_config_change(GlobalState *gs)
+static void apply_pool_config_change(GlobalState *gs,
+                                     uint32_t changed_pool_mask)
 {
-    coordinator_state_t old_state = s_state;
+    uint16_t primary_index = gs->SYSTEM_MODULE.primary_pool_index;
+    uint16_t fallback_index = gs->SYSTEM_MODULE.secondary_pool_index;
+    bool primary_changed = primary_index < MAX_POOLS &&
+                           (changed_pool_mask &
+                            (UINT32_C(1) << primary_index)) != 0;
+    bool fallback_changed = fallback_index < MAX_POOLS &&
+                            (changed_pool_mask &
+                             (UINT32_C(1) << fallback_index)) != 0;
 
-    if (old_state == COORD_STATE_RUNNING_PRIMARY ||
-        old_state == COORD_STATE_RUNNING_FALLBACK) {
-        if (!stop_running_task(gs)) {
-            return;
-        }
+    // Unselected pool slots do not affect protocol selection or a live task.
+    if (!primary_changed && !fallback_changed) {
+        return;
     }
 
-    SYSTEM_clean_jobs_queue(gs);
-    reset_share_stats(gs);
-    s_consecutive_pool_failures = 0;
+    coordinator_state_t old_state = s_state;
 
+    // Refresh first. If the snapshot fails, retain both the cached protocols
+    // and the current task rather than stopping a healthy session with no safe
+    // replacement protocol to publish.
     if (!refresh_pool_protocols(gs)) {
-        enter_paused_state(gs);
+        ESP_LOGE(TAG, "Pool protocol refresh failed; keeping current session");
         return;
     }
 
@@ -534,6 +557,24 @@ static void apply_pool_config_change(GlobalState *gs)
     }
 
     bool use_fallback = gs->SYSTEM_MODULE.is_using_fallback;
+    bool active_pool_changed = use_fallback ? fallback_changed
+                                            : primary_changed;
+    if (!active_pool_changed ||
+        (old_state != COORD_STATE_RUNNING_PRIMARY &&
+         old_state != COORD_STATE_RUNNING_FALLBACK)) {
+        ESP_LOGI(TAG,
+                 "Updated cached protocol for selected inactive pool; live session unchanged");
+        return;
+    }
+
+    if (!stop_running_task(gs)) {
+        return;
+    }
+
+    SYSTEM_clean_jobs_queue(gs);
+    reset_share_stats(gs);
+    s_consecutive_pool_failures = 0;
+
     stratum_protocol_t protocol = use_fallback
                                       ? s_fallback_protocol
                                       : s_primary_protocol;
@@ -649,10 +690,11 @@ void protocol_coordinator_task(void *pvParameters)
 
     // Main non-blocking event loop
     while (1) {
-        if (atomic_exchange_explicit(&s_pool_config_changed, false,
-                                     memory_order_acq_rel)) {
+        uint32_t changed_pool_mask = atomic_exchange_explicit(
+            &s_changed_pool_mask, 0, memory_order_acq_rel);
+        if (changed_pool_mask != 0) {
             bool was_heartbeat_enabled = s_heartbeat_enabled;
-            apply_pool_config_change(gs);
+            apply_pool_config_change(gs, changed_pool_mask);
             if (s_heartbeat_enabled && !was_heartbeat_enabled) {
                 heartbeat_initial_delay = true;
                 heartbeat_delay_start = esp_timer_get_time();

@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 
 #define TRANSPORT_TIMEOUT_MS 5000
@@ -272,6 +274,8 @@ void STRATUM_V1_reset_message(StratumApiV1Message *message)
     }
     message->method = METHOD_UNKNOWN;
     message->message_id = -1;
+    message->has_message_id = false;
+    message->is_response = false;
     message->response_success = false;
     message->new_difficulty = 0.0;
     message->version_mask = 0;
@@ -662,14 +666,30 @@ bool STRATUM_V1_parse(StratumApiV1Message *message, const char *stratum_json)
         return false;
     }
 
-    // Parse message ID
+    // Parse message ID. Although JSON-RPC specifies number/string/null IDs,
+    // a number is what this client sends. Accept a decimal string too because
+    // several otherwise-compatible Stratum implementations echo IDs that way.
     cJSON *id_json = cJSON_GetObjectItem(json, "id");
     if (id_json && cJSON_IsNumber(id_json)) {
         message->message_id = id_json->valueint;
+        message->has_message_id = true;
+    } else if (cJSON_IsString(id_json) && id_json->valuestring != NULL) {
+        char *end = NULL;
+        errno = 0;
+        long parsed_id = strtol(id_json->valuestring, &end, 10);
+        if (errno == 0 && end != id_json->valuestring && *end == '\0' &&
+            parsed_id >= INT_MIN && parsed_id <= INT_MAX) {
+            message->message_id = (int)parsed_id;
+            message->has_message_id = true;
+        }
     }
 
     // Parse method or result
     cJSON *method_json = cJSON_GetObjectItem(json, "method");
+    message->is_response =
+        !cJSON_IsString(method_json) &&
+        (cJSON_HasObjectItem(json, "result") ||
+         cJSON_HasObjectItem(json, "error"));
     message->method = parse_method(method_json);
 
     bool result = false;

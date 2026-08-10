@@ -117,6 +117,8 @@ typedef struct StratumApiV1Message
     int extranonce_2_len;
 
     int message_id;
+    bool has_message_id;
+    bool is_response;
     // Indicates the type of request the message represents.
     stratum_method method;
 

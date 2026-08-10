@@ -29,9 +29,37 @@
 #define TRANSPORT_TIMEOUT_MS 5000
 #define SV2_MAX_FRAME_SIZE 8192
 #define SV2_MAX_EXTRANONCE_SIZE 32
+#define SHUTDOWN_POLL_INTERVAL_MS 100
 
 static const char *TAG = "stratum_v2_task";
 static pthread_mutex_t sv2_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void stratum_v2_shutdown_aware_delay(uint32_t delay_ms)
+{
+    while (delay_ms > 0) {
+        if (protocol_coordinator_v2_should_shutdown()) {
+            return;
+        }
+
+        uint32_t interval_ms = delay_ms < SHUTDOWN_POLL_INTERVAL_MS
+                                   ? delay_ms
+                                   : SHUTDOWN_POLL_INTERVAL_MS;
+        vTaskDelay(pdMS_TO_TICKS(interval_ms));
+        delay_ms -= interval_ms;
+    }
+}
+
+// A transport is not visible to stratum_v2_interrupt_connection() until it is
+// published in GLOBAL_STATE. The task that created an unpublished handle must
+// therefore close and destroy it itself when a stop races connect/setup.
+static void stratum_v2_destroy_unpublished_transport(
+    esp_transport_handle_t transport)
+{
+    if (transport != NULL) {
+        esp_transport_close(transport);
+        esp_transport_destroy(transport);
+    }
+}
 
 static void free_sv2_extended_queued_work(void *work)
 {
@@ -139,7 +167,7 @@ void stratum_v2_close_connection(GlobalState *GLOBAL_STATE)
         esp_transport_close(transport);
         esp_transport_destroy(transport);
     }
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    stratum_v2_shutdown_aware_delay(1000);
 }
 
 void stratum_v2_interrupt_connection(GlobalState *GLOBAL_STATE)
@@ -782,44 +810,71 @@ void stratum_v2_task(void *pvParameters)
             snprintf(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info,
                      sizeof(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info), "SV2: Internal error");
             retry_attempts++;
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
+            stratum_v2_shutdown_aware_delay(5000);
+            continue;
+        }
+
+        if (protocol_coordinator_v2_should_shutdown()) {
+            stratum_v2_destroy_unpublished_transport(transport);
             continue;
         }
 
         // Resolve up front and connect by IP so DNS stays non-blocking (a long
         // DNS timeout otherwise stalls the lwIP stack and starves the HTTP server).
         stratum_connection_info_t conn_info;
-        if (stratum_socket_resolve(stratum_url, port, &conn_info) != ESP_OK) {
+        esp_err_t resolve_ret =
+            stratum_socket_resolve(stratum_url, port, &conn_info);
+        if (protocol_coordinator_v2_should_shutdown()) {
+            stratum_v2_destroy_unpublished_transport(transport);
+            continue;
+        }
+        if (resolve_ret != ESP_OK) {
             ESP_LOGE(TAG, "Address resolution failed for %s", stratum_url);
             snprintf(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info,
                      sizeof(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info), "SV2: Pool unreachable");
-            esp_transport_close(transport);
-            esp_transport_destroy(transport);
+            stratum_v2_destroy_unpublished_transport(transport);
             retry_attempts++;
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
+            stratum_v2_shutdown_aware_delay(5000);
             continue;
         }
 
         int64_t connect_start_us = esp_timer_get_time();
 
         esp_err_t ret = esp_transport_connect(transport, conn_info.host_ip, port, TRANSPORT_TIMEOUT_MS);
+        if (protocol_coordinator_v2_should_shutdown()) {
+            stratum_v2_destroy_unpublished_transport(transport);
+            continue;
+        }
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "TCP connect failed to %s:%d (%s) (err %d)", stratum_url, port, conn_info.host_ip, ret);
             snprintf(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info,
                      sizeof(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info), "SV2: Pool unreachable");
-            esp_transport_close(transport);
-            esp_transport_destroy(transport);
+            stratum_v2_destroy_unpublished_transport(transport);
             retry_attempts++;
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
+            stratum_v2_shutdown_aware_delay(5000);
             continue;
         }
 
         ESP_LOGI(TAG, "TCP connected to %s:%d (%s)", stratum_url, port, conn_info.host_ip);
 
-        pthread_mutex_lock(&sv2_lifecycle_lock);
-        GLOBAL_STATE->transport = transport;
-        pthread_mutex_unlock(&sv2_lifecycle_lock);
+        // Configure the still-local handle before publication so a concurrent
+        // stop cannot close it underneath setsockopt().
         stratum_socket_set_options(transport);
+
+        // Publish atomically with the shutdown check. If stop has already set
+        // the flag, its earlier interrupt could not see this local handle; if
+        // stop arrives after publication, it takes this same lock and closes it.
+        pthread_mutex_lock(&sv2_lifecycle_lock);
+        bool publish_transport =
+            !protocol_coordinator_v2_should_shutdown();
+        if (publish_transport) {
+            GLOBAL_STATE->transport = transport;
+        }
+        pthread_mutex_unlock(&sv2_lifecycle_lock);
+        if (!publish_transport) {
+            stratum_v2_destroy_unpublished_transport(transport);
+            continue;
+        }
 
         // Reset connection state
         memset(conn, 0, sizeof(*conn));
@@ -842,8 +897,17 @@ void stratum_v2_task(void *pvParameters)
             continue;
         }
         pthread_mutex_lock(&sv2_lifecycle_lock);
-        GLOBAL_STATE->sv2_noise_ctx = noise_ctx;
+        bool publish_noise_ctx =
+            !protocol_coordinator_v2_should_shutdown();
+        if (publish_noise_ctx) {
+            GLOBAL_STATE->sv2_noise_ctx = noise_ctx;
+        }
         pthread_mutex_unlock(&sv2_lifecycle_lock);
+        if (!publish_noise_ctx) {
+            sv2_noise_destroy(noise_ctx);
+            stratum_v2_close_connection(GLOBAL_STATE);
+            continue;
+        }
 
         // Load the optional authority pubkey and whether this pool requires it
         uint8_t auth_key[32];
@@ -867,7 +931,13 @@ void stratum_v2_task(void *pvParameters)
             ESP_LOGW(TAG, "No authority pubkey configured, server identity will not be verified");
         }
 
-        if (sv2_noise_handshake(noise_ctx, transport, has_auth ? auth_key : NULL) != 0) {
+        int handshake_ret = sv2_noise_handshake(
+            noise_ctx, transport, has_auth ? auth_key : NULL);
+        if (protocol_coordinator_v2_should_shutdown()) {
+            stratum_v2_close_connection(GLOBAL_STATE);
+            continue;
+        }
+        if (handshake_ret != 0) {
             ESP_LOGE(TAG, "Noise handshake failed, reconnecting...");
             snprintf(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info,
                      sizeof(GLOBAL_STATE->SYSTEM_MODULE.pool_connection_info), "SV2: Auth failed - check key");

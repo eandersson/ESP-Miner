@@ -657,8 +657,10 @@ void SYSTEM_load_pool_from_nvs(GlobalState * GLOBAL_STATE, int i) {
     pool_config_free_owned(&replacement);
     free(json_str);
 
-    if (changed) {
-        protocol_coordinator_notify_pool_config_changed();
+    if (changed &&
+        (i == GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index ||
+         i == GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index)) {
+        protocol_coordinator_notify_pool_config_changed(i);
     }
 }
 
@@ -753,4 +755,25 @@ bool SYSTEM_get_pool_config_snapshot(GlobalState *GLOBAL_STATE, int index,
 void SYSTEM_release_pool_config_snapshot(PoolConfig *snapshot)
 {
     pool_config_free_owned(snapshot);
+}
+
+bool SYSTEM_get_pool_protocols(GlobalState *GLOBAL_STATE, int primary_index,
+                               int fallback_index,
+                               stratum_protocol_t *primary_protocol,
+                               stratum_protocol_t *fallback_protocol)
+{
+    if (GLOBAL_STATE == NULL || primary_protocol == NULL ||
+        fallback_protocol == NULL || primary_index < 0 ||
+        primary_index >= MAX_POOLS || fallback_index < 0 ||
+        fallback_index >= MAX_POOLS) {
+        return false;
+    }
+
+    pthread_mutex_lock(&GLOBAL_STATE->pools_lock);
+    *primary_protocol =
+        GLOBAL_STATE->SYSTEM_MODULE.pools[primary_index].protocol;
+    *fallback_protocol =
+        GLOBAL_STATE->SYSTEM_MODULE.pools[fallback_index].protocol;
+    pthread_mutex_unlock(&GLOBAL_STATE->pools_lock);
+    return true;
 }

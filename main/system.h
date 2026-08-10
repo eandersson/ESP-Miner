@@ -47,5 +47,9 @@ bool SYSTEM_claim_pool_difficulty_update(GlobalState *GLOBAL_STATE,
 bool SYSTEM_get_pool_config_snapshot(GlobalState *GLOBAL_STATE, int index,
                                      PoolConfig *snapshot);
 void SYSTEM_release_pool_config_snapshot(PoolConfig *snapshot);
+bool SYSTEM_get_pool_protocols(GlobalState *GLOBAL_STATE, int primary_index,
+                               int fallback_index,
+                               stratum_protocol_t *primary_protocol,
+                               stratum_protocol_t *fallback_protocol);
 
 #endif /* SYSTEM_H_ */
