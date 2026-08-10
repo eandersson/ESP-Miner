@@ -59,6 +59,7 @@ static void free_self_test_queued_work(void *work)
     }
     STRATUM_V1_free_mining_notify(v1_work->notification);
     free(v1_work->extranonce_1);
+    free(v1_work->user);
     free(v1_work);
 }
 
@@ -521,9 +522,9 @@ void self_test_task(void * pvParameters)
     const char *difficulty_json = "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[4294967295]}";
     STRATUM_V1_parse(&msg, difficulty_json);
     if (msg.method == MINING_SET_DIFFICULTY) {
-        GLOBAL_STATE->pool_difficulty = msg.new_difficulty;
-        GLOBAL_STATE->new_set_mining_difficulty_msg = true;
-        ESP_LOGI(TAG, "Self-test: Applied mock difficulty %lu", (unsigned long)GLOBAL_STATE->pool_difficulty);
+        SYSTEM_set_pool_difficulty(GLOBAL_STATE, msg.new_difficulty, true);
+        ESP_LOGI(TAG, "Self-test: Applied mock difficulty %lu",
+                 (unsigned long)msg.new_difficulty);
     }
 
     // 3. Mock set_version_mask
@@ -553,11 +554,12 @@ void self_test_task(void * pvParameters)
         }
         work->notification = msg.mining_notification;
         work->extranonce_1 = strdup(GLOBAL_STATE->extranonce_str);
+        work->user = strdup("self-test");
         work->extranonce_2_len = GLOBAL_STATE->extranonce_2_len;
-        work->difficulty = GLOBAL_STATE->pool_difficulty;
+        work->difficulty = SYSTEM_get_pool_difficulty(GLOBAL_STATE);
         work->version_rolling_enabled = true;
         work->version_mask = GLOBAL_STATE->version_mask;
-        if (work->extranonce_1 == NULL) {
+        if (work->extranonce_1 == NULL || work->user == NULL) {
             free_self_test_queued_work(work);
             msg.mining_notification = NULL;
             ESP_LOGE(TAG, "Unable to snapshot self-test extranonce");

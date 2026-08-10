@@ -156,18 +156,23 @@ static void realloc_json_buffer(size_t len)
     json_rpc_buffer_size = new;
 }
 
-char * STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport)
+stratum_v1_receive_status_t STRATUM_V1_receive_jsonrpc_line_status(
+    esp_transport_handle_t transport, char **line_out)
 {
+    if (line_out == NULL) {
+        return STRATUM_V1_RECEIVE_ERROR;
+    }
+    *line_out = NULL;
+
     if (json_rpc_buffer == NULL) {
         STRATUM_V1_initialize_buffer();
     }
-    char *line = NULL;
-    char recv_buffer[BUFFER_SIZE];
-    int nbytes;
 
-    while (!strstr(json_rpc_buffer, "\n")) {
+    if (strchr(json_rpc_buffer, '\n') == NULL) {
+        char recv_buffer[BUFFER_SIZE];
         memset(recv_buffer, 0, BUFFER_SIZE);
-        nbytes = esp_transport_read(transport, recv_buffer, BUFFER_SIZE - 1, TRANSPORT_TIMEOUT_MS);
+        int nbytes = esp_transport_read(
+            transport, recv_buffer, BUFFER_SIZE - 1, TRANSPORT_TIMEOUT_MS);
         if (nbytes < 0) {
             const char *err_str;
             switch(nbytes) {
@@ -188,12 +193,18 @@ char * STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport)
             if (json_rpc_buffer) {
                 free(json_rpc_buffer);
                 json_rpc_buffer = NULL;
+                json_rpc_buffer_size = 0;
             }
-            return NULL;
+            return STRATUM_V1_RECEIVE_ERROR;
         }
-        if (nbytes > 0) {
-            realloc_json_buffer(nbytes);
-            strncat(json_rpc_buffer, recv_buffer, nbytes);
+        if (nbytes == 0) {
+            return STRATUM_V1_RECEIVE_TIMEOUT;
+        }
+
+        realloc_json_buffer((size_t)nbytes);
+        strncat(json_rpc_buffer, recv_buffer, (size_t)nbytes);
+        if (strchr(json_rpc_buffer, '\n') == NULL) {
+            return STRATUM_V1_RECEIVE_INCOMPLETE;
         }
     }
 
@@ -202,7 +213,11 @@ char * STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport)
     char *newline_pos = strchr(json_rpc_buffer, '\n');
     if (newline_pos) {
         size_t line_len = newline_pos - json_rpc_buffer;
-        line = strndup(json_rpc_buffer, line_len);  // Copy only up to \n
+        *line_out = strndup(json_rpc_buffer, line_len);  // Copy only up to \n
+        if (*line_out == NULL) {
+            ESP_LOGE(TAG, "Unable to allocate Stratum JSON line");
+            return STRATUM_V1_RECEIVE_ERROR;
+        }
         size_t remaining_len = buflen - line_len - 1;
         if (remaining_len > 0) {
             memmove(json_rpc_buffer, newline_pos + 1, remaining_len);
@@ -211,7 +226,22 @@ char * STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport)
             json_rpc_buffer[0] = '\0';
         }
     }
-    return line;
+    return STRATUM_V1_RECEIVE_LINE;
+}
+
+char * STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport)
+{
+    while (true) {
+        char *line = NULL;
+        stratum_v1_receive_status_t status =
+            STRATUM_V1_receive_jsonrpc_line_status(transport, &line);
+        if (status == STRATUM_V1_RECEIVE_LINE) {
+            return line;
+        }
+        if (status == STRATUM_V1_RECEIVE_ERROR) {
+            return NULL;
+        }
+    }
 }
 
 void STRATUM_V1_reset_message(StratumApiV1Message *message)

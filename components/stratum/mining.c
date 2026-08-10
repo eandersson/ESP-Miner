@@ -24,7 +24,9 @@ static allocated_bm_job_t *get_job_allocation(bm_job *job)
                                   offsetof(allocated_bm_job_t, job));
 }
 
-bm_job *allocate_bm_job(const char *jobid, const char *extranonce2)
+static bm_job *allocate_bm_job_internal(const char *jobid,
+                                        const char *extranonce2,
+                                        const char *session_user)
 {
     if (jobid == NULL || extranonce2 == NULL) {
         return NULL;
@@ -32,14 +34,19 @@ bm_job *allocate_bm_job(const char *jobid, const char *extranonce2)
 
     size_t jobid_size = strlen(jobid) + 1;
     size_t extranonce2_size = strlen(extranonce2) + 1;
+    size_t session_user_size =
+        session_user != NULL ? strlen(session_user) + 1 : 0;
     if (jobid_size > SIZE_MAX - extranonce2_size ||
-        sizeof(allocated_bm_job_t) >
-            SIZE_MAX - jobid_size - extranonce2_size) {
+        jobid_size + extranonce2_size > SIZE_MAX - session_user_size ||
+        sizeof(allocated_bm_job_t) > SIZE_MAX - jobid_size -
+                                                extranonce2_size -
+                                                session_user_size) {
         return NULL;
     }
 
     allocated_bm_job_t *allocation = calloc(
-        1, sizeof(*allocation) + jobid_size + extranonce2_size);
+        1, sizeof(*allocation) + jobid_size + extranonce2_size +
+               session_user_size);
     if (allocation == NULL) {
         return NULL;
     }
@@ -50,8 +57,26 @@ bm_job *allocate_bm_job(const char *jobid, const char *extranonce2)
     memcpy(job->jobid, jobid, jobid_size);
     job->extranonce2 = metadata + jobid_size;
     memcpy(job->extranonce2, extranonce2, extranonce2_size);
+    if (session_user_size != 0) {
+        job->session_user = metadata + jobid_size + extranonce2_size;
+        memcpy(job->session_user, session_user, session_user_size);
+    }
     atomic_init(&allocation->ref_count, 1);
     return job;
+}
+
+bm_job *allocate_bm_job(const char *jobid, const char *extranonce2)
+{
+    return allocate_bm_job_internal(jobid, extranonce2, NULL);
+}
+
+bm_job *allocate_bm_job_for_user(const char *jobid, const char *extranonce2,
+                                 const char *session_user)
+{
+    if (session_user == NULL) {
+        return NULL;
+    }
+    return allocate_bm_job_internal(jobid, extranonce2, session_user);
 }
 
 void retain_bm_job(bm_job *job)
@@ -88,6 +113,7 @@ void free_bm_job(bm_job *job)
     }
     free(job->jobid);
     free(job->extranonce2);
+    free(job->session_user);
     free(job);
 }
 

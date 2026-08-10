@@ -7,6 +7,8 @@
 #include "freertos/queue.h"
 #include "esp_heap_caps.h"
 
+#include <stdatomic.h>
+
 #include "global_state.h"
 #include "protocol_coordinator.h"
 #include "stratum_v1_task.h"
@@ -35,6 +37,7 @@ typedef enum {
     COORD_EVENT_PROTOCOL_SUCCESS,
     COORD_EVENT_V1_TASK_EXITED,
     COORD_EVENT_V2_TASK_EXITED,
+    COORD_EVENT_POOL_CONFIG_CHANGED,
 } coordinator_event_t;
 
 #define TRANSPORT_TIMEOUT_MS 5000
@@ -51,6 +54,7 @@ static coordinator_state_t s_state = COORD_STATE_IDLE;
 static QueueHandle_t s_event_queue = NULL;
 static volatile bool s_v1_should_shutdown = false;
 static volatile bool s_v2_should_shutdown = false;
+static atomic_bool s_pool_config_changed = ATOMIC_VAR_INIT(false);
 
 // Protocol tracking
 static stratum_protocol_t s_primary_protocol;
@@ -58,16 +62,14 @@ static stratum_protocol_t s_fallback_protocol;
 static stratum_protocol_t s_running_protocol;
 static bool s_heartbeat_enabled = false;
 
-// Primary pool info (saved at startup for heartbeat probing)
-static const char *s_primary_url = NULL;
-static uint16_t s_primary_port = 0;
-
 // Number of consecutive pools (primary and/or fallback) that have exhausted
 // their retry budget without a successful setup. When this reaches
 // pool_failure_threshold(), we enter COORD_STATE_PAUSED and set
 // pools_unavailable so power management cuts ASIC power.
 // Reset on COORD_EVENT_PROTOCOL_SUCCESS.
 static int s_consecutive_pool_failures = 0;
+
+static void enter_paused_state(GlobalState *gs);
 
 void protocol_coordinator_init(GlobalState *gs)
 {
@@ -77,13 +79,15 @@ void protocol_coordinator_init(GlobalState *gs)
     s_v2_should_shutdown = false;
     s_heartbeat_enabled = false;
     s_consecutive_pool_failures = 0;
+    atomic_store_explicit(&s_pool_config_changed, false,
+                          memory_order_release);
 }
 
 void protocol_coordinator_notify_failure(void)
 {
     coordinator_event_t evt = COORD_EVENT_PROTOCOL_FAILED;
     if (s_event_queue) {
-        xQueueSend(s_event_queue, &evt, 0);
+        (void)xQueueSend(s_event_queue, &evt, portMAX_DELAY);
     }
 }
 
@@ -92,6 +96,22 @@ void protocol_coordinator_notify_success(void)
     coordinator_event_t evt = COORD_EVENT_PROTOCOL_SUCCESS;
     if (s_event_queue) {
         xQueueSend(s_event_queue, &evt, 0);
+    }
+}
+
+void protocol_coordinator_notify_pool_config_changed(void)
+{
+    bool already_pending = atomic_exchange_explicit(
+        &s_pool_config_changed, true, memory_order_acq_rel);
+    if (already_pending) {
+        return;
+    }
+
+    // The flag is authoritative: even if the wake event cannot be queued, a
+    // full queue already guarantees the coordinator will wake and observe it.
+    coordinator_event_t evt = COORD_EVENT_POOL_CONFIG_CHANGED;
+    if (s_event_queue) {
+        (void)xQueueSend(s_event_queue, &evt, 0);
     }
 }
 
@@ -104,7 +124,7 @@ void protocol_coordinator_v1_exited(void)
 {
     coordinator_event_t evt = COORD_EVENT_V1_TASK_EXITED;
     if (s_event_queue) {
-        xQueueSend(s_event_queue, &evt, 0);
+        (void)xQueueSend(s_event_queue, &evt, portMAX_DELAY);
     }
 }
 
@@ -117,7 +137,7 @@ void protocol_coordinator_v2_exited(void)
 {
     coordinator_event_t evt = COORD_EVENT_V2_TASK_EXITED;
     if (s_event_queue) {
-        xQueueSend(s_event_queue, &evt, 0);
+        (void)xQueueSend(s_event_queue, &evt, portMAX_DELAY);
     }
 }
 
@@ -136,36 +156,44 @@ static void reset_share_stats(GlobalState *gs)
 static bool has_fallback_pool(GlobalState *gs)
 {
     uint16_t sec_idx = gs->SYSTEM_MODULE.secondary_pool_index;
-    return (gs->SYSTEM_MODULE.pools[sec_idx].url != NULL &&
-            gs->SYSTEM_MODULE.pools[sec_idx].url[0] != '\0');
+    PoolConfig pool = {0};
+    if (!SYSTEM_get_pool_config_snapshot(gs, sec_idx, &pool)) {
+        return false;
+    }
+    bool configured = pool.url != NULL && pool.url[0] != '\0';
+    SYSTEM_release_pool_config_snapshot(&pool);
+    return configured;
 }
 
 // Start the V1 stratum task (for primary V1 or fallback)
-static void start_v1_task(GlobalState *gs)
+static bool start_v1_task(GlobalState *gs)
 {
     s_v1_should_shutdown = false;
     if (xTaskCreateWithCaps(stratum_v1_task, "stratum v1", 8192, (void *)gs, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create V1 stratum task");
+        return false;
     }
+    return true;
 }
 
 // Start the V2 stratum task
-static void start_v2_task(GlobalState *gs)
+static bool start_v2_task(GlobalState *gs)
 {
     s_v2_should_shutdown = false;
     if (xTaskCreateWithCaps(stratum_v2_task, "stratum v2", 12288, (void *)gs, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create V2 stratum task");
+        return false;
     }
+    return true;
 }
 
 // Start a task for the given protocol
-static void start_protocol_task(GlobalState *gs, stratum_protocol_t protocol)
+static bool start_protocol_task(GlobalState *gs, stratum_protocol_t protocol)
 {
     if (protocol == STRATUM_PROTOCOL_V2) {
-        start_v2_task(gs);
-    } else {
-        start_v1_task(gs);
+        return start_v2_task(gs);
     }
+    return start_v1_task(gs);
 }
 
 // Tell the V1 task to shut down and wait for it to exit.
@@ -277,13 +305,23 @@ static bool probe_pool_v1(GlobalState *gs, const char *url, uint16_t port,
 static bool probe_pool(GlobalState *gs, bool use_fallback)
 {
     uint16_t idx = use_fallback ? gs->SYSTEM_MODULE.secondary_pool_index : gs->SYSTEM_MODULE.primary_pool_index;
-    PoolConfig *pool = &gs->SYSTEM_MODULE.pools[idx];
-
-    if (pool->protocol == STRATUM_PROTOCOL_V2) {
-        return probe_pool_sv2(pool->url, pool->port);
+    PoolConfig pool = {0};
+    if (!SYSTEM_get_pool_config_snapshot(gs, idx, &pool)) {
+        ESP_LOGE(TAG, "Unable to snapshot %s pool for probe",
+                 use_fallback ? "fallback" : "primary");
+        return false;
     }
 
-    return probe_pool_v1(gs, pool->url, pool->port, pool->tls, pool->cert, pool->user, pool->pass);
+    bool reachable;
+    if (pool.protocol == STRATUM_PROTOCOL_V2) {
+        reachable = probe_pool_sv2(pool.url, pool.port);
+    } else {
+        reachable = probe_pool_v1(gs, pool.url, pool.port, pool.tls,
+                                  pool.cert, pool.user, pool.pass);
+    }
+
+    SYSTEM_release_pool_config_snapshot(&pool);
+    return reachable;
 }
 
 // Switch from primary to fallback pool.
@@ -301,7 +339,10 @@ static void switch_to_fallback(GlobalState *gs)
     ESP_LOGI(TAG, "Switching to fallback pool (%s)",
              s_fallback_protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
 
-    start_protocol_task(gs, s_fallback_protocol);
+    if (!start_protocol_task(gs, s_fallback_protocol)) {
+        enter_paused_state(gs);
+        return;
+    }
 
     // Only enable heartbeat if this was an automatic failover (not user choice)
     s_heartbeat_enabled = !gs->SYSTEM_MODULE.use_fallback_stratum;
@@ -330,7 +371,10 @@ static void switch_to_primary(GlobalState *gs)
     s_running_protocol = s_primary_protocol;
     s_state = COORD_STATE_RUNNING_PRIMARY;
 
-    start_protocol_task(gs, s_primary_protocol);
+    if (!start_protocol_task(gs, s_primary_protocol)) {
+        enter_paused_state(gs);
+        return;
+    }
 
     s_heartbeat_enabled = false;
 }
@@ -348,7 +392,7 @@ static void do_heartbeat_probe(GlobalState *gs)
         return;
     }
 
-    ESP_LOGD(TAG, "Heartbeat: probing primary pool %s:%d", s_primary_url, s_primary_port);
+    ESP_LOGD(TAG, "Heartbeat: probing primary pool");
 
     if (probe_pool(gs, /*use_fallback=*/false)) {
         switch_to_primary(gs);
@@ -397,7 +441,10 @@ static void resume_on_pool(GlobalState *gs, bool use_fallback)
              use_fallback ? "fallback" : "primary",
              proto == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
 
-    start_protocol_task(gs, proto);
+    if (!start_protocol_task(gs, proto)) {
+        enter_paused_state(gs);
+        return;
+    }
 
     // Only run the auto-switch-back heartbeat for *automatic* failovers
     // (user did not explicitly choose the fallback pool).
@@ -437,6 +484,75 @@ static void try_resume_from_paused(GlobalState *gs)
     ESP_LOGD(TAG, "Recovery probe: no pool reachable, staying paused");
 }
 
+static bool refresh_pool_protocols(GlobalState *gs)
+{
+    uint16_t prim_idx = gs->SYSTEM_MODULE.primary_pool_index;
+    uint16_t sec_idx = gs->SYSTEM_MODULE.secondary_pool_index;
+    PoolConfig primary = {0};
+    PoolConfig fallback = {0};
+
+    if (!SYSTEM_get_pool_config_snapshot(gs, prim_idx, &primary) ||
+        !SYSTEM_get_pool_config_snapshot(gs, sec_idx, &fallback)) {
+        ESP_LOGE(TAG, "Unable to snapshot pool protocols");
+        SYSTEM_release_pool_config_snapshot(&primary);
+        SYSTEM_release_pool_config_snapshot(&fallback);
+        return false;
+    }
+
+    s_primary_protocol = primary.protocol;
+    s_fallback_protocol = fallback.protocol;
+    SYSTEM_release_pool_config_snapshot(&primary);
+    SYSTEM_release_pool_config_snapshot(&fallback);
+    return true;
+}
+
+static void apply_pool_config_change(GlobalState *gs)
+{
+    coordinator_state_t old_state = s_state;
+
+    if (old_state == COORD_STATE_RUNNING_PRIMARY ||
+        old_state == COORD_STATE_RUNNING_FALLBACK) {
+        if (!stop_running_task(gs)) {
+            return;
+        }
+    }
+
+    SYSTEM_clean_jobs_queue(gs);
+    reset_share_stats(gs);
+    s_consecutive_pool_failures = 0;
+
+    if (!refresh_pool_protocols(gs)) {
+        enter_paused_state(gs);
+        return;
+    }
+
+    if (old_state == COORD_STATE_PAUSED) {
+        // A user has supplied new pool data while mining was parked. Probe it
+        // immediately instead of waiting for the ordinary 30-second cadence.
+        try_resume_from_paused(gs);
+        return;
+    }
+
+    bool use_fallback = gs->SYSTEM_MODULE.is_using_fallback;
+    stratum_protocol_t protocol = use_fallback
+                                      ? s_fallback_protocol
+                                      : s_primary_protocol;
+    gs->stratum_protocol = protocol;
+    gs->SYSTEM_MODULE.pools_unavailable = false;
+    s_running_protocol = protocol;
+    s_state = use_fallback ? COORD_STATE_RUNNING_FALLBACK
+                           : COORD_STATE_RUNNING_PRIMARY;
+    s_heartbeat_enabled = use_fallback &&
+                          !gs->SYSTEM_MODULE.use_fallback_stratum;
+
+    ESP_LOGI(TAG, "Pool configuration changed; restarting %s session (%s)",
+             use_fallback ? "fallback" : "primary",
+             protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
+    if (!start_protocol_task(gs, protocol)) {
+        enter_paused_state(gs);
+    }
+}
+
 // Handle an event from the event queue
 static void handle_event(GlobalState *gs, coordinator_event_t evt)
 {
@@ -468,7 +584,9 @@ static void handle_event(GlobalState *gs, coordinator_event_t evt)
                 gs->stratum_protocol = s_primary_protocol;
                 s_running_protocol = s_primary_protocol;
                 s_state = COORD_STATE_RUNNING_PRIMARY;
-                start_protocol_task(gs, s_primary_protocol);
+                if (!start_protocol_task(gs, s_primary_protocol)) {
+                    enter_paused_state(gs);
+                }
                 s_heartbeat_enabled = false;
             }
             break;
@@ -489,6 +607,9 @@ static void handle_event(GlobalState *gs, coordinator_event_t evt)
             // If we receive one here unexpectedly, just log it.
             ESP_LOGI(TAG, "Task exited event received (evt=%d, state=%d)", evt, s_state);
             break;
+
+        case COORD_EVENT_POOL_CONFIG_CHANGED:
+            break;
     }
 }
 
@@ -496,27 +617,24 @@ void protocol_coordinator_task(void *pvParameters)
 {
     GlobalState *gs = (GlobalState *)pvParameters;
 
-    uint16_t prim_idx = gs->SYSTEM_MODULE.primary_pool_index;
-    uint16_t sec_idx = gs->SYSTEM_MODULE.secondary_pool_index;
-
-    s_primary_url = gs->SYSTEM_MODULE.pools[prim_idx].url;
-    s_primary_port = gs->SYSTEM_MODULE.pools[prim_idx].port;
-    s_primary_protocol = gs->SYSTEM_MODULE.pools[prim_idx].protocol;
-    s_fallback_protocol = gs->SYSTEM_MODULE.pools[sec_idx].protocol;
-
-    // Start initial protocol task
-    if (gs->SYSTEM_MODULE.is_using_fallback) {
+    if (!refresh_pool_protocols(gs)) {
+        enter_paused_state(gs);
+    } else if (gs->SYSTEM_MODULE.is_using_fallback) {
         // User explicitly selected fallback — use fallback protocol
         gs->stratum_protocol = s_fallback_protocol;
         s_running_protocol = s_fallback_protocol;
         s_state = COORD_STATE_RUNNING_FALLBACK;
-        start_protocol_task(gs, s_fallback_protocol);
+        if (!start_protocol_task(gs, s_fallback_protocol)) {
+            enter_paused_state(gs);
+        }
         // User chose fallback, no heartbeat
         s_heartbeat_enabled = false;
     } else {
         s_running_protocol = s_primary_protocol;
         s_state = COORD_STATE_RUNNING_PRIMARY;
-        start_protocol_task(gs, s_primary_protocol);
+        if (!start_protocol_task(gs, s_primary_protocol)) {
+            enter_paused_state(gs);
+        }
     }
 
     ESP_LOGI(TAG, "Protocol coordinator started (primary: %s, fallback: %s, state: %d)",
@@ -531,6 +649,17 @@ void protocol_coordinator_task(void *pvParameters)
 
     // Main non-blocking event loop
     while (1) {
+        if (atomic_exchange_explicit(&s_pool_config_changed, false,
+                                     memory_order_acq_rel)) {
+            bool was_heartbeat_enabled = s_heartbeat_enabled;
+            apply_pool_config_change(gs);
+            if (s_heartbeat_enabled && !was_heartbeat_enabled) {
+                heartbeat_initial_delay = true;
+                heartbeat_delay_start = esp_timer_get_time();
+            }
+            continue;
+        }
+
         coordinator_event_t evt;
         TickType_t wait;
         if (s_state == COORD_STATE_PAUSED) {

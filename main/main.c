@@ -230,6 +230,7 @@ void app_main(void)
     queue_init(&GLOBAL_STATE.stratum_queue);
     if (ASIC_result_task_init() != ESP_OK) {
         ESP_LOGE(TAG, "Unable to initialize ASIC result processing");
+        fail_asic_closed("ASIC result queue init failed");
         return;
     }
 

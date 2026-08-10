@@ -57,11 +57,10 @@ static void stratum_v2_free_pending_jobs(sv2_conn_t *conn)
 // SV2 format: base58check(0x0001_LE + 32_byte_xonly_pubkey)
 // Decoded: 2-byte version + 32-byte pubkey + 4-byte checksum = 38 bytes
 // Returns true if a valid base58 pubkey was decoded.
-static bool stratum_v2_load_authority_pubkey(GlobalState *GLOBAL_STATE, uint8_t out[32], bool use_fallback)
+static bool stratum_v2_load_authority_pubkey(const PoolConfig *pool,
+                                             uint8_t out[32])
 {
-    uint16_t pool_idx = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
-                                    : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-    const char *b58_key = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].sv2_authority_pubkey;
+    const char *b58_key = pool->sv2_authority_pubkey;
     if (!b58_key || strlen(b58_key) == 0) {
         return false;
     }
@@ -95,12 +94,11 @@ static bool stratum_v2_load_authority_pubkey(GlobalState *GLOBAL_STATE, uint8_t 
     return true;
 }
 
-static sv2_channel_type_t sv2_select_channel_type(GlobalState *GLOBAL_STATE, bool use_fallback)
+static sv2_channel_type_t sv2_select_channel_type(
+    GlobalState *GLOBAL_STATE, const PoolConfig *pool)
 {
-    uint16_t pool_idx = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
-                                    : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
     sv2_channel_type_t type = SV2_CHANNEL_EXTENDED;  // default, and forced for BM1397
-    sv2_channel_type_t parsed = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].sv2_channel_type;
+    sv2_channel_type_t parsed = pool->sv2_channel_type;
     if (parsed == SV2_CHANNEL_STANDARD) {
         if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id != BM1397) {
             type = SV2_CHANNEL_STANDARD;
@@ -369,13 +367,12 @@ static void stratum_v2_enqueue_ext_job(GlobalState *GLOBAL_STATE,
 }
 
 // Decode coinbase from extended job prefix/suffix by converting to hex and reusing V1 decoder
-static void stratum_v2_decode_coinbase(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
-                                        const sv2_ext_job_t *job)
+static void stratum_v2_decode_coinbase(GlobalState *GLOBAL_STATE,
+                                       sv2_conn_t *conn,
+                                       const PoolConfig *pool,
+                                       const sv2_ext_job_t *job)
 {
-    bool use_fallback = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback;
-    uint16_t pool_idx = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
-                                     : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-    bool decode_coinbase = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].decode_coinbase_tx;
+    bool decode_coinbase = pool->decode_coinbase_tx;
 
     // Check for BIP141 SegWit marker/flag in prefix (bytes[4]==0x00, bytes[5]!=0x00).
     // Some SV2 pools send the coinbase in witness format; the V1 decoder expects
@@ -439,7 +436,7 @@ static void stratum_v2_decode_coinbase(GlobalState *GLOBAL_STATE, sv2_conn_t *co
     }
     memset(result, 0, sizeof(mining_notification_result_t));
 
-    const char *user = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].user;
+    const char *user = pool->user;
 
     esp_err_t err = coinbase_process_notification(&notify, extranonce1_hex, extranonce2_len,
                                                    user, decode_coinbase, result);
@@ -511,8 +508,9 @@ static void stratum_v2_decode_coinbase(GlobalState *GLOBAL_STATE, sv2_conn_t *co
 }
 
 // Handle NewExtendedMiningJob message
-static void stratum_v2_handle_new_extended_mining_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
-                                                       const uint8_t *payload, uint32_t len)
+static void stratum_v2_handle_new_extended_mining_job(
+    GlobalState *GLOBAL_STATE, sv2_conn_t *conn, const PoolConfig *pool,
+    const uint8_t *payload, uint32_t len)
 {
     uint32_t channel_id;
     sv2_ext_job_t *job = sv2_parse_new_extended_mining_job(payload, len, &channel_id);
@@ -528,7 +526,7 @@ static void stratum_v2_handle_new_extended_mining_job(GlobalState *GLOBAL_STATE,
              job->ntime > 0 ? "no" : "yes");
 
     // Decode coinbase transaction (block height, scriptsig, outputs)
-    stratum_v2_decode_coinbase(GLOBAL_STATE, conn, job);
+    stratum_v2_decode_coinbase(GLOBAL_STATE, conn, pool, job);
 
     int slot = job->job_id % SV2_PENDING_JOBS_SIZE;
 
@@ -681,17 +679,12 @@ static void stratum_v2_handle_set_target(GlobalState *GLOBAL_STATE, sv2_conn_t *
     memcpy(conn->target, max_target, 32);
     double pdiff = hash_to_pdiff(max_target);
     ESP_LOGI(TAG, "Set pool difficulty: %g", pdiff);
-    GLOBAL_STATE->pool_difficulty = pdiff;
-    GLOBAL_STATE->new_set_mining_difficulty_msg = true;
+    SYSTEM_set_pool_difficulty(GLOBAL_STATE, pdiff, true);
 }
 
 void stratum_v2_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
-
-    // Determine channel type before setting up queue free function
-    bool use_fallback_init = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback;
-    sv2_channel_type_t channel_type = sv2_select_channel_type(GLOBAL_STATE, use_fallback_init);
 
     // Set default version mask for version rolling
     GLOBAL_STATE->version_mask = STRATUM_DEFAULT_VERSION_MASK;
@@ -721,8 +714,20 @@ void stratum_v2_task(void *pvParameters)
     int retry_attempts = 0;
     bool use_fallback = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback;
     uint16_t pool_idx = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-    char *stratum_url = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].url;
-    uint16_t port = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].port;
+    PoolConfig pool = {0};
+    if (!SYSTEM_get_pool_config_snapshot(GLOBAL_STATE, pool_idx, &pool)) {
+        ESP_LOGE(TAG, "Unable to snapshot SV2 pool configuration");
+        free(frame_buf);
+        free(recv_buf);
+        free(conn);
+        protocol_coordinator_notify_failure();
+        vTaskDelete(NULL);
+        return;
+    }
+    sv2_channel_type_t channel_type =
+        sv2_select_channel_type(GLOBAL_STATE, &pool);
+    const char *stratum_url = pool.url ? pool.url : "";
+    uint16_t port = pool.port;
 
     ESP_LOGI(TAG, "Starting SV2 task (%s), connecting to %s:%d (free heap: %lu)",
              use_fallback ? "fallback" : "primary",
@@ -736,6 +741,7 @@ void stratum_v2_task(void *pvParameters)
             free(frame_buf);
             free(recv_buf);
             free(conn);
+            SYSTEM_release_pool_config_snapshot(&pool);
             protocol_coordinator_v2_exited();
             vTaskDelete(NULL);
             return;
@@ -743,7 +749,12 @@ void stratum_v2_task(void *pvParameters)
 
         if (!wifi_is_connected()) {
             ESP_LOGI(TAG, "WiFi disconnected, waiting...");
-            vTaskDelay(10000 / portTICK_PERIOD_MS);
+            for (int i = 0;
+                 i < 100 && !protocol_coordinator_v2_should_shutdown() &&
+                 !wifi_is_connected();
+                 i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
             continue;
         }
 
@@ -755,6 +766,7 @@ void stratum_v2_task(void *pvParameters)
             free(frame_buf);
             free(recv_buf);
             free(conn);
+            SYSTEM_release_pool_config_snapshot(&pool);
             // Send only failure event — coordinator knows the task exited because it failed
             protocol_coordinator_notify_failure();
             vTaskDelete(NULL);
@@ -835,10 +847,8 @@ void stratum_v2_task(void *pvParameters)
 
         // Load the optional authority pubkey and whether this pool requires it
         uint8_t auth_key[32];
-        bool has_auth = stratum_v2_load_authority_pubkey(GLOBAL_STATE, auth_key, use_fallback);
-        uint16_t auth_pool_idx = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
-                                              : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-        bool require_auth = GLOBAL_STATE->SYSTEM_MODULE.pools[auth_pool_idx].sv2_require_auth;
+        bool has_auth = stratum_v2_load_authority_pubkey(&pool, auth_key);
+        bool require_auth = pool.sv2_require_auth;
 
         // When auth is required but no usable authority key is configured,
         // refuse to connect rather than mine against an unverifiable server
@@ -946,9 +956,7 @@ void stratum_v2_task(void *pvParameters)
 
         // 3. Send OpenMiningChannel (extended or standard)
         {
-            uint16_t pool_idx = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
-                                             : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-            char *user = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].user;
+            const char *user = pool.user;
             float hash_rate = 1e12;
             int frame_len;
 
@@ -1057,8 +1065,7 @@ void stratum_v2_task(void *pvParameters)
             pthread_mutex_unlock(&sv2_lifecycle_lock);
 
             double pdiff = hash_to_pdiff(target);
-            GLOBAL_STATE->pool_difficulty = pdiff;
-            GLOBAL_STATE->new_set_mining_difficulty_msg = true;
+            SYSTEM_set_pool_difficulty(GLOBAL_STATE, pdiff, true);
 
             ESP_LOGI(TAG, "Mining channel opened: channel_id=%lu, group=%lu, type=%s",
                      channel_id, group_channel_id,
@@ -1095,7 +1102,8 @@ void stratum_v2_task(void *pvParameters)
                     break;
 
                 case SV2_MSG_NEW_EXTENDED_MINING_JOB:
-                    stratum_v2_handle_new_extended_mining_job(GLOBAL_STATE, conn, recv_buf, hdr.msg_length);
+                    stratum_v2_handle_new_extended_mining_job(
+                        GLOBAL_STATE, conn, &pool, recv_buf, hdr.msg_length);
                     break;
 
                 case SV2_MSG_SET_NEW_PREV_HASH:

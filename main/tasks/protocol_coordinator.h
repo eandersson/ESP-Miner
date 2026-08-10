@@ -19,6 +19,8 @@ void protocol_coordinator_notify_failure(void);
 // Resets the "all pools unreachable" failure counter and clears pools_unavailable.
 void protocol_coordinator_notify_success(void);
 
+void protocol_coordinator_notify_pool_config_changed(void);
+
 // V1 task checks this to know when to shut down gracefully
 bool protocol_coordinator_v1_should_shutdown(void);
 

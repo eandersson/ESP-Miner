@@ -807,18 +807,44 @@ void POWER_MANAGEMENT_task(void *pvParameters)
     // network is ready. Prepare and verify its VCORE here, as the legacy loop
     // did, without falsely publishing the ASIC as RUNNING.
     vTaskDelay(pdMS_TO_TICKS(500));
-    if (VCORE_clear_faults(GLOBAL_STATE) != ESP_OK ||
-        set_vcore_verified(GLOBAL_STATE, power->requested_voltage_mv) != ESP_OK) {
-        system->hardware_fault = true;
-        snprintf(system->hardware_fault_msg, sizeof(system->hardware_fault_msg),
-                 "VCORE startup verification failed");
-        ESP_LOGE(TAG, "%s", system->hardware_fault_msg);
+
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    bool preflight_allowed =
+        asic_lifecycle_get(GLOBAL_STATE) == ASIC_LIFECYCLE_STOPPED &&
+        !system->hardware_fault &&
+        !GLOBAL_STATE->SELF_TEST_MODULE.is_finished;
+    esp_err_t preflight_err = ESP_ERR_INVALID_STATE;
+    if (preflight_allowed) {
+        preflight_err = VCORE_clear_faults(GLOBAL_STATE);
+        if (preflight_err == ESP_OK) {
+            preflight_err = set_vcore_verified(
+                GLOBAL_STATE, power->requested_voltage_mv);
+        }
+    }
+    bool preflight_still_valid =
+        preflight_err == ESP_OK &&
+        asic_lifecycle_get(GLOBAL_STATE) == ASIC_LIFECYCLE_STOPPED &&
+        !system->hardware_fault &&
+        !GLOBAL_STATE->SELF_TEST_MODULE.is_finished;
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+
+    if (!preflight_still_valid) {
+        if (preflight_allowed && preflight_err != ESP_OK) {
+            system->hardware_fault = true;
+            snprintf(system->hardware_fault_msg,
+                     sizeof(system->hardware_fault_msg),
+                     "VCORE startup verification failed");
+            ESP_LOGE(TAG, "%s", system->hardware_fault_msg);
+        } else {
+            ESP_LOGW(TAG, "VCORE startup preflight cancelled");
+        }
         asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
         pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
         (void)SERIAL_pause_tx(0);
         asic_hold_reset_low();
         pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
         VCORE_set_voltage(GLOBAL_STATE, 0.0f);
+        control.applied_voltage_mv = 0;
         asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPED);
         __atomic_store_n(&power->startup_preflight_succeeded, false,
                          __ATOMIC_RELAXED);
@@ -863,6 +889,9 @@ void POWER_MANAGEMENT_task(void *pvParameters)
         asic_lifecycle_state_t lifecycle = asic_lifecycle_get(GLOBAL_STATE);
         if (lifecycle == ASIC_LIFECYCLE_RUNNING) {
             control.cold_boot_complete = true;
+            if (!wants_stop) {
+                control.stopped_for_request = false;
+            }
         }
 
         if (wants_stop) {

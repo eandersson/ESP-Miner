@@ -580,14 +580,16 @@ static bool enqueue_v1_share(GlobalState *GLOBAL_STATE,
                              const queued_asic_result_t *queued_result,
                              uint32_t version_bits, double difficulty)
 {
-    uint16_t active_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback
-                              ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
-                              : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-    const char *active_user =
-        GLOBAL_STATE->SYSTEM_MODULE.pools[active_idx].user;
+    const char *session_user = queued_result->job != NULL
+                                   ? queued_result->job->session_user
+                                   : NULL;
+    char *user_copy = session_user != NULL ? strdup(session_user) : NULL;
+    if (user_copy == NULL) {
+        return false;
+    }
     queued_v1_share_t share = {
         .job = queued_result->job,
-        .user = active_user != NULL ? strdup(active_user) : NULL,
+        .user = user_copy,
         .generation = queued_result->generation,
         .nonce = queued_result->result.nonce,
         .version_bits = version_bits,

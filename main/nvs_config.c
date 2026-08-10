@@ -329,13 +329,10 @@ static void nvs_task(void *pvParameters)
                 get_nvs_key_name(setting, update.index, key);
 
                 // NVS flash write is AFTER releasing the mutex so getters are never blocked
-                char *old_str = NULL;
                 char nvs_str_buf[32]; // for TYPE_FLOAT serialisation
                 xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
                 switch (update.type) {
                     case TYPE_STR:
-                        old_str = setting->value[update.index].str;
-                        setting->value[update.index].str = update.value.str;
                         break;
                     case TYPE_U16:
                         // Numeric/bool setters publish accepted state before
@@ -383,7 +380,9 @@ static void nvs_task(void *pvParameters)
                         ESP_LOGE(TAG, "Failed to commit data to NVS");
                     }
                 }
-                if (old_str) free(old_str);
+                if (update.type == TYPE_STR) {
+                    free(update.value.str);
+                }
             } 
             else if (update.type == TYPE_STR) {
                 free(update.value.str);
@@ -559,23 +558,76 @@ char *nvs_config_get_string_indexed(NvsConfigKey key, int index)
 void nvs_config_set_string(NvsConfigKey key, const char *value)
 {
     Settings *setting = nvs_config_get_settings(key);
-    if (!setting || setting->type != TYPE_STR || (setting->value[0].str && strcmp(setting->value[0].str, value) == 0)) return;
+    if (!setting || setting->type != TYPE_STR || setting->array_size > 1 ||
+        value == NULL) {
+        return;
+    }
 
-    ConfigUpdate update = { .key = key, .type = TYPE_STR, .value.str = strdup(value) };
-    if (!update.value.str) return;
+    char *cache_copy = strdup(value);
+    char *queued_copy = strdup(value);
+    if (cache_copy == NULL || queued_copy == NULL) {
+        free(cache_copy);
+        free(queued_copy);
+        return;
+    }
+
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    if (setting->value[0].str != NULL &&
+        strcmp(setting->value[0].str, value) == 0) {
+        xSemaphoreGive(nvs_cache_mutex);
+        free(cache_copy);
+        free(queued_copy);
+        return;
+    }
+
+    char *old_cache = setting->value[0].str;
+    setting->value[0].str = cache_copy;
+    ConfigUpdate update = {
+        .key = key,
+        .type = TYPE_STR,
+        .value.str = queued_copy,
+        .index = 0,
+    };
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    xSemaphoreGive(nvs_cache_mutex);
+    free(old_cache);
 }
 
 void nvs_config_set_string_indexed(NvsConfigKey key, int index, const char *value)
 {
     Settings *setting = nvs_config_get_settings(key);
-    if (!setting || setting->type != TYPE_STR || setting->array_size < 1) return;
+    if (!setting || setting->type != TYPE_STR || setting->array_size < 1 ||
+        value == NULL) return;
     if (index < 0 || index >= setting->array_size) return;
-    if (setting->value[index].str && strcmp(setting->value[index].str, value) == 0) return;
 
-    ConfigUpdate update = { .key = key, .type = TYPE_STR, .value.str = strdup(value), .index = index };
-    if (!update.value.str) return;
+    char *cache_copy = strdup(value);
+    char *queued_copy = strdup(value);
+    if (cache_copy == NULL || queued_copy == NULL) {
+        free(cache_copy);
+        free(queued_copy);
+        return;
+    }
+
+    xSemaphoreTake(nvs_cache_mutex, portMAX_DELAY);
+    if (setting->value[index].str != NULL &&
+        strcmp(setting->value[index].str, value) == 0) {
+        xSemaphoreGive(nvs_cache_mutex);
+        free(cache_copy);
+        free(queued_copy);
+        return;
+    }
+
+    char *old_cache = setting->value[index].str;
+    setting->value[index].str = cache_copy;
+    ConfigUpdate update = {
+        .key = key,
+        .type = TYPE_STR,
+        .value.str = queued_copy,
+        .index = index,
+    };
     xQueueSend(nvs_save_queue, &update, portMAX_DELAY);
+    xSemaphoreGive(nvs_cache_mutex);
+    free(old_cache);
 }
 
 uint16_t nvs_config_get_u16(NvsConfigKey key)

@@ -266,16 +266,23 @@ void BAP_send_request(bap_parameter_t param, GlobalState *state) {
     //ESP_LOGI(TAG, "Sending request response for %s", BAP_parameter_to_string(param));
 
     switch (param) {
-        case BAP_PARAM_SYSTEM_INFO:
+        case BAP_PARAM_SYSTEM_INFO: {
             BAP_send_message(BAP_CMD_RES, "deviceModel", state->DEVICE_CONFIG.family.name);
             BAP_send_message(BAP_CMD_RES, "asicModel", state->DEVICE_CONFIG.family.asic.name);
             char port_str[6];
             uint16_t prim_idx = state->SYSTEM_MODULE.primary_pool_index;
-            snprintf(port_str, sizeof(port_str),"%u", state->SYSTEM_MODULE.pools[prim_idx].port);
-            BAP_send_message(BAP_CMD_RES, "pool", state->SYSTEM_MODULE.pools[prim_idx].url);
-            BAP_send_message(BAP_CMD_RES, "poolPort", port_str);
-            BAP_send_message(BAP_CMD_RES, "poolUser", state->SYSTEM_MODULE.pools[prim_idx].user);
+            PoolConfig pool = {0};
+            if (SYSTEM_get_pool_config_snapshot(state, prim_idx, &pool)) {
+                snprintf(port_str, sizeof(port_str), "%u", pool.port);
+                BAP_send_message(BAP_CMD_RES, "pool", pool.url ? pool.url : "");
+                BAP_send_message(BAP_CMD_RES, "poolPort", port_str);
+                BAP_send_message(BAP_CMD_RES, "poolUser", pool.user ? pool.user : "");
+                SYSTEM_release_pool_config_snapshot(&pool);
+            } else {
+                ESP_LOGE(TAG, "Unable to snapshot primary pool for BAP response");
+            }
             break;
+        }
         case BAP_PARAM_SHARES:
             {
                 char shares_ar_str[64];

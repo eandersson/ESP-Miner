@@ -518,9 +518,15 @@ static void screen_update_cb(lv_timer_t * timer)
     PowerManagementModule * power_management = &GLOBAL_STATE->POWER_MANAGEMENT_MODULE;
 
     uint16_t pool_idx = module->is_using_fallback ? module->secondary_pool_index : module->primary_pool_index;
-    char *pool_url = module->pools[pool_idx].url;
-    if (strcmp(lv_label_get_text(urls_mining_url_label), pool_url) != 0) {
-        lv_label_set_text(urls_mining_url_label, pool_url);
+    PoolConfig pool = {0};
+    if (SYSTEM_get_pool_config_snapshot(GLOBAL_STATE, pool_idx, &pool)) {
+        const char *pool_url = pool.url ? pool.url : "";
+        if (strcmp(lv_label_get_text(urls_mining_url_label), pool_url) != 0) {
+            // LVGL copies label text, so the owned snapshot can be released
+            // immediately after updating the widget.
+            lv_label_set_text(urls_mining_url_label, pool_url);
+        }
+        SYSTEM_release_pool_config_snapshot(&pool);
     }
 
     if (strcmp(lv_label_get_text(urls_ip_addr_label), module->ip_addr_str) != 0) {

@@ -26,11 +26,14 @@ typedef struct bm_job
     bool version_rolling_enabled;
     char *jobid;
     char *extranonce2;
+    char *session_user;
 } bm_job;
 
 // Allocate a zero-initialized job with immutable metadata stored in the same
 // allocation. The returned reference is owned by the caller.
 bm_job *allocate_bm_job(const char *jobid, const char *extranonce2);
+bm_job *allocate_bm_job_for_user(const char *jobid, const char *extranonce2,
+                                 const char *session_user);
 void retain_bm_job(bm_job *job);
 void release_bm_job(bm_job *job);
 // Free a legacy independently allocated job and its metadata. Jobs returned by

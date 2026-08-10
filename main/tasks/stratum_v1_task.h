@@ -11,10 +11,12 @@ typedef struct
 {
     mining_notify *notification;
     char *extranonce_1;
+    char *user;
     uint32_t extranonce_2_len;
     double difficulty;
     uint32_t version_mask;
     bool version_rolling_enabled;
+    bool decode_coinbase_tx;
 } stratum_v1_work;
 
 // Negative and distinct from the stratum_socket write results (-1/-2) and

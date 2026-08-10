@@ -2,6 +2,7 @@
 #define GLOBAL_STATE_H_
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
@@ -184,11 +185,14 @@ typedef struct GlobalState
     // Serializes V1 share writers. Job-generation invalidation deliberately
     // does not take this lock, so one already in-flight stale write may finish.
     pthread_mutex_t stratum_v1_submit_lock;
+    pthread_mutex_t pools_lock;
+    pthread_mutex_t pool_difficulty_lock;
 
     double pool_difficulty;
     bool new_set_mining_difficulty_msg;
-    uint32_t version_mask;
-    bool new_stratum_version_rolling_msg;
+
+    _Atomic uint32_t version_mask;
+    _Atomic bool new_stratum_version_rolling_msg;
     // Stratum V1's BIP310 state is reset for every TCP connection. Keep it
     // separate from the shared mask above, which is also used by Stratum V2.
     bool stratum_v1_version_rolling_enabled;

@@ -1,5 +1,6 @@
 #include <sys/time.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -227,29 +228,35 @@ static bool apply_pending_control_updates(GlobalState *GLOBAL_STATE,
     static int64_t next_mask_retry_us;
     bool changed = false;
 
-    if (GLOBAL_STATE->new_set_mining_difficulty_msg) {
-        ESP_LOGI(TAG, "New pool difficulty %.2f",
-                 GLOBAL_STATE->pool_difficulty);
-        *difficulty = GLOBAL_STATE->pool_difficulty;
-        GLOBAL_STATE->new_set_mining_difficulty_msg = false;
+    double difficulty_update;
+    if (SYSTEM_claim_pool_difficulty_update(GLOBAL_STATE,
+                                            &difficulty_update)) {
+        ESP_LOGI(TAG, "New pool difficulty %.2f", difficulty_update);
+        *difficulty = difficulty_update;
         changed = true;
     }
 
-    if (GLOBAL_STATE->new_stratum_version_rolling_msg &&
-        asic_lifecycle_is_running(GLOBAL_STATE)) {
+    if (asic_lifecycle_is_running(GLOBAL_STATE)) {
         int64_t now_us = esp_timer_get_time();
-        if (now_us >= next_mask_retry_us) {
+        if (now_us >= next_mask_retry_us &&
+            atomic_exchange_explicit(
+                &GLOBAL_STATE->new_stratum_version_rolling_msg, false,
+                memory_order_acq_rel)) {
+            uint32_t mask_snapshot = atomic_load_explicit(
+                &GLOBAL_STATE->version_mask, memory_order_acquire);
             ESP_LOGI(TAG, "Set chip version rolls %i",
-                     (int)(GLOBAL_STATE->version_mask >> 13));
+                     (int)(mask_snapshot >> 13));
             esp_err_t err = ASIC_set_version_mask_if_running(
-                GLOBAL_STATE, GLOBAL_STATE->version_mask);
+                GLOBAL_STATE, mask_snapshot);
             if (err == ESP_OK) {
-                GLOBAL_STATE->new_stratum_version_rolling_msg = false;
                 next_mask_retry_us = 0;
                 changed = true;
             } else {
                 // Preserve the pending state. A transient UART failure must
                 // not make software believe the chip accepted a new mask.
+                atomic_store_explicit(
+                    &GLOBAL_STATE->new_stratum_version_rolling_msg, true,
+                    memory_order_release);
                 next_mask_retry_us = now_us + 1000000;
                 ESP_LOGW(TAG,
                          "ASIC version-mask update failed (%s); retrying",
@@ -335,7 +342,7 @@ void create_jobs_task(void *pvParameters)
         return;
     }
 
-    double difficulty = GLOBAL_STATE->pool_difficulty;
+    double difficulty = SYSTEM_get_pool_difficulty(GLOBAL_STATE);
     void *current_work = NULL;
     work_queue_item_metadata current_work_metadata = {0};
     work_queue_item_kind observed_active_kind =
@@ -910,8 +917,8 @@ static bm_job *prepare_work_v1(stratum_v1_work *work,
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
 
-    bm_job *next_job = allocate_bm_job(notification->job_id,
-                                       extranonce_2_str);
+    bm_job *next_job = allocate_bm_job_for_user(
+        notification->job_id, extranonce_2_str, work->user);
 
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new job");

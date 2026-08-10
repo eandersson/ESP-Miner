@@ -43,6 +43,7 @@
 
 #define TRANSPORT_TIMEOUT_MS 5000
 #define CONFIGURE_RESPONSE_TIMEOUT_US 10000000LL
+#define SETUP_RESPONSE_TIMEOUT_US 10000000LL
 
 #define BUFFER_SIZE 1024
 
@@ -52,6 +53,39 @@ static pthread_cond_t v1_writers_drained = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t v1_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int v1_active_writers = 0;
 static bool v1_connection_closing = true;
+
+typedef struct
+{
+    int subscribe_message_id;
+    int authorize_message_id;
+    int64_t deadline_us;
+    bool extranonce_ready;
+    bool authorized;
+    bool success_notified;
+} stratum_v1_setup_state_t;
+
+static bool stratum_v1_setup_timed_out(
+    const stratum_v1_setup_state_t *setup, int64_t now_us)
+{
+    return setup != NULL && !setup->success_notified &&
+           setup->deadline_us > 0 && now_us >= setup->deadline_us;
+}
+
+static void stratum_v1_maybe_complete_setup(
+    stratum_v1_setup_state_t *setup, int *retry_attempts)
+{
+    if (setup == NULL || setup->success_notified ||
+        !setup->extranonce_ready || !setup->authorized) {
+        return;
+    }
+
+    setup->success_notified = true;
+    if (retry_attempts != NULL) {
+        *retry_attempts = 0;
+    }
+    ESP_LOGI(TAG, "Stratum V1 subscription and authorization succeeded");
+    protocol_coordinator_notify_success();
+}
 
 static bool version_mask_meets_minimum(uint32_t mask)
 {
@@ -73,6 +107,7 @@ static void free_v1_queued_work(void *work)
         STRATUM_V1_free_mining_notify(v1_work->notification);
     }
     free(v1_work->extranonce_1);
+    free(v1_work->user);
     free(v1_work);
 }
 
@@ -198,13 +233,13 @@ static void stratum_v1_reset_connection_state(GlobalState *GLOBAL_STATE)
     char *old_extranonce = GLOBAL_STATE->extranonce_str;
     GLOBAL_STATE->extranonce_str = NULL;
     GLOBAL_STATE->extranonce_2_len = 0;
-    GLOBAL_STATE->pool_difficulty = 1.0;
     GLOBAL_STATE->stratum_v1_version_rolling_enabled = false;
     GLOBAL_STATE->stratum_v1_version_mask = 0;
     GLOBAL_STATE->version_mask = 0;
     GLOBAL_STATE->new_stratum_version_rolling_msg = true;
     pthread_mutex_unlock(&v1_state_lock);
     pthread_mutex_unlock(&v1_lifecycle_lock);
+    SYSTEM_set_pool_difficulty(GLOBAL_STATE, 1.0, false);
     free(old_extranonce);
 }
 
@@ -212,13 +247,11 @@ static void stratum_v1_set_difficulty(GlobalState *GLOBAL_STATE,
                                       double difficulty)
 {
     // Do not take stratum_v1_submit_lock here. Submitters serialize socket
-    // writes separately and re-read pool_difficulty under v1_state_lock before
-    // each write.
+    // writes separately and re-read pool_difficulty through its dedicated
+    // mutex before each write.
     // An already-snapshotted write may finish, but blocking pool RX behind its
     // five-second socket timeout would delay subsequent difficulty/job data.
-    pthread_mutex_lock(&v1_state_lock);
-    GLOBAL_STATE->pool_difficulty = difficulty;
-    pthread_mutex_unlock(&v1_state_lock);
+    SYSTEM_set_pool_difficulty(GLOBAL_STATE, difficulty, false);
 }
 
 double stratum_v1_get_current_difficulty(GlobalState *GLOBAL_STATE)
@@ -227,10 +260,7 @@ double stratum_v1_get_current_difficulty(GlobalState *GLOBAL_STATE)
         return 0.0;
     }
 
-    pthread_mutex_lock(&v1_state_lock);
-    double difficulty = GLOBAL_STATE->pool_difficulty;
-    pthread_mutex_unlock(&v1_state_lock);
-    return difficulty;
+    return SYSTEM_get_pool_difficulty(GLOBAL_STATE);
 }
 
 static void stratum_v1_set_rolling_state(GlobalState *GLOBAL_STATE,
@@ -270,8 +300,13 @@ static void stratum_v1_replace_extranonce(GlobalState *GLOBAL_STATE,
 }
 
 static stratum_v1_work *stratum_v1_create_work(
-    GlobalState *GLOBAL_STATE, mining_notify *notification)
+    GlobalState *GLOBAL_STATE, mining_notify *notification,
+    const PoolConfig *session_pool)
 {
+    if (session_pool == NULL || session_pool->user == NULL) {
+        return NULL;
+    }
+
     stratum_v1_work *work = calloc(1, sizeof(*work));
     if (work == NULL) {
         return NULL;
@@ -282,18 +317,22 @@ static stratum_v1_work *stratum_v1_create_work(
         work->extranonce_1 = strdup(GLOBAL_STATE->extranonce_str);
     }
     work->extranonce_2_len = GLOBAL_STATE->extranonce_2_len;
-    work->difficulty = GLOBAL_STATE->pool_difficulty;
     work->version_rolling_enabled =
         GLOBAL_STATE->stratum_v1_version_rolling_enabled;
     work->version_mask = work->version_rolling_enabled
                              ? GLOBAL_STATE->stratum_v1_version_mask
                              : 0;
     pthread_mutex_unlock(&v1_state_lock);
+    work->difficulty = SYSTEM_get_pool_difficulty(GLOBAL_STATE);
 
-    if (work->extranonce_1 == NULL ||
+    work->user = strdup(session_pool->user);
+    work->decode_coinbase_tx = session_pool->decode_coinbase_tx;
+
+    if (work->extranonce_1 == NULL || work->user == NULL ||
         work->extranonce_2_len > MAX_EXTRANONCE_2_LEN ||
         !(work->difficulty > 0.0)) {
         free(work->extranonce_1);
+        free(work->user);
         free(work);
         return NULL;
     }
@@ -321,9 +360,8 @@ int stratum_v1_submit_share_safe(
         return STRATUM_V1_SUBMIT_STALE;
     }
 
-    pthread_mutex_lock(&v1_state_lock);
-    double announced_difficulty = GLOBAL_STATE->pool_difficulty;
-    pthread_mutex_unlock(&v1_state_lock);
+    double announced_difficulty =
+        SYSTEM_get_pool_difficulty(GLOBAL_STATE);
     double required_difficulty = mining_v1_effective_share_difficulty(
         job_difficulty, announced_difficulty);
     if (!(share_difficulty >= required_difficulty)) {
@@ -372,15 +410,11 @@ static void decode_mining_notification(GlobalState *GLOBAL_STATE,
     }
     memset(result, 0, sizeof(mining_notification_result_t));
 
-    uint16_t pool_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-    const char *user = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].user;
-    bool decode_coinbase_tx = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].decode_coinbase_tx;
-
     if (coinbase_process_notification(mining_notification,
                                      work->extranonce_1,
                                      work->extranonce_2_len,
-                                     user,
-                                     decode_coinbase_tx,
+                                     work->user,
+                                     work->decode_coinbase_tx,
                                      result) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to process mining notification");
         free(result);
@@ -454,10 +488,11 @@ static void decode_mining_notification(GlobalState *GLOBAL_STATE,
 }
 
 static bool stratum_v1_enqueue_work(GlobalState *GLOBAL_STATE,
-                                    mining_notify *notification)
+                                    mining_notify *notification,
+                                    const PoolConfig *session_pool)
 {
     stratum_v1_work *work =
-        stratum_v1_create_work(GLOBAL_STATE, notification);
+        stratum_v1_create_work(GLOBAL_STATE, notification, session_pool);
     if (work == NULL) {
         ESP_LOGW(TAG,
                  "Dropping V1 notification until valid extranonce and difficulty state is available");
@@ -482,7 +517,8 @@ static bool stratum_v1_enqueue_work(GlobalState *GLOBAL_STATE,
 }
 
 static void stratum_v1_refresh_latest_work(
-    GlobalState *GLOBAL_STATE, const mining_notify *latest_notification)
+    GlobalState *GLOBAL_STATE, const mining_notify *latest_notification,
+    const PoolConfig *session_pool)
 {
     if (latest_notification == NULL) {
         return;
@@ -492,16 +528,12 @@ static void stratum_v1_refresh_latest_work(
         ESP_LOGE(TAG, "Unable to refresh V1 work after connection-state update");
         return;
     }
-    stratum_v1_enqueue_work(GLOBAL_STATE, refresh);
+    stratum_v1_enqueue_work(GLOBAL_STATE, refresh, session_pool);
 }
 
 void stratum_v1_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
-
-    uint16_t pool_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-    char *stratum_url = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].url;
-    uint16_t port = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].port;
 
     STRATUM_V1_initialize_buffer();
     int retry_attempts = 0;
@@ -514,7 +546,7 @@ void stratum_v1_task(void *pvParameters)
         STRATUM_V1_BIP310_STATE_INITIALIZER;
     mining_notify *latest_notification = NULL;
 
-    ESP_LOGI(TAG, "Opening connection to pool: %s:%d", stratum_url, port);
+    ESP_LOGI(TAG, "Starting Stratum V1 pool task");
     while (1) {
         // Check if coordinator wants us to shut down
         if (protocol_coordinator_v1_should_shutdown()) {
@@ -537,7 +569,12 @@ void stratum_v1_task(void *pvParameters)
 
         if (!wifi_is_connected()) {
             ESP_LOGI(TAG, "WiFi disconnected, attempting to reconnect...");
-            vTaskDelay(10000 / portTICK_PERIOD_MS);
+            for (int i = 0;
+                 i < 100 && !protocol_coordinator_v1_should_shutdown() &&
+                 !wifi_is_connected();
+                 i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
             continue;
         }
 
@@ -558,22 +595,34 @@ void stratum_v1_task(void *pvParameters)
             return;
         }
 
-        pool_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
-        stratum_url = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].url;
-        port = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].port;
+        uint16_t pool_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback
+                                ? GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index
+                                : GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
+        PoolConfig session_pool = {0};
+        if (!SYSTEM_get_pool_config_snapshot(GLOBAL_STATE, pool_idx,
+                                             &session_pool)) {
+            ESP_LOGE(TAG, "Unable to snapshot pool %u configuration",
+                     (unsigned int)pool_idx);
+            retry_attempts++;
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
+        }
+        const char *stratum_url = session_pool.url;
+        uint16_t port = session_pool.port;
 
         stratum_connection_info_t conn_info;
         if (stratum_socket_resolve(stratum_url, port, &conn_info) != ESP_OK) {
             ESP_LOGE(TAG, "Address resolution failed for %s", stratum_url);
             retry_attempts++;
+            SYSTEM_release_pool_config_snapshot(&session_pool);
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             continue;
         }
 
         ESP_LOGI(TAG, "Connecting to: stratum+tcp://%s:%d (%s)", stratum_url, port, conn_info.host_ip);
 
-        tls_mode tls = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].tls;
-        char * cert = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].cert;
+        tls_mode tls = session_pool.tls;
+        char *cert = session_pool.cert;
         retry_critical_attempts = 0;
 
         esp_transport_handle_t transport =
@@ -586,6 +635,7 @@ void stratum_v1_task(void *pvParameters)
                 esp_restart();
             }
             retry_attempts++;
+            SYSTEM_release_pool_config_snapshot(&session_pool);
             vTaskDelay(5000 / portTICK_PERIOD_MS);
             continue;
         }
@@ -605,6 +655,7 @@ void stratum_v1_task(void *pvParameters)
             // close the transport
             esp_transport_close(transport);
             esp_transport_destroy(transport);
+            SYSTEM_release_pool_config_snapshot(&session_pool);
             // instead of restarting, retry this every 5 seconds
             vTaskDelay(5000 / portTICK_PERIOD_MS);
             continue;
@@ -662,6 +713,7 @@ void stratum_v1_task(void *pvParameters)
                 STRATUM_V1_bip310_transient_failure(&bip310_state);
                 retry_attempts++;
                 stratum_v1_close_connection(GLOBAL_STATE);
+                SYSTEM_release_pool_config_snapshot(&session_pool);
                 continue;
             }
             configure_pending = true;
@@ -671,16 +723,43 @@ void stratum_v1_task(void *pvParameters)
                      "Using legacy Stratum V1 without BIP310 version rolling");
         }
 
-        // mining.subscribe - ID: 2
-        STRATUM_V1_subscribe(GLOBAL_STATE->transport, stratum_get_next_uid(GLOBAL_STATE), GLOBAL_STATE->DEVICE_CONFIG.family.asic.name);
-
-        char *username = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].user;
-        char *password = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].pass;
-
+        int subscribe_message_id = stratum_get_next_uid(GLOBAL_STATE);
         int authorize_message_id = stratum_get_next_uid(GLOBAL_STATE);
+        stratum_v1_setup_state_t setup = {
+            .subscribe_message_id = subscribe_message_id,
+            .authorize_message_id = authorize_message_id,
+        };
 
-        //mining.authorize - ID: 3
-        STRATUM_V1_authorize(GLOBAL_STATE->transport, authorize_message_id, username, password);
+        int subscribe_ret = STRATUM_V1_subscribe(
+            GLOBAL_STATE->transport, subscribe_message_id,
+            GLOBAL_STATE->DEVICE_CONFIG.family.asic.name);
+        if (subscribe_ret < 0) {
+            ESP_LOGE(TAG, "Unable to send mining.subscribe; reconnecting");
+            if (configure_pending) {
+                STRATUM_V1_bip310_transient_failure(&bip310_state);
+            }
+            retry_attempts++;
+            stratum_v1_close_connection(GLOBAL_STATE);
+            SYSTEM_release_pool_config_snapshot(&session_pool);
+            continue;
+        }
+
+        const char *username = session_pool.user;
+        const char *password = session_pool.pass;
+
+        int authorize_ret = STRATUM_V1_authorize(
+            GLOBAL_STATE->transport, authorize_message_id, username, password);
+        if (authorize_ret < 0) {
+            ESP_LOGE(TAG, "Unable to send mining.authorize; reconnecting");
+            if (configure_pending) {
+                STRATUM_V1_bip310_transient_failure(&bip310_state);
+            }
+            retry_attempts++;
+            stratum_v1_close_connection(GLOBAL_STATE);
+            SYSTEM_release_pool_config_snapshot(&session_pool);
+            continue;
+        }
+        setup.deadline_us = esp_timer_get_time() + SETUP_RESPONSE_TIMEOUT_US;
 
         while (1) {
             // Check if coordinator wants us to shut down
@@ -691,14 +770,25 @@ void stratum_v1_task(void *pvParameters)
                     STRATUM_V1_free_mining_notify(latest_notification);
                     latest_notification = NULL;
                 }
+                SYSTEM_release_pool_config_snapshot(&session_pool);
                 cleanup_stratum_buffer();
                 protocol_coordinator_v1_exited();
                 vTaskDelete(NULL);
                 return;
             }
 
-            char *line = STRATUM_V1_receive_jsonrpc_line(GLOBAL_STATE->transport);
-            if (!line) {
+            if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
+                ESP_LOGI(TAG, "Mining paused, disconnecting from pool");
+                retry_attempts = 0;
+                stratum_v1_close_connection(GLOBAL_STATE);
+                break;
+            }
+
+            char *line = NULL;
+            stratum_v1_receive_status_t receive_status =
+                STRATUM_V1_receive_jsonrpc_line_status(
+                    GLOBAL_STATE->transport, &line);
+            if (receive_status == STRATUM_V1_RECEIVE_ERROR) {
                 if (configure_pending) {
                     ESP_LOGW(TAG,
                              "Pool closed before mining.configure completed; falling back to legacy V1");
@@ -710,13 +800,26 @@ void stratum_v1_task(void *pvParameters)
                 stratum_v1_close_connection(GLOBAL_STATE);
                 break;
             }
-
-            if (!asic_lifecycle_is_running(GLOBAL_STATE)) {
-                free(line);
-                ESP_LOGI(TAG, "Mining paused, disconnecting from pool");
-                retry_attempts = 0;
-                stratum_v1_close_connection(GLOBAL_STATE);
-                break;
+            if (receive_status != STRATUM_V1_RECEIVE_LINE) {
+                int64_t now_us = esp_timer_get_time();
+                if (configure_pending && configure_sent_us > 0 &&
+                    now_us - configure_sent_us >=
+                        CONFIGURE_RESPONSE_TIMEOUT_US) {
+                    ESP_LOGW(TAG,
+                             "mining.configure response timed out; continuing this connection in legacy V1 mode");
+                    configure_pending = false;
+                }
+                if (stratum_v1_setup_timed_out(&setup, now_us)) {
+                    ESP_LOGE(TAG,
+                             "Stratum V1 subscription/authorization timed out; reconnecting");
+                    if (configure_pending) {
+                        STRATUM_V1_bip310_transient_failure(&bip310_state);
+                    }
+                    retry_attempts++;
+                    stratum_v1_close_connection(GLOBAL_STATE);
+                    break;
+                }
+                continue;
             }
 
             int64_t receive_time_us = esp_timer_get_time();
@@ -735,6 +838,25 @@ void stratum_v1_task(void *pvParameters)
                     ESP_LOGW(TAG,
                              "mining.configure response timed out; continuing this connection in legacy V1 mode");
                     configure_pending = false;
+                }
+                if (stratum_api_v1_message.message_id ==
+                        setup.subscribe_message_id ||
+                    stratum_api_v1_message.message_id ==
+                        setup.authorize_message_id) {
+                    ESP_LOGE(
+                        TAG, "Invalid %s response; reconnecting",
+                        stratum_api_v1_message.message_id ==
+                                setup.subscribe_message_id
+                            ? "mining.subscribe"
+                            : "mining.authorize");
+                    if (configure_pending) {
+                        STRATUM_V1_bip310_transient_failure(&bip310_state);
+                    }
+                    STRATUM_V1_reset_message(&stratum_api_v1_message);
+                    free(line);
+                    retry_attempts++;
+                    stratum_v1_close_connection(GLOBAL_STATE);
+                    break;
                 }
                 ESP_LOGE(TAG, "Failed to parse Stratum message, ignoring");
                 STRATUM_V1_reset_message(&stratum_api_v1_message);
@@ -772,7 +894,8 @@ void stratum_v1_task(void *pvParameters)
                     }
                     stratum_v1_enqueue_work(
                         GLOBAL_STATE,
-                        stratum_api_v1_message.mining_notification);
+                        stratum_api_v1_message.mining_notification,
+                        &session_pool);
                     stratum_api_v1_message.mining_notification = NULL;
                     break;
 
@@ -810,7 +933,7 @@ void stratum_v1_task(void *pvParameters)
                         STRATUM_V1_bip310_mark_unsupported(&bip310_state);
                         stratum_v1_set_rolling_state(GLOBAL_STATE, false, 0);
                         stratum_v1_refresh_latest_work(
-                            GLOBAL_STATE, latest_notification);
+                            GLOBAL_STATE, latest_notification, &session_pool);
                         break;
                     }
                     pthread_mutex_lock(&v1_state_lock);
@@ -830,7 +953,8 @@ void stratum_v1_task(void *pvParameters)
                     stratum_v1_set_rolling_state(GLOBAL_STATE, true,
                                                  updated_mask);
                     stratum_v1_refresh_latest_work(GLOBAL_STATE,
-                                                   latest_notification);
+                                                   latest_notification,
+                                                   &session_pool);
                     break;
 
                 case STRATUM_RESULT_CONFIGURE:
@@ -862,7 +986,8 @@ void stratum_v1_task(void *pvParameters)
                             stratum_v1_set_rolling_state(
                                 GLOBAL_STATE, false, 0);
                             stratum_v1_refresh_latest_work(
-                                GLOBAL_STATE, latest_notification);
+                                GLOBAL_STATE, latest_notification,
+                                &session_pool);
                             break;
                         }
                         ESP_LOGI(TAG,
@@ -872,8 +997,7 @@ void stratum_v1_task(void *pvParameters)
                         stratum_v1_set_rolling_state(
                             GLOBAL_STATE, true, negotiated_mask);
                         stratum_v1_refresh_latest_work(
-                            GLOBAL_STATE, latest_notification);
-                        protocol_coordinator_notify_success();
+                            GLOBAL_STATE, latest_notification, &session_pool);
                     } else {
                         STRATUM_V1_bip310_mark_unsupported(&bip310_state);
                         ESP_LOGW(TAG,
@@ -886,14 +1010,43 @@ void stratum_v1_task(void *pvParameters)
 
                 case MINING_SET_EXTRANONCE:
                 case STRATUM_RESULT_SUBSCRIBE:
-                    ESP_LOGI(TAG, "Set extranonce: %s, extranonce_2_len: %d", stratum_api_v1_message.extranonce_str, stratum_api_v1_message.extranonce_2_len);
+                    if (stratum_api_v1_message.method ==
+                            STRATUM_RESULT_SUBSCRIBE &&
+                        stratum_api_v1_message.message_id !=
+                            setup.subscribe_message_id) {
+                        ESP_LOGW(TAG,
+                                 "Ignoring unexpected mining.subscribe result id %d",
+                                 stratum_api_v1_message.message_id);
+                        break;
+                    }
+                    if (stratum_api_v1_message.extranonce_str == NULL ||
+                        stratum_api_v1_message.extranonce_2_len < 0 ||
+                        stratum_api_v1_message.extranonce_2_len >
+                            MAX_EXTRANONCE_2_LEN) {
+                        ESP_LOGE(TAG,
+                                 "mining.subscribe did not establish a usable extranonce; reconnecting");
+                        if (configure_pending) {
+                            STRATUM_V1_bip310_transient_failure(
+                                &bip310_state);
+                        }
+                        retry_attempts++;
+                        stratum_v1_close_connection(GLOBAL_STATE);
+                        reconnect_requested = true;
+                        break;
+                    }
+                    ESP_LOGI(TAG,
+                             "Set extranonce: %s, extranonce_2_len: %d",
+                             stratum_api_v1_message.extranonce_str,
+                             stratum_api_v1_message.extranonce_2_len);
                     stratum_v1_replace_extranonce(
                         GLOBAL_STATE,
                         stratum_api_v1_message.extranonce_str,
                         stratum_api_v1_message.extranonce_2_len);
                     stratum_api_v1_message.extranonce_str = NULL;
+                    setup.extranonce_ready = true;
                     stratum_v1_refresh_latest_work(GLOBAL_STATE,
-                                                   latest_notification);
+                                                   latest_notification,
+                                                   &session_pool);
                     break;
 
                 case MINING_PING:
@@ -923,8 +1076,68 @@ void stratum_v1_task(void *pvParameters)
                             ESP_LOGW(TAG,
                                      "mining.configure rejected; continuing in legacy V1 mode: %s",
                                      stratum_api_v1_message.error_str != NULL
-                                         ? stratum_api_v1_message.error_str
-                                         : "unsupported");
+                                          ? stratum_api_v1_message.error_str
+                                          : "unsupported");
+                            break;
+                        }
+                        if (stratum_api_v1_message.message_id ==
+                            setup.subscribe_message_id) {
+                            if (!stratum_api_v1_message.response_success ||
+                                !setup.extranonce_ready) {
+                                ESP_LOGE(
+                                    TAG,
+                                    "mining.subscribe was rejected or returned no extranonce: %s",
+                                    stratum_api_v1_message.error_str != NULL
+                                        ? stratum_api_v1_message.error_str
+                                        : "invalid result");
+                                if (configure_pending) {
+                                    STRATUM_V1_bip310_transient_failure(
+                                        &bip310_state);
+                                }
+                                retry_attempts++;
+                                stratum_v1_close_connection(GLOBAL_STATE);
+                                reconnect_requested = true;
+                            } else {
+                                ESP_LOGI(
+                                    TAG,
+                                    "mining.subscribe accepted after mining.set_extranonce established the extranonce");
+                            }
+                            break;
+                        }
+                        if (stratum_api_v1_message.message_id ==
+                            setup.authorize_message_id) {
+                            if (!stratum_api_v1_message.response_success) {
+                                ESP_LOGE(
+                                    TAG, "mining.authorize rejected: %s",
+                                    stratum_api_v1_message.error_str != NULL
+                                        ? stratum_api_v1_message.error_str
+                                        : "unknown");
+                                if (configure_pending) {
+                                    STRATUM_V1_bip310_transient_failure(
+                                        &bip310_state);
+                                }
+                                retry_attempts++;
+                                stratum_v1_close_connection(GLOBAL_STATE);
+                                reconnect_requested = true;
+                                break;
+                            }
+
+                            setup.authorized = true;
+                            ESP_LOGI(TAG, "mining.authorize accepted");
+                            uint16_t difficulty = session_pool.difficulty;
+                            if (difficulty > 0) {
+                                STRATUM_V1_suggest_difficulty(
+                                    GLOBAL_STATE->transport,
+                                    stratum_get_next_uid(GLOBAL_STATE),
+                                    difficulty);
+                            }
+                            bool extranonce_subscribe =
+                                session_pool.extranonce_subscribe;
+                            if (extranonce_subscribe) {
+                                STRATUM_V1_extranonce_subscribe(
+                                    GLOBAL_STATE->transport,
+                                    stratum_get_next_uid(GLOBAL_STATE));
+                            }
                             break;
                         }
                         float response_time_ms = STRATUM_V1_get_response_time_ms(stratum_api_v1_message.message_id, receive_time_us);
@@ -938,27 +1151,14 @@ void stratum_v1_task(void *pvParameters)
                                 ESP_LOGW(TAG, "message result rejected: %s", stratum_api_v1_message.error_str);
                                 SYSTEM_notify_rejected_share(GLOBAL_STATE, stratum_api_v1_message.error_str);
                             }
+                        } else if (stratum_api_v1_message.response_success) {
+                            ESP_LOGI(TAG, "Untracked request accepted");
                         } else {
-                            // Reset retry attempts after successfully receiving data.
-                            retry_attempts = 0;
-                            // Tell the coordinator setup succeeded so it clears its
-                            // failure counter and pools_unavailable.
-                            protocol_coordinator_notify_success();
-                            if (stratum_api_v1_message.response_success) {
-                                ESP_LOGI(TAG, "setup message accepted");
-                                if (stratum_api_v1_message.message_id == authorize_message_id) {
-                                    uint16_t difficulty = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].difficulty;
-                                    if (difficulty > 0) {
-                                        STRATUM_V1_suggest_difficulty(GLOBAL_STATE->transport, stratum_get_next_uid(GLOBAL_STATE), difficulty);
-                                    }
-                                    bool extranonce_subscribe = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].extranonce_subscribe;
-                                    if (extranonce_subscribe) {
-                                        STRATUM_V1_extranonce_subscribe(GLOBAL_STATE->transport, stratum_get_next_uid(GLOBAL_STATE));
-                                    }
-                                }
-                            } else {
-                                ESP_LOGE(TAG, "setup message rejected: %s", stratum_api_v1_message.error_str);
-                            }
+                            ESP_LOGW(
+                                TAG, "Untracked request rejected: %s",
+                                stratum_api_v1_message.error_str != NULL
+                                    ? stratum_api_v1_message.error_str
+                                    : "unknown");
                         }
                     }
                     break;
@@ -974,7 +1174,19 @@ void stratum_v1_task(void *pvParameters)
             if (reconnect_requested) {
                 break;
             }
+            stratum_v1_maybe_complete_setup(&setup, &retry_attempts);
+            if (stratum_v1_setup_timed_out(&setup, receive_time_us)) {
+                ESP_LOGE(TAG,
+                         "Stratum V1 subscription/authorization timed out; reconnecting");
+                if (configure_pending) {
+                    STRATUM_V1_bip310_transient_failure(&bip310_state);
+                }
+                retry_attempts++;
+                stratum_v1_close_connection(GLOBAL_STATE);
+                break;
+            }
         }
+        SYSTEM_release_pool_config_snapshot(&session_pool);
     }
     vTaskDelete(NULL);
 }

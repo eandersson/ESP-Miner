@@ -139,12 +139,23 @@ typedef struct RequestTiming
     bool tracking;
 } RequestTiming;
 
+typedef enum
+{
+    STRATUM_V1_RECEIVE_LINE,
+    STRATUM_V1_RECEIVE_INCOMPLETE,
+    STRATUM_V1_RECEIVE_TIMEOUT,
+    STRATUM_V1_RECEIVE_ERROR,
+} stratum_v1_receive_status_t;
+
 esp_transport_handle_t STRATUM_V1_transport_init(tls_mode tls, char * cert);
 
 void STRATUM_V1_initialize_buffer(void);
 void cleanup_stratum_buffer(void);
 
 char *STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport);
+
+stratum_v1_receive_status_t STRATUM_V1_receive_jsonrpc_line_status(
+    esp_transport_handle_t transport, char **line_out);
 
 int STRATUM_V1_subscribe(esp_transport_handle_t transport, int send_uid, const char * model);
 

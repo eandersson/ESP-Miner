@@ -29,6 +29,21 @@ TEST_CASE("Job allocation rejects missing metadata", "[mining]")
 {
     TEST_ASSERT_NULL(allocate_bm_job(NULL, ""));
     TEST_ASSERT_NULL(allocate_bm_job("job", NULL));
+    TEST_ASSERT_NULL(allocate_bm_job_for_user("job", "", NULL));
+}
+
+TEST_CASE("V1 jobs retain their authorized session username", "[mining]")
+{
+    char user[] = "bc1-session.worker";
+    bm_job *job = allocate_bm_job_for_user("pool-job", "0102", user);
+    TEST_ASSERT_NOT_NULL(job);
+
+    user[0] = 'X';
+    TEST_ASSERT_EQUAL_STRING("bc1-session.worker", job->session_user);
+    retain_bm_job(job);
+    release_bm_job(job);
+    TEST_ASSERT_EQUAL_STRING("bc1-session.worker", job->session_user);
+    release_bm_job(job);
 }
 
 TEST_CASE("Check coinbase tx construction", "[mining]")
