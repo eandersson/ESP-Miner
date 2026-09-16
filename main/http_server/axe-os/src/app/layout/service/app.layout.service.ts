@@ -3,7 +3,9 @@ import { BehaviorSubject, Subject } from 'rxjs';
 import { ThemeService } from '../../services/theme.service';
 import { LocalStorageService } from '../../local-storage.service';
 
-const STATIC_MENU_DESKTOP_INACTIVE = 'STATIC_MENU_DESKTOP_INACTIVE'
+const STATIC_MENU_DESKTOP_INACTIVE = 'STATIC_MENU_DESKTOP_INACTIVE';
+const BRAND_PRIMARY = '#B8C9A5';
+const LEGACY_PRIMARY = '#F80421';
 
 export interface AppConfig {
     colorScheme: string;
@@ -56,15 +58,25 @@ export class LayoutService {
         this.themeService.getThemeSettings().subscribe(
             settings => {
                 if (settings) {
+                    const primaryColor = this.normalizePrimaryColor(settings.primaryColor);
                     this._config = {
                         ...this._config,
                         colorScheme: settings.colorScheme,
                     };
 
-                    document.documentElement.style.setProperty('--color-primary', settings.primaryColor);
+                    document.documentElement.style.setProperty('--color-primary', primaryColor);
+
+                    // Preserve deliberate custom choices while migrating the
+                    // former AxeOS red default to Nordic twilight.
+                    if (settings.primaryColor?.toUpperCase() === LEGACY_PRIMARY) {
+                        this.themeService.saveThemeSettings({
+                            ...settings,
+                            primaryColor
+                        }).subscribe();
+                    }
                 } else {
-                    // Save default red dark theme if no settings exist
-                    const defaultPrimary = '#F80421';
+                    // Save the native Nordic-twilight theme if no settings exist.
+                    const defaultPrimary = BRAND_PRIMARY;
                     this.themeService.saveThemeSettings({
                         colorScheme: 'dark',
                         primaryColor: defaultPrimary
@@ -159,7 +171,10 @@ export class LayoutService {
         this.themeService.getThemeSettings().subscribe(
             settings => {
                 if (settings && settings.primaryColor) {
-                    root.style.setProperty('--color-primary', settings.primaryColor);
+                    root.style.setProperty(
+                        '--color-primary',
+                        this.normalizePrimaryColor(settings.primaryColor)
+                    );
                 }
             },
             error => console.error('Error loading accent colors:', error)
@@ -168,6 +183,14 @@ export class LayoutService {
 
     changeScale(value: number) {
         document.documentElement.style.fontSize = `${value}px`;
+    }
+
+    private normalizePrimaryColor(primaryColor: string | undefined): string {
+        if (!primaryColor || primaryColor.toUpperCase() === LEGACY_PRIMARY) {
+            return BRAND_PRIMARY;
+        }
+
+        return primaryColor.toUpperCase();
     }
 
     handleStaticMenuDesktopInactivity() {

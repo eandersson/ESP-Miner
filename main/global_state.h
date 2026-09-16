@@ -2,6 +2,7 @@
 #define GLOBAL_STATE_H_
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
@@ -15,6 +16,7 @@
 #include "scoreboard.h"
 #include "esp_transport.h"
 #include "system.h"
+#include "power/asic_init.h"
 
 typedef struct bm_job bm_job;
 
@@ -148,6 +150,12 @@ typedef struct AsicTaskModule
     // it also may return a previous nonce under some circumstances
     // so we keep a list of jobs indexed by the job id
     bm_job **active_jobs;
+    // Keep the immediately preceding owner of each wire job ID. A nonce can
+    // still be in the ASIC/UART pipeline when the small hardware ID space is
+    // reused, so result handling must be able to validate both generations.
+    bm_job **retired_jobs;
+    int64_t *active_job_dispatch_us;
+    int64_t *retired_job_dispatch_us;
     uint8_t *valid_jobs;
     pthread_mutex_t valid_jobs_lock;
 } AsicTaskModule;
@@ -165,10 +173,19 @@ typedef struct GlobalState
     SelfTestModule SELF_TEST_MODULE;
     HashrateMonitorModule HASHRATE_MONITOR_MODULE;
 
+    // Serializes runtime ASIC commands with stop/reset transitions. Lock
+    // ordering is asic_command_lock -> ASIC_TASK_MODULE.valid_jobs_lock ->
+    // UART TX lock.
+    pthread_mutex_t asic_command_lock;
+    // Guards replacement of the heap strings inside SYSTEM_MODULE.pools[]
+    // against concurrent snapshot readers. Leaf lock: take nothing under it.
+    pthread_mutex_t pools_lock;
+
     esp_transport_handle_t transport;
     pthread_mutex_t transport_mutex;
 
-    bool ASIC_initalized;
+    volatile asic_lifecycle_state_t asic_lifecycle;
+    volatile bool ASIC_initalized;
     bool psram_is_available;
     bool filesystem_is_available;
 

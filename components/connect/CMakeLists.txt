@@ -9,6 +9,7 @@ REQUIRES
     "asic"
     "nvs_flash"
     "esp_wifi"
+    "wpa_supplicant"
     "esp_event"
     "stratum"
     "stratum_v2"

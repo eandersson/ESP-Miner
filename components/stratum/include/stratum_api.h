@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <sys/time.h>
 #include <esp_transport.h>
 #include "miner_job.h"
@@ -15,6 +16,65 @@
 #define MAX_EXTRANONCE_2_LEN 32
 #define MAX_POOL_MESSAGE_LEN 256
 #define STRATUM_V1_MAX_JSON_LINE_SIZE 16384
+#define STRATUM_VERSION_ROLLING_MIN_BIT_COUNT 2
+
+// STRATUM_V1_submit_share() could not encode the request in its bounded
+// buffer. Kept distinct from the stratum_socket write results so callers do
+// not tear down a healthy connection for a local formatting failure.
+#define STRATUM_V1_SUBMIT_FORMAT_ERROR (-3)
+
+typedef enum
+{
+    STRATUM_V1_BIP310_PROBE = 0,
+    STRATUM_V1_BIP310_SKIP_ONCE,
+    STRATUM_V1_BIP310_EXPLICIT_LEGACY,
+} stratum_v1_bip310_mode_t;
+
+typedef struct
+{
+    stratum_v1_bip310_mode_t mode;
+} stratum_v1_bip310_state_t;
+
+#define STRATUM_V1_BIP310_STATE_INITIALIZER \
+    { .mode = STRATUM_V1_BIP310_PROBE }
+
+static inline bool STRATUM_V1_bip310_should_probe(
+    stratum_v1_bip310_state_t *state)
+{
+    if (state == NULL) {
+        return false;
+    }
+    if (state->mode == STRATUM_V1_BIP310_SKIP_ONCE) {
+        state->mode = STRATUM_V1_BIP310_PROBE;
+        return false;
+    }
+    return state->mode == STRATUM_V1_BIP310_PROBE;
+}
+
+static inline void STRATUM_V1_bip310_transient_failure(
+    stratum_v1_bip310_state_t *state)
+{
+    if (state != NULL &&
+        state->mode != STRATUM_V1_BIP310_EXPLICIT_LEGACY) {
+        state->mode = STRATUM_V1_BIP310_SKIP_ONCE;
+    }
+}
+
+static inline void STRATUM_V1_bip310_mark_unsupported(
+    stratum_v1_bip310_state_t *state)
+{
+    if (state != NULL) {
+        state->mode = STRATUM_V1_BIP310_EXPLICIT_LEGACY;
+    }
+}
+
+static inline void STRATUM_V1_bip310_mark_supported(
+    stratum_v1_bip310_state_t *state)
+{
+    if (state != NULL) {
+        state->mode = STRATUM_V1_BIP310_PROBE;
+    }
+}
 
 typedef enum
 {
@@ -57,6 +117,8 @@ typedef struct StratumApiV1Message
     int extranonce_2_len;
 
     int message_id;
+    bool has_message_id;
+    bool is_response;
     // Indicates the type of request the message represents.
     stratum_method method;
 
@@ -93,11 +155,22 @@ typedef struct RequestTiming
     bool tracking;
 } RequestTiming;
 
+typedef enum
+{
+    STRATUM_V1_RECEIVE_LINE,
+    STRATUM_V1_RECEIVE_INCOMPLETE,
+    STRATUM_V1_RECEIVE_TIMEOUT,
+    STRATUM_V1_RECEIVE_ERROR,
+} stratum_v1_receive_status_t;
+
 esp_transport_handle_t STRATUM_V1_transport_init(tls_mode tls, const char * cert);
 
 bool STRATUM_V1_initialize_buffer(void);
 
 char *STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport);
+
+stratum_v1_receive_status_t STRATUM_V1_receive_jsonrpc_line_status(
+    esp_transport_handle_t transport, char **line_out);
 
 int STRATUM_V1_subscribe(esp_transport_handle_t transport, int send_uid, const char * model);
 
@@ -107,7 +180,10 @@ void STRATUM_V1_reset_message(StratumApiV1Message *message);
 
 int STRATUM_V1_authorize(esp_transport_handle_t transport, int send_uid, const char *username, const char *pass);
 
-int STRATUM_V1_configure_version_rolling(esp_transport_handle_t transport, int send_uid, uint32_t * version_mask);
+int STRATUM_V1_configure_version_rolling(esp_transport_handle_t transport,
+                                         int send_uid,
+                                         uint32_t version_mask,
+                                         uint8_t min_bit_count);
 
 int STRATUM_V1_pong(esp_transport_handle_t transport, int message_id);
 
@@ -119,7 +195,20 @@ int STRATUM_V1_extranonce_subscribe(esp_transport_handle_t transport, int send_u
 
 int STRATUM_V1_submit_share(esp_transport_handle_t transport, int send_uid, const char *username, const char *job_id,
                             const char *extranonce_2, const uint32_t ntime, const uint32_t nonce,
-                            const uint32_t version_bits, uint64_t *out_sent_time_us);
+                            bool version_rolling_enabled, const uint32_t version_bits,
+                            uint64_t *out_sent_time_us);
+
+int STRATUM_V1_format_submit_request(char *buffer, size_t buffer_size,
+                                     int send_uid, const char *username,
+                                     const char *job_id,
+                                     const char *extranonce_2, uint32_t ntime,
+                                     uint32_t nonce,
+                                     bool version_rolling_enabled,
+                                     uint32_t version_bits);
+
+int STRATUM_V1_format_configure_request(char *buffer, size_t buffer_size,
+                                        int send_uid, uint32_t version_mask,
+                                        uint8_t min_bit_count);
 
 float STRATUM_V1_get_response_time_ms(int request_id, int64_t receive_time_us);
 

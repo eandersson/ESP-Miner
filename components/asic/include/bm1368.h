@@ -24,12 +24,17 @@ typedef struct __attribute__((__packed__))
 } BM1368_job;
 
 uint8_t BM1368_init(GlobalState * GLOBAL_STATE);
-void BM1368_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job);
-void BM1368_set_version_mask(uint32_t version_mask);
-int BM1368_set_max_baud(void);
-float BM1368_send_hash_frequency(float frequency);
+// Takes ownership of next_bm_job only when true is returned.
+bool BM1368_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
+                      uint32_t expected_generation);
+esp_err_t BM1368_set_version_mask(uint32_t version_mask);
+esp_err_t BM1368_set_max_baud(int *baud);
+esp_err_t BM1368_set_default_baud(int *baud);
+esp_err_t BM1368_send_hash_frequency(float frequency,
+                                     float *applied_frequency);
 task_result * BM1368_process_work(GlobalState * GLOBAL_STATE);
 void BM1368_read_registers(GlobalState * GLOBAL_STATE);
-void BM1368_set_nonce_space(double nonce_percent, float frequency, uint16_t asic_count, uint16_t cores);
+esp_err_t BM1368_set_nonce_space(double nonce_percent, float frequency,
+                                 uint16_t asic_count, uint16_t cores);
 
 #endif /* BM1368_H_ */

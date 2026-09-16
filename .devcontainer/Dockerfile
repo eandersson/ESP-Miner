@@ -1,5 +1,5 @@
 # Stage 1: Base image with ESP-IDF and common dependencies
-FROM espressif/idf:v6.0.2 AS base
+FROM espressif/idf:v6.1 AS base
 
 ARG DEBIAN_FRONTEND=nointeractive
 

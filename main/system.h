@@ -1,12 +1,15 @@
 #ifndef SYSTEM_H_
 #define SYSTEM_H_
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "miner_job.h"
 #include "stratum_api.h"
 
 typedef struct GlobalState GlobalState;
 typedef struct SystemModule SystemModule;
+typedef struct PoolConfig PoolConfig;
 
 void SYSTEM_check_firmware_migration(void);
 void SYSTEM_reset_custom_www(void);
@@ -37,5 +40,13 @@ double SYSTEM_noinit_get_total_hashes();
 double SYSTEM_noinit_get_total_log2_work();
 void SYSTEM_load_pool_from_nvs(GlobalState * GLOBAL_STATE, int i);
 void SYSTEM_reload_pool_config(GlobalState * GLOBAL_STATE);
+
+bool SYSTEM_get_pool_config_snapshot(GlobalState *GLOBAL_STATE, int index,
+                                     PoolConfig *snapshot);
+void SYSTEM_release_pool_config_snapshot(PoolConfig *snapshot);
+bool SYSTEM_get_pool_protocols(GlobalState *GLOBAL_STATE, int primary_index,
+                               int fallback_index,
+                               stratum_protocol_t *primary_protocol,
+                               stratum_protocol_t *fallback_protocol);
 
 #endif /* SYSTEM_H_ */

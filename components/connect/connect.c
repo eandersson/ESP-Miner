@@ -1,10 +1,13 @@
 #include <string.h>
+#include <stdint.h>
+#include <stdatomic.h>
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "mdns.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_wnm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -24,6 +27,14 @@
 
 // Maximum number of access points to scan
 #define MAX_AP_COUNT 20
+#define WIFI_SCAN_ACTIVE_MAX_MS 100U
+#define WIFI_SCAN_PASSIVE_MS 300U
+#define WIFI_SCAN_HOME_DWELL_MS 30U
+#define WIFI_RECONNECT_INITIAL_DELAY_MS 250
+#define WIFI_RECONNECT_MAX_DELAY_MS 5000
+#define WIFI_ROAM_RSSI_THRESHOLD_DBM (-72)
+#define WIFI_ROAM_REARM_DELAY_MS (5U * 60U * 1000U)
+#define WIFI_ROAM_DEFER_DELAY_MS 60000U
 
 #if CONFIG_ESP_WPA3_SAE_PWE_HUNT_AND_PECK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
@@ -59,18 +70,164 @@
 static const char * TAG = "connect";
 
 static TimerHandle_t ip_acquire_timer = NULL;
+static TimerHandle_t reconnect_timer = NULL;
+static TimerHandle_t roam_rearm_timer = NULL;
+static StaticTimer_t roam_rearm_timer_storage;
+static GlobalState *wifi_global_state = NULL;
 
-static bool is_scanning = false;
+static atomic_bool is_scanning;
 static uint16_t ap_number = 0;
 static wifi_ap_record_t ap_info[MAX_AP_COUNT];
-static int s_retry_num = 0;
-static int clients_connected_to_ap = 0;
+static atomic_int s_retry_num;
+static atomic_int clients_connected_to_ap;
+static atomic_bool roam_cooldown_active;
 static bool mdns_initialized = false;
 static bool mdns_init_in_progress = false;
 
 static const char *get_wifi_reason_string(int reason);
 static void wifi_softap_on(void);
 static void wifi_softap_off(void);
+static void schedule_wifi_reconnect(GlobalState *GLOBAL_STATE,
+                                    uint32_t delay_ms);
+static void schedule_wifi_roam_rearm(GlobalState *GLOBAL_STATE,
+                                     uint32_t delay_ms);
+
+static void arm_wifi_roam_trigger(GlobalState *GLOBAL_STATE)
+{
+    if (GLOBAL_STATE == NULL ||
+        !GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
+        return;
+    }
+
+    esp_err_t err = esp_wifi_set_rssi_threshold(
+        WIFI_ROAM_RSSI_THRESHOLD_DBM);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to arm Wi-Fi roaming threshold: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGD(TAG, "Wi-Fi mesh steering armed below %d dBm",
+             WIFI_ROAM_RSSI_THRESHOLD_DBM);
+}
+
+static void roam_rearm_timer_callback(TimerHandle_t timer)
+{
+    GlobalState *GLOBAL_STATE = (GlobalState *)pvTimerGetTimerID(timer);
+    if (GLOBAL_STATE == NULL) {
+        atomic_store(&roam_cooldown_active, false);
+        return;
+    }
+
+    if (atomic_load(&is_scanning) ||
+        atomic_load(&clients_connected_to_ap) > 0 ||
+        GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update) {
+        // Timer callbacks must not block on the timer command queue. If this
+        // zero-wait retry fails, re-arm the RSSI event so its event-loop path
+        // can retry once with the normal bounded queue wait.
+        if (xTimerChangePeriod(timer,
+                               pdMS_TO_TICKS(WIFI_ROAM_DEFER_DELAY_MS),
+                               0) != pdPASS) {
+            ESP_LOGW(TAG, "Failed to defer Wi-Fi roaming rearm");
+            atomic_store(&roam_cooldown_active, false);
+            arm_wifi_roam_trigger(GLOBAL_STATE);
+        }
+        return;
+    }
+
+    // Clear first, then attempt to arm. This pairs safely with GOT_IP: either
+    // this call sees the new connection, or GOT_IP sees the cleared cooldown.
+    atomic_store(&roam_cooldown_active, false);
+    arm_wifi_roam_trigger(GLOBAL_STATE);
+}
+
+static void schedule_wifi_roam_rearm(GlobalState *GLOBAL_STATE,
+                                     uint32_t delay_ms)
+{
+    if (GLOBAL_STATE == NULL) {
+        return;
+    }
+
+    if (roam_rearm_timer == NULL) {
+        roam_rearm_timer = xTimerCreateStatic(
+            "wifi_roam_rearm", pdMS_TO_TICKS(delay_ms), pdFALSE,
+            GLOBAL_STATE, roam_rearm_timer_callback,
+            &roam_rearm_timer_storage);
+        if (roam_rearm_timer == NULL) {
+            ESP_LOGE(TAG, "Failed to create Wi-Fi roaming rearm timer");
+            atomic_store(&roam_cooldown_active, false);
+            return;
+        }
+    }
+
+    if (xTimerChangePeriod(roam_rearm_timer, pdMS_TO_TICKS(delay_ms),
+                           pdMS_TO_TICKS(10)) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to schedule Wi-Fi roaming rearm");
+        atomic_store(&roam_cooldown_active, false);
+    }
+}
+
+static uint32_t wifi_reconnect_delay_ms(int attempt)
+{
+    uint32_t delay_ms = WIFI_RECONNECT_INITIAL_DELAY_MS;
+    for (int i = 1; i < attempt && delay_ms < WIFI_RECONNECT_MAX_DELAY_MS; i++) {
+        delay_ms *= 2;
+    }
+    return delay_ms > WIFI_RECONNECT_MAX_DELAY_MS
+               ? WIFI_RECONNECT_MAX_DELAY_MS
+               : delay_ms;
+}
+
+static void reconnect_timer_callback(TimerHandle_t timer)
+{
+    GlobalState *GLOBAL_STATE = (GlobalState *)pvTimerGetTimerID(timer);
+    if (GLOBAL_STATE == NULL ||
+        GLOBAL_STATE->SYSTEM_MODULE.is_connected ||
+        atomic_load(&is_scanning) ||
+        atomic_load(&clients_connected_to_ap) > 0) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Retrying Wi-Fi connection...");
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi reconnect request failed: %s",
+                 esp_err_to_name(err));
+        schedule_wifi_reconnect(GLOBAL_STATE,
+                                WIFI_RECONNECT_MAX_DELAY_MS);
+    }
+}
+
+static void cancel_wifi_reconnect(void)
+{
+    if (reconnect_timer != NULL) {
+        xTimerStop(reconnect_timer, 0);
+    }
+}
+
+static void schedule_wifi_reconnect(GlobalState *GLOBAL_STATE, uint32_t delay_ms)
+{
+    if (GLOBAL_STATE == NULL ||
+        GLOBAL_STATE->SYSTEM_MODULE.is_connected ||
+        GLOBAL_STATE->SYSTEM_MODULE.ssid == NULL ||
+        GLOBAL_STATE->SYSTEM_MODULE.ssid[0] == '\0') {
+        return;
+    }
+
+    if (reconnect_timer == NULL) {
+        reconnect_timer = xTimerCreate(
+            "wifi_reconnect", pdMS_TO_TICKS(WIFI_RECONNECT_INITIAL_DELAY_MS),
+            pdFALSE, GLOBAL_STATE, reconnect_timer_callback);
+        if (reconnect_timer == NULL) {
+            ESP_LOGE(TAG, "Failed to create Wi-Fi reconnect timer");
+            return;
+        }
+    }
+
+    if (xTimerChangePeriod(reconnect_timer, pdMS_TO_TICKS(delay_ms), 0) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to schedule Wi-Fi reconnect");
+    }
+}
 
 esp_err_t wifi_apply_hostname(const char *hostname)
 {
@@ -318,44 +475,70 @@ esp_err_t get_wifi_current_rssi(int8_t *rssi)
 // Function to scan for available WiFi networks
 esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
 {
-    if (is_scanning) {
+    if (ap_records == NULL || ap_count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool expected_not_scanning = false;
+    if (!atomic_compare_exchange_strong(
+            &is_scanning, &expected_not_scanning, true)) {
         ESP_LOGW(TAG, "Scan already in progress");
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG, "Starting Wi-Fi scan!");
-    is_scanning = true;
-
-    wifi_ap_record_t current_ap_info;
-    if (esp_wifi_sta_get_ap_info(&current_ap_info) != ESP_OK) {
-        ESP_LOGI(TAG, "Forcing disconnect so that we can scan!");
-        esp_wifi_disconnect();
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
+    cancel_wifi_reconnect();
 
      wifi_scan_config_t scan_config = {
         .ssid = 0,
         .bssid = 0,
         .channel = 0,
-        .show_hidden = false
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active = {
+            .min = 0,
+            .max = WIFI_SCAN_ACTIVE_MAX_MS,
+        },
+        .scan_time.passive = WIFI_SCAN_PASSIVE_MS,
+        .home_chan_dwell_time = WIFI_SCAN_HOME_DWELL_MS,
     };
 
-    esp_err_t err = esp_wifi_scan_start(&scan_config, false);
+    // Fetch application-owned results synchronously here. The shared Wi-Fi
+    // event handler deliberately never consumes SCAN_DONE records because
+    // connection and 802.11v supplicant scans use the same driver-owned list.
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi scan start failed with error: %s", esp_err_to_name(err));
-        is_scanning = false;
+        atomic_store(&is_scanning, false);
+        schedule_wifi_reconnect(wifi_global_state,
+                                wifi_reconnect_delay_ms(
+                                    atomic_load(&s_retry_num)));
         return err;
     }
 
-    uint16_t retries_remaining = 10;
-    while (is_scanning) {
-        retries_remaining--;
-        if (retries_remaining == 0) {
-            is_scanning = false;
-            return ESP_FAIL;
-        }
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    uint16_t found_ap_count = 0;
+    err = esp_wifi_scan_get_ap_num(&found_ap_count);
+    if (err == ESP_OK) {
+        ap_number = found_ap_count > MAX_AP_COUNT
+                        ? MAX_AP_COUNT
+                        : found_ap_count;
+        ESP_LOGI(TAG, "Wi-Fi Scan Done (%u found, keeping %u)",
+                 found_ap_count, ap_number);
+        err = esp_wifi_scan_get_ap_records(&ap_number, ap_info);
     }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to retrieve Wi-Fi scan results: %s",
+                 esp_err_to_name(err));
+        esp_wifi_clear_ap_list();
+        ap_number = 0;
+    }
+
+    // Publish the completed records before allowing another scan or a
+    // deferred reconnect to proceed.
+    atomic_store(&is_scanning, false);
+    schedule_wifi_reconnect(
+        wifi_global_state,
+        wifi_reconnect_delay_ms(atomic_load(&s_retry_num)));
 
     ESP_LOGD(TAG, "Wi-Fi networks found: %d", ap_number);
     if (ap_number == 0) {
@@ -391,15 +574,66 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
     if (event_base == WIFI_EVENT)
     {
         if (event_id == WIFI_EVENT_SCAN_DONE) {
-            esp_wifi_scan_get_ap_num(&ap_number);
-            ESP_LOGI(TAG, "Wi-Fi Scan Done");
-            if (esp_wifi_scan_get_ap_records(&ap_number, ap_info) != ESP_OK) {
-                ESP_LOGI(TAG, "Failed esp_wifi_scan_get_ap_records");
-            }
-            is_scanning = false;
+            // Never consume results here: this event can belong to a driver
+            // or 802.11v supplicant scan sharing the driver-owned result list.
+            // wifi_scan() uses blocked mode and synchronously retrieves only
+            // the application scan it initiated.
+            ESP_LOGD(TAG, "Wi-Fi scan completed");
+            return;
         }
 
-        if (is_scanning) {
+        if (event_id == WIFI_EVENT_STA_BSS_RSSI_LOW) {
+            wifi_event_bss_rssi_low_t *event =
+                (wifi_event_bss_rssi_low_t *)event_data;
+            int32_t rssi = event != NULL ? event->rssi : INT32_MIN;
+
+            // The threshold event is one-shot. Rate-limit requests so a mesh
+            // with no better candidate cannot cause scan or roam churn.
+            if (atomic_exchange(&roam_cooldown_active, true)) {
+                return;
+            }
+
+            if (atomic_load(&is_scanning) ||
+                atomic_load(&clients_connected_to_ap) > 0 ||
+                GLOBAL_STATE->SYSTEM_MODULE.is_firmware_update) {
+                ESP_LOGI(TAG,
+                         "Deferring Wi-Fi mesh steering at RSSI %ld dBm",
+                         (long)rssi);
+                schedule_wifi_roam_rearm(GLOBAL_STATE,
+                                         WIFI_ROAM_DEFER_DELAY_MS);
+                return;
+            }
+
+            if (esp_wnm_is_btm_supported_connection()) {
+                int query_result =
+                    esp_wnm_send_bss_transition_mgmt_query(
+                        REASON_RSSI, NULL, 0);
+                if (query_result == 0) {
+                    ESP_LOGI(TAG,
+                             "RSSI %ld dBm; requested healthier mesh AP via 802.11v",
+                             (long)rssi);
+                } else {
+                    ESP_LOGW(TAG,
+                             "RSSI %ld dBm; 802.11v steering request failed (%d)",
+                             (long)rssi, query_result);
+                }
+            } else {
+                ESP_LOGI(TAG,
+                         "RSSI %ld dBm; mesh AP does not support 802.11v steering",
+                         (long)rssi);
+            }
+
+            schedule_wifi_roam_rearm(GLOBAL_STATE,
+                                     WIFI_ROAM_REARM_DELAY_MS);
+            return;
+        }
+
+        if (event_id != WIFI_EVENT_STA_DISCONNECTED &&
+            event_id != WIFI_EVENT_AP_START &&
+            event_id != WIFI_EVENT_AP_STOP &&
+            event_id != WIFI_EVENT_AP_STACONNECTED &&
+            event_id != WIFI_EVENT_AP_STADISCONNECTED &&
+            atomic_load(&is_scanning)) {
             ESP_LOGI(TAG, "Still scanning, ignore wifi event.");
             return;
         }
@@ -407,12 +641,14 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         if (event_id == WIFI_EVENT_STA_START) {
             ESP_LOGI(TAG, "Connecting...");
             strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connecting...");
+            cancel_wifi_reconnect();
             esp_wifi_connect();
         }
 
         if (event_id == WIFI_EVENT_STA_CONNECTED) {
             ESP_LOGI(TAG, "Acquiring IP...");
             strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Acquiring IP...");
+            cancel_wifi_reconnect();
 
             if (ip_acquire_timer == NULL) {
                 ip_acquire_timer = xTimerCreate("ip_acquire_timer", pdMS_TO_TICKS(30000), pdFALSE, (void *)GLOBAL_STATE, ip_timeout_callback);
@@ -424,34 +660,41 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
 
         if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
             wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
-            if (event->reason == WIFI_REASON_ROAMING) {
-                ESP_LOGI(TAG, "We are roaming, nothing to do");
+            GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
+            if (ip_acquire_timer != NULL) {
+                xTimerStop(ip_acquire_timer, 0);
+            }
+
+            if (event->reason == WIFI_REASON_ROAMING ||
+                event->reason == WIFI_REASON_BSS_TRANSITION_DISASSOC) {
+                ESP_LOGI(TAG,
+                         "802.11v transition in progress; letting the supplicant reconnect");
+                // Normally STA_CONNECTED cancels this before it fires. Keep a
+                // delayed watchdog in case the supplicant's internal connect
+                // request fails without producing another Wi-Fi event.
+                schedule_wifi_reconnect(GLOBAL_STATE,
+                                        WIFI_RECONNECT_MAX_DELAY_MS);
                 return;
             }
 
             ESP_LOGI(TAG, "Could not connect to '%.*s' [rssi %d]: reason %d", event->ssid_len, event->ssid, event->rssi, event->reason);
-            if (clients_connected_to_ap > 0) {
+
+            if (atomic_load(&clients_connected_to_ap) > 0) {
                 ESP_LOGI(TAG, "Client(s) connected to AP, not retrying...");
                 snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "Config AP connected!");
                 return;
             }
 
-            GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
             wifi_softap_on();
 
-            snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (Error %d, retry #%d)", get_wifi_reason_string(event->reason), event->reason, s_retry_num);
+            int retry_num = atomic_fetch_add(&s_retry_num, 1) + 1;
+            snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (Error %d, retry #%d)", get_wifi_reason_string(event->reason), event->reason, retry_num);
             ESP_LOGI(TAG, "Wi-Fi status: %s", GLOBAL_STATE->SYSTEM_MODULE.wifi_status);
 
-            // Wait a little
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retrying Wi-Fi connection...");
-            esp_wifi_connect();
-
-            if (ip_acquire_timer != NULL) {
-                xTimerStop(ip_acquire_timer, 0);
-            }            
+            uint32_t retry_delay_ms = wifi_reconnect_delay_ms(retry_num);
+            ESP_LOGI(TAG, "Scheduling Wi-Fi reconnect in %lu ms",
+                     (unsigned long)retry_delay_ms);
+            schedule_wifi_reconnect(GLOBAL_STATE, retry_delay_ms);
         }
         
         if (event_id == WIFI_EVENT_AP_START) {
@@ -462,14 +705,20 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         if (event_id == WIFI_EVENT_AP_STOP) {
             ESP_LOGI(TAG, "Configuration Access Point disabled");
             GLOBAL_STATE->SYSTEM_MODULE.ap_enabled = false;
+            atomic_store(&clients_connected_to_ap, 0);
         }
 
         if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-            clients_connected_to_ap += 1;
+            atomic_fetch_add(&clients_connected_to_ap, 1);
         }
         
         if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-            clients_connected_to_ap -= 1;
+            int previous_clients = atomic_fetch_sub(&clients_connected_to_ap, 1);
+            if (previous_clients <= 1) {
+                atomic_store(&clients_connected_to_ap, 0);
+                schedule_wifi_reconnect(
+                    GLOBAL_STATE, WIFI_RECONNECT_INITIAL_DELAY_MS);
+            }
         }
     }
 
@@ -478,7 +727,8 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         snprintf(GLOBAL_STATE->SYSTEM_MODULE.ip_addr_str, IP4ADDR_STRLEN_MAX, IPSTR, IP2STR(&event->ip_info.ip));
 
         ESP_LOGI(TAG, "IPv4 Address: %s", GLOBAL_STATE->SYSTEM_MODULE.ip_addr_str);
-        s_retry_num = 0;
+        atomic_store(&s_retry_num, 0);
+        cancel_wifi_reconnect();
 
         if (ip_acquire_timer != NULL) {
             xTimerStop(ip_acquire_timer, 0);
@@ -488,6 +738,10 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
 
         ESP_LOGI(TAG, "Connected to SSID: %s", GLOBAL_STATE->SYSTEM_MODULE.ssid);
         strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connected!");
+
+        if (!atomic_load(&roam_cooldown_active)) {
+            arm_wifi_roam_trigger(GLOBAL_STATE);
+        }
 
         wifi_softap_off();
         
@@ -678,6 +932,7 @@ esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
                 .rm_enabled = 1,
                 .scan_method = WIFI_ALL_CHANNEL_SCAN,
                 .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
+                .failure_retry_cnt = 2,
                 .pmf_cfg =
                     {
                         .capable = true,
@@ -717,6 +972,12 @@ esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
 
 void wifi_init(GlobalState * GLOBAL_STATE)
 {
+    wifi_global_state = GLOBAL_STATE;
+    atomic_store(&is_scanning, false);
+    atomic_store(&clients_connected_to_ap, 0);
+    atomic_store(&s_retry_num, 0);
+    atomic_store(&roam_cooldown_active, false);
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -736,7 +997,14 @@ void wifi_init(GlobalState * GLOBAL_STATE)
     /* Initialize AP */
     wifi_init_softap(GLOBAL_STATE);
 
-    GLOBAL_STATE->SYSTEM_MODULE.ssid = nvs_config_get_string(NVS_CONFIG_WIFI_SSID);
+    if (GLOBAL_STATE->SYSTEM_MODULE.ssid == NULL) {
+        GLOBAL_STATE->SYSTEM_MODULE.ssid =
+            nvs_config_get_string(NVS_CONFIG_WIFI_SSID);
+    }
+    if (GLOBAL_STATE->SYSTEM_MODULE.ssid == NULL) {
+        ESP_LOGE(TAG, "Unable to load Wi-Fi SSID");
+        return;
+    }
 
     /* Skip connection if SSID is null */
     if (strlen(GLOBAL_STATE->SYSTEM_MODULE.ssid) == 0) {
@@ -752,6 +1020,14 @@ void wifi_init(GlobalState * GLOBAL_STATE)
     } else {
 
         char * wifi_pass = nvs_config_get_string(NVS_CONFIG_WIFI_PASS);
+        if (wifi_pass == NULL) {
+            ESP_LOGW(TAG, "Unable to load Wi-Fi password, using an empty password");
+            wifi_pass = strdup("");
+            if (wifi_pass == NULL) {
+                ESP_LOGE(TAG, "Unable to allocate empty Wi-Fi password");
+                return;
+            }
+        }
 
         /* Initialize STA */
         ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");

@@ -11,6 +11,7 @@
 #include "connect.h"
 #include "system.h"
 #include <sys/socket.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #define TAG "stratum_task"
@@ -23,6 +24,29 @@
 static GlobalState *s_global_state = NULL;
 static volatile bool s_should_reconnect = false;
 static TaskHandle_t s_heartbeat_task_handle = NULL;
+static atomic_uint_fast32_t s_next_session_id = 1;
+
+uint32_t stratum_next_session_id(void)
+{
+    uint32_t id;
+    do {
+        id = (uint32_t)atomic_fetch_add(&s_next_session_id, 1);
+    } while (id == 0);
+    return id;
+}
+
+// True when the pool slot has a URL and port. Reads through the locked
+// snapshot so a concurrent pool edit cannot free the strings underneath.
+static bool pool_is_configured(GlobalState *gs, uint16_t pool_idx)
+{
+    PoolConfig pool = {0};
+    if (!SYSTEM_get_pool_config_snapshot(gs, pool_idx, &pool)) {
+        return false;
+    }
+    bool configured = pool.url != NULL && pool.url[0] != '\0' && pool.port != 0;
+    SYSTEM_release_pool_config_snapshot(&pool);
+    return configured;
+}
 
 void stratum_request_reconnect(void)
 {
@@ -48,10 +72,14 @@ bool stratum_reconnect_requested(void)
 bool stratum_probe_pool(GlobalState *gs, uint16_t pool_idx)
 {
     if (!gs || pool_idx >= MAX_POOLS) return false;
-    const PoolConfig *pool = &gs->SYSTEM_MODULE.pools[pool_idx];
-    if (!pool->url || pool->url[0] == '\0' || pool->port == 0) return false;
+    PoolConfig pool = {0};
+    if (!SYSTEM_get_pool_config_snapshot(gs, pool_idx, &pool)) return false;
+    bool configured = pool.url != NULL && pool.url[0] != '\0' && pool.port != 0;
+    stratum_protocol_t protocol = pool.protocol;
+    SYSTEM_release_pool_config_snapshot(&pool);
+    if (!configured) return false;
 
-    if (pool->protocol == STRATUM_PROTOCOL_V2) {
+    if (protocol == STRATUM_PROTOCOL_V2) {
         return stratum_v2_probe_pool(gs, pool_idx);
     }
     return stratum_v1_probe_pool(gs, pool_idx);
@@ -84,8 +112,7 @@ static void stratum_heartbeat_task(void *pvParameters)
             wifi_is_connected()) {
 
             uint16_t prim_idx = gs->SYSTEM_MODULE.primary_pool_index;
-            const char *url = gs->SYSTEM_MODULE.pools[prim_idx].url;
-            ESP_LOGI(TAG, "Heartbeat: probing primary pool %u (%s)...", prim_idx, url ? url : "unknown");
+            ESP_LOGI(TAG, "Heartbeat: probing primary pool %u...", prim_idx);
             if (stratum_probe_pool(gs, prim_idx)) {
                 ESP_LOGI(TAG, "Primary pool %u is back online! Switching from fallback.", prim_idx);
                 gs->SYSTEM_MODULE.is_using_fallback = false;
@@ -163,8 +190,7 @@ void stratum_task(void *pvParameters)
 
         uint16_t prim_idx = GLOBAL_STATE->SYSTEM_MODULE.primary_pool_index;
         uint16_t sec_idx = GLOBAL_STATE->SYSTEM_MODULE.secondary_pool_index;
-        bool has_fallback = (GLOBAL_STATE->SYSTEM_MODULE.pools[sec_idx].url != NULL &&
-                             GLOBAL_STATE->SYSTEM_MODULE.pools[sec_idx].url[0] != '\0');
+        bool has_fallback = pool_is_configured(GLOBAL_STATE, sec_idx);
 
         int threshold = has_fallback ? 2 : 1;
 
@@ -211,7 +237,9 @@ void stratum_task(void *pvParameters)
         }
 
         uint16_t active_idx = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? sec_idx : prim_idx;
-        stratum_protocol_t protocol = GLOBAL_STATE->SYSTEM_MODULE.pools[active_idx].protocol;
+        stratum_protocol_t protocol = STRATUM_PROTOCOL_V1;
+        stratum_protocol_t unused_protocol = STRATUM_PROTOCOL_V1;
+        SYSTEM_get_pool_protocols(GLOBAL_STATE, active_idx, active_idx, &protocol, &unused_protocol);
 
         s_running_pool_idx = active_idx;
         s_should_reconnect = false;
@@ -232,9 +260,8 @@ void stratum_task(void *pvParameters)
             s_should_reconnect = false;
         } else {
             retry_attempts++;
-            ESP_LOGW(TAG, "Pool %u (%s) connection failed (attempt %d/%d)",
-                     active_idx, GLOBAL_STATE->SYSTEM_MODULE.pools[active_idx].url,
-                     retry_attempts, MAX_RETRY_ATTEMPTS);
+            ESP_LOGW(TAG, "Pool %u connection failed (attempt %d/%d)",
+                     active_idx, retry_attempts, MAX_RETRY_ATTEMPTS);
 
             if (retry_attempts >= MAX_RETRY_ATTEMPTS) {
                 consecutive_pool_failures++;
@@ -242,9 +269,9 @@ void stratum_task(void *pvParameters)
 
                 if (has_fallback) {
                     GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback = !GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback;
-                    ESP_LOGI(TAG, "Switching to %s pool (%s)",
+                    ESP_LOGI(TAG, "Switching to %s pool %u",
                              GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? "fallback" : "primary",
-                             GLOBAL_STATE->SYSTEM_MODULE.pools[GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? sec_idx : prim_idx].url);
+                             GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? sec_idx : prim_idx);
                     reset_share_stats(GLOBAL_STATE);
                 }
             }

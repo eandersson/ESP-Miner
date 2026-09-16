@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <math.h>
 #include "esp_log.h"
 #include "esp_check.h"
 
@@ -102,6 +103,9 @@ uint16_t EMC2101_get_fan_speed(void)
     // ESP_LOGI(TAG, "Raw Fan Speed = %02X %02X", tach_msb, tach_lsb);
 
     reading = tach_lsb | (tach_msb << 8);
+    if (reading == 0 || reading == UINT16_MAX) {
+        return 0;
+    }
     RPM = 5400000 / reading;
 
     // ESP_LOGI(TAG, "Fan Speed = %d RPM", RPM);
@@ -120,13 +124,13 @@ float EMC2101_get_external_temp(void)
     err = i2c_bitaxe_register_read(emc2101_dev_handle, EMC2101_EXTERNAL_TEMP_MSB, &temp_msb, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read external temperature MSB: %s", esp_err_to_name(err));
-        return -1;
+        return NAN;
     }
     
     err = i2c_bitaxe_register_read(emc2101_dev_handle, EMC2101_EXTERNAL_TEMP_LSB, &temp_lsb, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read external temperature LSB: %s", esp_err_to_name(err));
-        return -1;
+        return NAN;
     }
     
     // Combine MSB and LSB, and then right shift to get 11 bits
@@ -143,9 +147,11 @@ float EMC2101_get_external_temp(void)
 
     if (signed_reading == EMC2101_TEMP_FAULT_OPEN_CIRCUIT) {
         ESP_LOGE(TAG, "EMC2101 TEMP_FAULT_OPEN_CIRCUIT: %04X", signed_reading);
+        return NAN;
     }
     if (signed_reading == EMC2101_TEMP_FAULT_SHORT) {
         ESP_LOGE(TAG, "EMC2101 TEMP_FAULT_SHORT: %04X", signed_reading);
+        return NAN;
     }
 
     // Convert the signed reading to temperature in Celsius
@@ -162,7 +168,7 @@ float EMC2101_get_internal_temp(void)
     err = i2c_bitaxe_register_read(emc2101_dev_handle, EMC2101_INTERNAL_TEMP, &temp, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read internal temperature: %s", esp_err_to_name(err));
-        return -1;
+        return NAN;
     }
     return (float) temp + temp_offset;
 }

@@ -16,6 +16,8 @@
 #include "libbase58.h"
 #include "device_config.h"
 #include "esp_heap_caps.h"
+#include "asic_result_task.h"
+#include "miner_job.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -27,6 +29,8 @@
 static const char *TAG = "stratum_v2";
 
 static sv2_conn_t *s_v2_conn = NULL;
+// Connection that issued the current jobs; guarded by transport_mutex.
+static uint32_t s_v2_session_id = 0;
 
 static bool add_active_job_id(uint32_t *active_job_ids, int *count, uint32_t job_id)
 {
@@ -104,6 +108,7 @@ void stratum_v2_close_connection(GlobalState *GLOBAL_STATE)
     GLOBAL_STATE->transport = NULL;
     sv2_conn_t *conn = s_v2_conn;
     s_v2_conn = NULL;
+    s_v2_session_id = 0;
 
     if (conn && conn->noise_ctx) {
         sv2_noise_destroy(conn->noise_ctx);
@@ -170,6 +175,10 @@ int stratum_v2_submit_share(GlobalState *GLOBAL_STATE, const bm_job *active_job,
         pthread_mutex_unlock(&GLOBAL_STATE->transport_mutex);
         return -1;
     }
+    if (active_job->session_id != s_v2_session_id) {
+        pthread_mutex_unlock(&GLOBAL_STATE->transport_mutex);
+        return STRATUM_V2_SUBMIT_STALE;
+    }
 
     uint32_t sequence_number = conn->sequence_number++;
     uint8_t buf[SV2_SUBMIT_SHARES_MAX_FRAME_SIZE];
@@ -191,13 +200,31 @@ int stratum_v2_submit_share(GlobalState *GLOBAL_STATE, const bm_job *active_job,
         if (sent_time_us) {
             *sent_time_us = esp_timer_get_time();
         }
+    } else {
+        // A failed send may have advanced the Noise nonce or left a partial
+        // frame on the wire; the connection cannot be reused.
+        int sock = esp_transport_get_socket(transport);
+        if (sock >= 0) {
+            shutdown(sock, SHUT_RDWR);
+        }
     }
     pthread_mutex_unlock(&GLOBAL_STATE->transport_mutex);
     return ret;
 }
 
-static void stratum_v2_handle_new_extended_mining_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
-                                                       const uint8_t *payload, uint32_t len)
+static void stratum_v2_publish_slot(GlobalState *GLOBAL_STATE, miner_job_t *job, uint8_t slot)
+{
+    job->session_id = s_v2_session_id;
+    job->pool_generation = ASIC_result_task_get_pool_generation();
+    GLOBAL_STATE->SYSTEM_MODULE.work_received++;
+    SYSTEM_notify_new_ntime(GLOBAL_STATE, job->ntime);
+    if (GLOBAL_STATE->create_jobs_task_handle) {
+        xTaskNotify(GLOBAL_STATE->create_jobs_task_handle, slot, eSetValueWithOverwrite);
+    }
+}
+
+static void stratum_v2_handle_new_extended_mining_job_locked(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
+                                                              const uint8_t *payload, uint32_t len)
 {
     if (len < 8) {
         ESP_LOGE(TAG, "NewExtendedMiningJob payload too short (%lu bytes)", (unsigned long)len);
@@ -246,12 +273,16 @@ static void stratum_v2_handle_new_extended_mining_job(GlobalState *GLOBAL_STATE,
         job->nbits = conn->prev_hash_nbits;
         job->clean_jobs = false;
 
-        GLOBAL_STATE->SYSTEM_MODULE.work_received++;
-        SYSTEM_notify_new_ntime(GLOBAL_STATE, job->ntime);
-        if (GLOBAL_STATE->create_jobs_task_handle) {
-            xTaskNotify(GLOBAL_STATE->create_jobs_task_handle, slot, eSetValueWithOverwrite);
-        }
+        stratum_v2_publish_slot(GLOBAL_STATE, job, slot);
     }
+}
+
+static void stratum_v2_handle_new_extended_mining_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
+                                                       const uint8_t *payload, uint32_t len)
+{
+    miner_job_lock();
+    stratum_v2_handle_new_extended_mining_job_locked(GLOBAL_STATE, conn, payload, len);
+    miner_job_unlock();
 }
 
 static void stratum_v2_handle_new_mining_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
@@ -275,6 +306,7 @@ static void stratum_v2_handle_new_mining_job(GlobalState *GLOBAL_STATE, sv2_conn
     }
 
     uint8_t slot = (uint8_t)(job_id % MINER_JOB_POOL_SIZE);
+    miner_job_lock();
     miner_job_t *job = miner_job_get_slot(slot);
     uint8_t *p_buf = job->coinbase_prefix;
     uint8_t *s_buf = job->coinbase_suffix;
@@ -294,6 +326,7 @@ static void stratum_v2_handle_new_mining_job(GlobalState *GLOBAL_STATE, sv2_conn
     if (has_min_ntime && conn->has_prev_hash) {
         if (!add_active_job_id(conn->active_job_ids, &conn->active_job_ids_count, job_id)) {
             ESP_LOGW(TAG, "Ignoring duplicate V2 job %s", job->job_id);
+            miner_job_unlock();
             return;
         }
         memcpy(job->prev_hash, conn->prev_hash, 32);
@@ -301,12 +334,9 @@ static void stratum_v2_handle_new_mining_job(GlobalState *GLOBAL_STATE, sv2_conn
         job->nbits = conn->prev_hash_nbits;
         job->clean_jobs = false;
 
-        GLOBAL_STATE->SYSTEM_MODULE.work_received++;
-        SYSTEM_notify_new_ntime(GLOBAL_STATE, job->ntime);
-        if (GLOBAL_STATE->create_jobs_task_handle) {
-            xTaskNotify(GLOBAL_STATE->create_jobs_task_handle, slot, eSetValueWithOverwrite);
-        }
+        stratum_v2_publish_slot(GLOBAL_STATE, job, slot);
     }
+    miner_job_unlock();
 }
 
 static void stratum_v2_handle_set_new_prev_hash(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
@@ -332,11 +362,17 @@ static void stratum_v2_handle_set_new_prev_hash(GlobalState *GLOBAL_STATE, sv2_c
     conn->prev_hash_nbits = nbits;
     conn->has_prev_hash = true;
 
+    // SetNewPrevHash is the SV2 clean-work event: every older job is stale,
+    // even when the referenced job is missing from the pending slots.
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
+
     uint8_t slot = (uint8_t)(job_id % MINER_JOB_POOL_SIZE);
     miner_job_t *job = miner_job_get_slot(slot);
 
+    // Only this task writes SV2 slots, so reading its own slot needs no lock.
     if ((conn->pending_jobs_valid & (1U << slot)) &&
         (uint32_t)strtoul(job->job_id, NULL, 10) == job_id) {
+        miner_job_lock();
         clear_active_job_ids(conn->active_job_ids, &conn->active_job_ids_count);
         add_active_job_id(conn->active_job_ids, &conn->active_job_ids_count, job_id);
 
@@ -357,11 +393,8 @@ static void stratum_v2_handle_set_new_prev_hash(GlobalState *GLOBAL_STATE, sv2_c
             job->extranonce2_len = conn->extranonce_size;
         }
 
-        GLOBAL_STATE->SYSTEM_MODULE.work_received++;
-        SYSTEM_notify_new_ntime(GLOBAL_STATE, job->ntime);
-        if (GLOBAL_STATE->create_jobs_task_handle) {
-            xTaskNotify(GLOBAL_STATE->create_jobs_task_handle, slot, eSetValueWithOverwrite);
-        }
+        stratum_v2_publish_slot(GLOBAL_STATE, job, slot);
+        miner_job_unlock();
     } else {
         ESP_LOGW(TAG, "SetNewPrevHash for unknown job_id %lu", (unsigned long)job_id);
     }
@@ -402,18 +435,23 @@ esp_err_t stratum_v2_run(GlobalState *GLOBAL_STATE, uint16_t pool_idx)
         return ESP_ERR_INVALID_ARG;
     }
 
-    PoolConfig *pool = &GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx];
+    PoolConfig pool = {0};
+    if (!SYSTEM_get_pool_config_snapshot(GLOBAL_STATE, pool_idx, &pool)) {
+        ESP_LOGE(TAG, "Unable to snapshot pool %u configuration", pool_idx);
+        return ESP_ERR_NO_MEM;
+    }
     char stratum_url[256] = {0};
     char user[256] = {0};
     char auth_pubkey[128] = {0};
 
-    if (pool->url) strlcpy(stratum_url, pool->url, sizeof(stratum_url));
-    if (pool->user) strlcpy(user, pool->user, sizeof(user));
-    if (pool->sv2_authority_pubkey) strlcpy(auth_pubkey, pool->sv2_authority_pubkey, sizeof(auth_pubkey));
+    if (pool.url) strlcpy(stratum_url, pool.url, sizeof(stratum_url));
+    if (pool.user) strlcpy(user, pool.user, sizeof(user));
+    if (pool.sv2_authority_pubkey) strlcpy(auth_pubkey, pool.sv2_authority_pubkey, sizeof(auth_pubkey));
 
-    uint16_t port = pool->port;
-    sv2_channel_type_t channel_type = pool->sv2_channel_type;
-    bool require_auth = pool->sv2_require_auth;
+    uint16_t port = pool.port;
+    sv2_channel_type_t channel_type = pool.sv2_channel_type;
+    bool require_auth = pool.sv2_require_auth;
+    SYSTEM_release_pool_config_snapshot(&pool);
 
     if (stratum_url[0] == '\0' || port == 0) {
         ESP_LOGE(TAG, "Invalid pool configuration for pool %u", pool_idx);
@@ -490,9 +528,12 @@ esp_err_t stratum_v2_run(GlobalState *GLOBAL_STATE, uint16_t pool_idx)
 
     ESP_LOGI(TAG, "TCP connected to %s:%d (%s)", stratum_url, port, conn_info.host_ip);
 
+    uint32_t session_id = stratum_next_session_id();
     pthread_mutex_lock(&GLOBAL_STATE->transport_mutex);
     GLOBAL_STATE->transport = transport;
+    s_v2_session_id = session_id;
     pthread_mutex_unlock(&GLOBAL_STATE->transport_mutex);
+    SYSTEM_clean_jobs_queue(GLOBAL_STATE);
 
     stratum_socket_set_options(transport);
 
@@ -873,16 +914,18 @@ bool stratum_v2_probe_pool(GlobalState *GLOBAL_STATE, uint16_t pool_idx)
 {
     if (!GLOBAL_STATE || pool_idx >= MAX_POOLS) return false;
 
-    PoolConfig *pool = &GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx];
+    PoolConfig pool = {0};
+    if (!SYSTEM_get_pool_config_snapshot(GLOBAL_STATE, pool_idx, &pool)) return false;
     char url[256] = {0};
     char auth_pubkey[128] = {0};
 
-    if (pool->url) strlcpy(url, pool->url, sizeof(url));
-    if (pool->sv2_authority_pubkey) strlcpy(auth_pubkey, pool->sv2_authority_pubkey, sizeof(auth_pubkey));
+    if (pool.url) strlcpy(url, pool.url, sizeof(url));
+    if (pool.sv2_authority_pubkey) strlcpy(auth_pubkey, pool.sv2_authority_pubkey, sizeof(auth_pubkey));
 
-    uint16_t port = pool->port;
-    sv2_channel_type_t channel_type = pool->sv2_channel_type;
-    bool require_auth = pool->sv2_require_auth;
+    uint16_t port = pool.port;
+    sv2_channel_type_t channel_type = pool.sv2_channel_type;
+    bool require_auth = pool.sv2_require_auth;
+    SYSTEM_release_pool_config_snapshot(&pool);
 
     if (url[0] == '\0' || port == 0) return false;
 

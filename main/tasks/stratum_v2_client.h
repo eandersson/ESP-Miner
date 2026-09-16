@@ -8,6 +8,12 @@
 
 typedef struct GlobalState GlobalState;
 
+// The share's job belongs to an earlier connection (matches
+// STRATUM_V1_SUBMIT_STALE).
+enum {
+    STRATUM_V2_SUBMIT_STALE = -5,
+};
+
 // Run the Stratum V2 client loop for pool_idx until disconnect, ASIC pause, or reconnect requested.
 esp_err_t stratum_v2_run(GlobalState *GLOBAL_STATE, uint16_t pool_idx);
 

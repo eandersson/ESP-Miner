@@ -161,15 +161,22 @@ esp_err_t VCORE_set_voltage(GlobalState * GLOBAL_STATE, float core_voltage)
 {
     ESP_LOGI(TAG, "Set ASIC voltage = %.3fV", core_voltage);
 
-    // Enable/disable the ASIC power enable GPIO before touching the regulator
-    if (GLOBAL_STATE->DEVICE_CONFIG.asic_enable) {
-        bool active_high = GLOBAL_STATE->DEVICE_CONFIG.asic_enable_active_high;
-        bool enable_power = core_voltage != 0.0f;
-        gpio_set_level(GPIO_ASIC_ENABLE, enable_power ? active_high : !active_high);
+    if (!isfinite(core_voltage) || core_voltage < 0.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-        if (enable_power) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
+    // On shutdown, remove power before reprogramming the regulator. On startup,
+    // leave the ASIC disabled until every regulator write has succeeded so it
+    // can never see a stale power-on setpoint. Boards with an active-high
+    // enable (Naja Duo, Gamma Hex; #1916) keep master's bring-up order: enable,
+    // settle, then program. VCORE_init powers them the same way.
+    bool asic_enable = GLOBAL_STATE->DEVICE_CONFIG.asic_enable;
+    bool active_high = GLOBAL_STATE->DEVICE_CONFIG.asic_enable_active_high;
+    if (asic_enable && core_voltage == 0.0f) {
+        gpio_set_level(GPIO_ASIC_ENABLE, !active_high);
+    } else if (asic_enable && active_high) {
+        gpio_set_level(GPIO_ASIC_ENABLE, 1);
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     if (GLOBAL_STATE->DEVICE_CONFIG.DS4432U) {
@@ -180,6 +187,11 @@ esp_err_t VCORE_set_voltage(GlobalState * GLOBAL_STATE, float core_voltage)
     if (GLOBAL_STATE->DEVICE_CONFIG.TPS546) {
         uint16_t voltage_domains = GLOBAL_STATE->DEVICE_CONFIG.family.voltage_domains;
         ESP_RETURN_ON_ERROR(TPS546_set_vout(core_voltage * voltage_domains), TAG, "TPS546 set voltage failed!");
+    }
+
+    if (asic_enable && !active_high && core_voltage > 0.0f) {
+        gpio_set_level(GPIO_ASIC_ENABLE, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     return ESP_OK;
@@ -212,6 +224,15 @@ esp_err_t VCORE_check_fault(GlobalState * GLOBAL_STATE)
     if (GLOBAL_STATE->DEVICE_CONFIG.TPS546) {
         ESP_RETURN_ON_ERROR(TPS546_check_status(GLOBAL_STATE), TAG, "TPS546 check status failed!");
     }
+    return ESP_OK;
+}
+
+esp_err_t VCORE_clear_faults(GlobalState * GLOBAL_STATE)
+{
+    if (GLOBAL_STATE->DEVICE_CONFIG.TPS546) {
+        ESP_RETURN_ON_ERROR(TPS546_clear_faults(), TAG, "TPS546 clear faults failed!");
+    }
+    GLOBAL_STATE->SYSTEM_MODULE.power_fault = 0;
     return ESP_OK;
 }
 

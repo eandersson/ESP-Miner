@@ -35,6 +35,8 @@
 #include "self_test.h"
 #include "filesystem.h"
 #include "embedded_web_ui.h"
+#include "asic_result_task.h"
+#include "mining.h"
 #include "hashrate_monitor_task.h"
 #include "coinbase_decoder.h"
 #include "sv2_protocol.h"
@@ -60,7 +62,36 @@ static const char * TAG = "system";
 //local function prototypes
 static esp_err_t ensure_overheat_mode_config();
 
-static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int index) {
+static void pool_config_free_owned(PoolConfig *cfg)
+{
+    if (cfg == NULL) {
+        return;
+    }
+
+    free(cfg->url);
+    free(cfg->user);
+    free(cfg->pass);
+    free(cfg->cert);
+    free(cfg->sv2_authority_pubkey);
+    memset(cfg, 0, sizeof(*cfg));
+}
+
+static bool pool_config_replace_string(char **field, const char *value)
+{
+    char *copy = strdup(value != NULL ? value : "");
+    if (copy == NULL) {
+        return false;
+    }
+    free(*field);
+    *field = copy;
+    return true;
+}
+
+static bool parse_pool_config_json(const char *json_str, PoolConfig *cfg,
+                                   int index)
+{
+    memset(cfg, 0, sizeof(*cfg));
+
     // Set default values first
     cfg->protocol = STRATUM_PROTOCOL_V1;
     cfg->url = strdup(index == 0 ? CONFIG_STRATUM_URL : "");
@@ -80,13 +111,20 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
     cfg->sv2_authority_pubkey = strdup("");
     cfg->sv2_require_auth = false;
 
+    if (cfg->url == NULL || cfg->user == NULL || cfg->pass == NULL ||
+        cfg->cert == NULL || cfg->sv2_authority_pubkey == NULL) {
+        pool_config_free_owned(cfg);
+        return false;
+    }
+
     if (!json_str || strlen(json_str) == 0) {
-        return;
+        return true;
     }
 
     cJSON *root = cJSON_Parse(json_str);
     if (!root) {
-        return;
+        // Preserve the historical behavior for corrupt NVS: use defaults.
+        return true;
     }
 
     cJSON *item;
@@ -99,8 +137,9 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
 
     item = cJSON_GetObjectItem(root, "stratumURL");
     if (item && cJSON_IsString(item)) {
-        free(cfg->url);
-        cfg->url = strdup(item->valuestring);
+        if (!pool_config_replace_string(&cfg->url, item->valuestring)) {
+            goto allocation_failed;
+        }
     }
 
     item = cJSON_GetObjectItem(root, "stratumPort");
@@ -110,14 +149,16 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
 
     item = cJSON_GetObjectItem(root, "stratumUser");
     if (item && cJSON_IsString(item)) {
-        free(cfg->user);
-        cfg->user = strdup(item->valuestring);
+        if (!pool_config_replace_string(&cfg->user, item->valuestring)) {
+            goto allocation_failed;
+        }
     }
 
     item = cJSON_GetObjectItem(root, "stratumPassword");
     if (item && cJSON_IsString(item)) {
-        free(cfg->pass);
-        cfg->pass = strdup(item->valuestring);
+        if (!pool_config_replace_string(&cfg->pass, item->valuestring)) {
+            goto allocation_failed;
+        }
     }
 
     item = cJSON_GetObjectItem(root, "stratumSuggestedDifficulty");
@@ -137,8 +178,9 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
 
     item = cJSON_GetObjectItem(root, "stratumCert");
     if (item && cJSON_IsString(item)) {
-        free(cfg->cert);
-        cfg->cert = strdup(item->valuestring);
+        if (!pool_config_replace_string(&cfg->cert, item->valuestring)) {
+            goto allocation_failed;
+        }
     }
 
     item = cJSON_GetObjectItem(root, "stratumDecodeCoinbase");
@@ -154,8 +196,10 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
 
     item = cJSON_GetObjectItem(root, "stratumV2AuthorityPubkey");
     if (item && cJSON_IsString(item)) {
-        free(cfg->sv2_authority_pubkey);
-        cfg->sv2_authority_pubkey = strdup(item->valuestring);
+        if (!pool_config_replace_string(&cfg->sv2_authority_pubkey,
+                                        item->valuestring)) {
+            goto allocation_failed;
+        }
     }
 
     item = cJSON_GetObjectItem(root, "stratumV2RequireAuth");
@@ -164,6 +208,35 @@ static void parse_pool_config_json(const char *json_str, PoolConfig *cfg, int in
     }
 
     cJSON_Delete(root);
+    return true;
+
+allocation_failed:
+    cJSON_Delete(root);
+    pool_config_free_owned(cfg);
+    return false;
+}
+
+static bool pool_config_strings_equal(const char *a, const char *b)
+{
+    return a == b || (a != NULL && b != NULL && strcmp(a, b) == 0);
+}
+
+static bool pool_configs_equal(const PoolConfig *a, const PoolConfig *b)
+{
+    return a->port == b->port &&
+           a->protocol == b->protocol &&
+           a->difficulty == b->difficulty &&
+           a->extranonce_subscribe == b->extranonce_subscribe &&
+           a->tls == b->tls &&
+           a->decode_coinbase_tx == b->decode_coinbase_tx &&
+           a->sv2_channel_type == b->sv2_channel_type &&
+           a->sv2_require_auth == b->sv2_require_auth &&
+           pool_config_strings_equal(a->url, b->url) &&
+           pool_config_strings_equal(a->user, b->user) &&
+           pool_config_strings_equal(a->pass, b->pass) &&
+           pool_config_strings_equal(a->cert, b->cert) &&
+           pool_config_strings_equal(a->sv2_authority_pubkey,
+                                     b->sv2_authority_pubkey);
 }
 
 void SYSTEM_check_firmware_migration(void)
@@ -233,6 +306,8 @@ void SYSTEM_init_system(GlobalState * GLOBAL_STATE)
     strcpy(module->ipv6_addr_str, "");
     strcpy(module->wifi_status, "Initializing...");
     
+    pthread_mutex_init(&GLOBAL_STATE->pools_lock, NULL);
+
     // set the pool configurations
     for (int i = 0; i < MAX_POOLS; i++) {
         module->pools[i].url = NULL;
@@ -264,16 +339,24 @@ void SYSTEM_init_system(GlobalState * GLOBAL_STATE)
     suffixString(module->best_session_nonce_diff, module->best_session_diff_string, DIFF_STRING_SIZE, 0);
 
     // Initialize mutexes
+    pthread_mutex_init(&GLOBAL_STATE->asic_command_lock, NULL);
     pthread_mutex_init(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock, NULL);
     pthread_mutex_init(&GLOBAL_STATE->transport_mutex, NULL);
 
     // Allocate the job tracking tables here rather than in create_jobs_task().
-    // The stratum tasks touch valid_jobs (SYSTEM_clean_jobs_queue) as soon as they
-    // connect, so tying the allocation to create_jobs_task actually starting is a
-    // NULL dereference waiting to happen if that task ever fails to spawn.
-    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs = heap_caps_calloc(MAX_ASIC_JOBS, sizeof(bm_job *), MALLOC_CAP_SPIRAM);
-    GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs = heap_caps_calloc(MAX_ASIC_JOBS, sizeof(uint8_t), MALLOC_CAP_SPIRAM);
-    if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs == NULL || GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs == NULL) {
+    // The stratum tasks touch them (SYSTEM_clean_jobs_queue) as soon as they
+    // connect, so tying the allocation to create_jobs_task actually starting is
+    // a NULL dereference waiting to happen if that task ever fails to spawn.
+    AsicTaskModule *asic_jobs = &GLOBAL_STATE->ASIC_TASK_MODULE;
+    asic_jobs->active_jobs = heap_caps_calloc(MAX_ASIC_JOBS, sizeof(bm_job *), MALLOC_CAP_SPIRAM);
+    asic_jobs->retired_jobs = heap_caps_calloc(MAX_ASIC_JOBS, sizeof(bm_job *), MALLOC_CAP_SPIRAM);
+    asic_jobs->active_job_dispatch_us = heap_caps_calloc(MAX_ASIC_JOBS, sizeof(int64_t), MALLOC_CAP_SPIRAM);
+    asic_jobs->retired_job_dispatch_us = heap_caps_calloc(MAX_ASIC_JOBS, sizeof(int64_t), MALLOC_CAP_SPIRAM);
+    asic_jobs->valid_jobs = heap_caps_calloc(MAX_ASIC_JOBS, sizeof(uint8_t), MALLOC_CAP_SPIRAM);
+    if (asic_jobs->active_jobs == NULL || asic_jobs->retired_jobs == NULL ||
+        asic_jobs->active_job_dispatch_us == NULL ||
+        asic_jobs->retired_job_dispatch_us == NULL ||
+        asic_jobs->valid_jobs == NULL) {
         ESP_LOGE(TAG, "Failed to allocate job tracking tables");
         abort();
     }
@@ -408,11 +491,40 @@ void SYSTEM_clean_jobs_queue(GlobalState * GLOBAL_STATE)
 {
     ESP_LOGI(TAG, "Clean Jobs: invalidating active jobs");
 
-    pthread_mutex_lock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
-    for (int i = 0; i < MAX_ASIC_JOBS; i = i + 4) {
-        GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs[i] = 0;
+    // Publish the new generation before releasing the job tables. ASIC send
+    // paths reject an old generation before UART TX, so prepared work cannot
+    // be resent once invalidation becomes visible.
+    AsicTaskModule *asic_jobs = &GLOBAL_STATE->ASIC_TASK_MODULE;
+    pthread_mutex_lock(&asic_jobs->valid_jobs_lock);
+    ASIC_result_task_invalidate_pool_jobs();
+    for (int i = 0; i < MAX_ASIC_JOBS; i++) {
+        bm_job *active_job = NULL;
+        bm_job *retired_job = NULL;
+        if (asic_jobs->valid_jobs != NULL) {
+            asic_jobs->valid_jobs[i] = 0;
+        }
+        if (asic_jobs->active_jobs != NULL && asic_jobs->active_jobs[i] != NULL) {
+            active_job = asic_jobs->active_jobs[i];
+            asic_jobs->active_jobs[i] = NULL;
+        }
+        if (asic_jobs->retired_jobs != NULL && asic_jobs->retired_jobs[i] != NULL) {
+            retired_job = asic_jobs->retired_jobs[i];
+            asic_jobs->retired_jobs[i] = NULL;
+        }
+        if (asic_jobs->active_job_dispatch_us != NULL) {
+            asic_jobs->active_job_dispatch_us[i] = 0;
+        }
+        if (asic_jobs->retired_job_dispatch_us != NULL) {
+            asic_jobs->retired_job_dispatch_us[i] = 0;
+        }
+        if (active_job != NULL) {
+            release_bm_job(active_job);
+        }
+        if (retired_job != NULL && retired_job != active_job) {
+            release_bm_job(retired_job);
+        }
     }
-    pthread_mutex_unlock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
+    pthread_mutex_unlock(&asic_jobs->valid_jobs_lock);
 
     // Reset hashrate measurements to prevent a spike on reconnection
     hashrate_monitor_reset_measurements(GLOBAL_STATE);
@@ -523,10 +635,11 @@ void SYSTEM_decode_and_apply_coinbase(GlobalState * GLOBAL_STATE, const miner_jo
     memset(result, 0, sizeof(mining_notification_result_t));
 
     uint16_t pool_idx = (job->pool_id < MAX_POOLS) ? job->pool_id : 0;
-    const char *user = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].user;
-    bool decode_coinbase_tx = GLOBAL_STATE->SYSTEM_MODULE.pools[pool_idx].decode_coinbase_tx;
-
-    if (coinbase_process_miner_job(job, user, decode_coinbase_tx, result) != ESP_OK) {
+    PoolConfig pool = {0};
+    (void)SYSTEM_get_pool_config_snapshot(GLOBAL_STATE, pool_idx, &pool);
+    esp_err_t decode_err = coinbase_process_miner_job(job, pool.user, pool.decode_coinbase_tx, result);
+    SYSTEM_release_pool_config_snapshot(&pool);
+    if (decode_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to decode coinbase for job %s", job->job_id);
         free(result);
         SYSTEM_reset_coinbase_ui_state(GLOBAL_STATE, "[decode error]");
@@ -748,24 +861,108 @@ void SYSTEM_init_partitions(GlobalState * GLOBAL_STATE) {
 }
 
 void SYSTEM_load_pool_from_nvs(GlobalState * GLOBAL_STATE, int i) {
-    if (i < 0 || i >= MAX_POOLS) return;
-    
-    PoolConfig *cfg = &GLOBAL_STATE->SYSTEM_MODULE.pools[i];
-    free(cfg->url);
-    free(cfg->user);
-    free(cfg->pass);
-    free(cfg->cert);
-    free(cfg->sv2_authority_pubkey);
-    
-    cfg->url = NULL;
-    cfg->user = NULL;
-    cfg->pass = NULL;
-    cfg->cert = NULL;
-    cfg->sv2_authority_pubkey = NULL;
+    if (GLOBAL_STATE == NULL || i < 0 || i >= MAX_POOLS) return;
 
     char *json_str = nvs_config_get_string_indexed(NVS_CONFIG_POOL, i);
-    parse_pool_config_json(json_str, cfg, i);
+    if (json_str == NULL) {
+        ESP_LOGE(TAG, "Unable to snapshot pool %d from NVS cache", i);
+        return;
+    }
+    PoolConfig replacement = {0};
+    if (!parse_pool_config_json(json_str, &replacement, i)) {
+        ESP_LOGE(TAG, "Unable to allocate pool %d configuration", i);
+        free(json_str);
+        return;
+    }
+
+    // Unchanged configurations keep their strings so concurrent snapshot
+    // readers never observe a pointless replacement.
+    PoolConfig previous = {0};
+    pthread_mutex_lock(&GLOBAL_STATE->pools_lock);
+    PoolConfig *cfg = &GLOBAL_STATE->SYSTEM_MODULE.pools[i];
+    if (!pool_configs_equal(cfg, &replacement)) {
+        previous = *cfg;
+        *cfg = replacement;
+        memset(&replacement, 0, sizeof(replacement));
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->pools_lock);
+
+    pool_config_free_owned(&previous);
+    pool_config_free_owned(&replacement);
     free(json_str);
+}
+
+bool SYSTEM_get_pool_config_snapshot(GlobalState *GLOBAL_STATE, int index,
+                                     PoolConfig *snapshot)
+{
+    if (GLOBAL_STATE == NULL || snapshot == NULL ||
+        index < 0 || index >= MAX_POOLS) {
+        return false;
+    }
+
+    PoolConfig copy = {0};
+    pthread_mutex_lock(&GLOBAL_STATE->pools_lock);
+    const PoolConfig *source = &GLOBAL_STATE->SYSTEM_MODULE.pools[index];
+
+    copy.port = source->port;
+    copy.protocol = source->protocol;
+    copy.difficulty = source->difficulty;
+    copy.extranonce_subscribe = source->extranonce_subscribe;
+    copy.tls = source->tls;
+    copy.decode_coinbase_tx = source->decode_coinbase_tx;
+    copy.sv2_channel_type = source->sv2_channel_type;
+    copy.sv2_require_auth = source->sv2_require_auth;
+
+    copy.url = source->url != NULL ? strdup_psram(source->url) : NULL;
+    copy.user = source->user != NULL ? strdup_psram(source->user) : NULL;
+    copy.pass = source->pass != NULL ? strdup_psram(source->pass) : NULL;
+    copy.cert = source->cert != NULL ? strdup_psram(source->cert) : NULL;
+    copy.sv2_authority_pubkey = source->sv2_authority_pubkey != NULL
+                                    ? strdup_psram(source->sv2_authority_pubkey)
+                                    : NULL;
+
+    bool copied = (source->url == NULL || copy.url != NULL) &&
+                  (source->user == NULL || copy.user != NULL) &&
+                  (source->pass == NULL || copy.pass != NULL) &&
+                  (source->cert == NULL || copy.cert != NULL) &&
+                  (source->sv2_authority_pubkey == NULL ||
+                   copy.sv2_authority_pubkey != NULL);
+    pthread_mutex_unlock(&GLOBAL_STATE->pools_lock);
+
+    if (!copied) {
+        pool_config_free_owned(&copy);
+        memset(snapshot, 0, sizeof(*snapshot));
+        return false;
+    }
+
+    *snapshot = copy;
+    return true;
+}
+
+void SYSTEM_release_pool_config_snapshot(PoolConfig *snapshot)
+{
+    pool_config_free_owned(snapshot);
+}
+
+bool SYSTEM_get_pool_protocols(GlobalState *GLOBAL_STATE, int primary_index,
+                               int fallback_index,
+                               stratum_protocol_t *primary_protocol,
+                               stratum_protocol_t *fallback_protocol)
+{
+    if (GLOBAL_STATE == NULL || primary_protocol == NULL ||
+        fallback_protocol == NULL || primary_index < 0 ||
+        primary_index >= MAX_POOLS || fallback_index < 0 ||
+        fallback_index >= MAX_POOLS) {
+        return false;
+    }
+
+    pthread_mutex_lock(&GLOBAL_STATE->pools_lock);
+    *primary_protocol =
+        GLOBAL_STATE->SYSTEM_MODULE.pools[primary_index].protocol;
+    *fallback_protocol =
+        GLOBAL_STATE->SYSTEM_MODULE.pools[fallback_index].protocol;
+    pthread_mutex_unlock(&GLOBAL_STATE->pools_lock);
+    return true;
 }
 
 void SYSTEM_reload_pool_config(GlobalState * GLOBAL_STATE)

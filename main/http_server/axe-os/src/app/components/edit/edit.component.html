@@ -4,7 +4,7 @@
       @if (settingsUnlocked) {
         <div class="flex items-center justify-center gap-2 p-4 rounded-lg border w-full mb-3 text-center bg-[#ffecb3] text-[#614a00] border-[#ffe082]">
           <i class="pi pi-exclamation-triangle"></i>
-          <span>Custom settings can cause damage & system instability. Only modify these settings if you understand the risks of running outside designed parameters.</span>
+          <span>Values are limited to this board's tuning envelope, but extreme or incompatible settings can still cause overheating, instability, reduced hardware lifespan, or permanent damage.</span>
         </div>
       }
       <div class="flex flex-col md:flex-row md:items-center mb-4 gap-2">
@@ -40,6 +40,17 @@
             </app-dropdown>
           </div>
         }
+      </div>
+      <div class="flex flex-col md:flex-row md:items-center mb-4 gap-2">
+        <label for="asicJobInterval" class="w-full md:w-2/12 font-medium">ASIC Job Residency</label>
+        <div class="w-full md:w-10/12">
+          <input class="input-text" id="asicJobInterval" formControlName="asicJobInterval"
+                 type="number" min="1000" max="60000" step="1000" />
+          <small class="block mt-1">
+            Milliseconds before refreshing still-valid work (1,000–60,000). New blocks always preempt immediately.
+            BM1397 uses its calculated full-scan interval.
+          </small>
+        </div>
       </div>
       @if (form.get('overheat_mode')?.value === 1) {
         <div class="mt-4">

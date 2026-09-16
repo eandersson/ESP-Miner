@@ -12,9 +12,12 @@
 #include "global_state.h"
 #include "mining.h"
 #include "device_config.h"
+#include "nvs_config.h"
 #include "frequency_transition_bmXX.h"
+#include "utils.h"
 
 static const char *TAG = "asic";
+static uint32_t effective_version_mask = BIP320_VERSION_ROLLING_MASK;
 
 uint8_t ASIC_init(GlobalState * GLOBAL_STATE)
 {
@@ -53,96 +56,183 @@ task_result * ASIC_process_work(GlobalState * GLOBAL_STATE)
     return NULL;
 }
 
-int ASIC_set_max_baud(GlobalState * GLOBAL_STATE)
+esp_err_t ASIC_set_max_baud(GlobalState *GLOBAL_STATE, int *baud)
 {
+    if (GLOBAL_STATE == NULL || baud == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            return BM1397_set_max_baud();
+            return BM1397_set_max_baud(baud);
         case BM1366:
-            return BM1366_set_max_baud();
+            return BM1366_set_max_baud(baud);
         case BM1368:
-            return BM1368_set_max_baud();
+            return BM1368_set_max_baud(baud);
         case BM1370:
-            return BM1370_set_max_baud();
+            return BM1370_set_max_baud(baud);
         case BM1373:
-            return BM1373_set_max_baud();
+            return BM1373_set_max_baud(baud);
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set max baud", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
-    return 0;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
-void ASIC_send_work(GlobalState * GLOBAL_STATE, bm_job * next_job)
+bool ASIC_send_work(GlobalState * GLOBAL_STATE, bm_job * next_job,
+                    uint32_t expected_generation)
 {
+    if (GLOBAL_STATE == NULL) {
+        return false;
+    }
+
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    if (__atomic_load_n(&GLOBAL_STATE->asic_lifecycle, __ATOMIC_ACQUIRE) !=
+        ASIC_LIFECYCLE_RUNNING) {
+        pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+        ESP_LOGD(TAG, "Discarding work while ASIC is not running");
+        return false;
+    }
+
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            BM1397_send_work(GLOBAL_STATE, next_job);
-            break;
+        {
+            bool sent = BM1397_send_work(GLOBAL_STATE, next_job,
+                                         expected_generation);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return sent;
+        }
         case BM1366:
-            BM1366_send_work(GLOBAL_STATE, next_job);
-            break;
+        {
+            bool sent = BM1366_send_work(GLOBAL_STATE, next_job,
+                                         expected_generation);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return sent;
+        }
         case BM1368:
-            BM1368_send_work(GLOBAL_STATE, next_job);
-            break;
+        {
+            bool sent = BM1368_send_work(GLOBAL_STATE, next_job,
+                                         expected_generation);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return sent;
+        }
         case BM1370:
-            BM1370_send_work(GLOBAL_STATE, next_job);
-            break;
+        {
+            bool sent = BM1370_send_work(GLOBAL_STATE, next_job,
+                                         expected_generation);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return sent;
+        }
         case BM1373:
-            BM1373_send_work(GLOBAL_STATE, next_job);
-            break;
+        {
+            bool sent = BM1373_send_work(GLOBAL_STATE, next_job,
+                                         expected_generation);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return sent;
+        }
         default:
             ESP_LOGE(TAG, "Unknown ASIC id %d — cannot send work", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
-            break;
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return false;
     }
 }
 
-void ASIC_set_version_mask(GlobalState * GLOBAL_STATE, uint32_t mask)
+esp_err_t ASIC_set_version_mask(GlobalState *GLOBAL_STATE, uint32_t mask)
 {
+    if (GLOBAL_STATE == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err;
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            BM1397_set_version_mask(mask);
+            err = BM1397_set_version_mask(mask);
             break;
         case BM1366:
-            BM1366_set_version_mask(mask);
+            err = BM1366_set_version_mask(mask);
             break;
         case BM1368:
-            BM1368_set_version_mask(mask);
+            err = BM1368_set_version_mask(mask);
             break;
         case BM1370:
-            BM1370_set_version_mask(mask);
+            err = BM1370_set_version_mask(mask);
             break;
         case BM1373:
-            BM1373_set_version_mask(mask);
+            err = BM1373_set_version_mask(mask);
             break;
         default:
             ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set version mask", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
-            break;
+            return ESP_ERR_NOT_SUPPORTED;
     }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set ASIC version mask 0x%08lx: %s",
+                 (unsigned long)mask, esp_err_to_name(err));
+        return err;
+    }
+    effective_version_mask = mask;
+    return ESP_OK;
 }
 
-void ASIC_set_frequency(GlobalState * GLOBAL_STATE)
+esp_err_t ASIC_restore_version_mask(GlobalState *GLOBAL_STATE)
 {
+    return ASIC_set_version_mask(GLOBAL_STATE, effective_version_mask);
+}
+
+esp_err_t ASIC_set_version_mask_if_running(GlobalState *GLOBAL_STATE,
+                                           uint32_t mask)
+{
+    if (GLOBAL_STATE == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    if (__atomic_load_n(&GLOBAL_STATE->asic_lifecycle, __ATOMIC_ACQUIRE) !=
+        ASIC_LIFECYCLE_RUNNING) {
+        pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = ASIC_set_version_mask(GLOBAL_STATE, mask);
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+    return err;
+}
+
+esp_err_t ASIC_set_frequency(GlobalState *GLOBAL_STATE)
+{
+    if (GLOBAL_STATE == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            do_frequency_transition(GLOBAL_STATE, BM1397_send_hash_frequency);
-            return;
+            return do_runtime_frequency_transition(
+                GLOBAL_STATE, BM1397_send_hash_frequency);
         case BM1366:
-            do_frequency_transition(GLOBAL_STATE, BM1366_send_hash_frequency);
-            return;
+            return do_runtime_frequency_transition(
+                GLOBAL_STATE, BM1366_send_hash_frequency);
         case BM1368:
-            do_frequency_transition(GLOBAL_STATE, BM1368_send_hash_frequency);
-            return;
+            return do_runtime_frequency_transition(
+                GLOBAL_STATE, BM1368_send_hash_frequency);
         case BM1370:
-            do_frequency_transition(GLOBAL_STATE, BM1370_send_hash_frequency);
-            return;
+            return do_runtime_frequency_transition(
+                GLOBAL_STATE, BM1370_send_hash_frequency);
         case BM1373:
-            do_frequency_transition(GLOBAL_STATE, BM1373_send_hash_frequency);
-            return;
+            return do_runtime_frequency_transition(
+                GLOBAL_STATE, BM1373_send_hash_frequency);
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set frequency", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
-void ASIC_set_nonce_space(GlobalState * GLOBAL_STATE)
+esp_err_t ASIC_set_nonce_space(GlobalState *GLOBAL_STATE)
 {
+    if (GLOBAL_STATE == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    if (__atomic_load_n(&GLOBAL_STATE->asic_lifecycle, __ATOMIC_ACQUIRE) !=
+        ASIC_LIFECYCLE_RUNNING) {
+        pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     float nonce_percent = 1.0;
     int cores = GLOBAL_STATE->DEVICE_CONFIG.family.asic.core_count;
     int asic_count = GLOBAL_STATE->DEVICE_CONFIG.family.asic_count;
@@ -150,40 +240,86 @@ void ASIC_set_nonce_space(GlobalState * GLOBAL_STATE)
 
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
-            return;
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return ESP_OK;
         case BM1366:
-            BM1366_set_nonce_space(nonce_percent, frequency, asic_count, cores);
-            return;
+        {
+            esp_err_t err = BM1366_set_nonce_space(
+                nonce_percent, frequency, asic_count, cores);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return err;
+        }
         case BM1368:
-            BM1368_set_nonce_space(nonce_percent, frequency, asic_count, cores);
-            return;
+        {
+            esp_err_t err = BM1368_set_nonce_space(
+                nonce_percent, frequency, asic_count, cores);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return err;
+        }
         case BM1370:
-            BM1370_set_nonce_space(nonce_percent, frequency, asic_count, cores);
-            return;
+        {
+            esp_err_t err = BM1370_set_nonce_space(
+                nonce_percent, frequency, asic_count, cores);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return err;
+        }
         case BM1373:
-            BM1373_set_nonce_space(nonce_percent, frequency, asic_count, cores);
-            return;
+        {
+            esp_err_t err = BM1373_set_nonce_space(
+                nonce_percent, frequency, asic_count, cores);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return err;
+        }
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot set nonce space", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 double ASIC_get_asic_job_frequency_ms(GlobalState * GLOBAL_STATE)
 {
-    float freq = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value;
+    float freq = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.actual_frequency;
+    if (freq <= 0.0f) {
+        freq = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value;
+    }
     int cores = GLOBAL_STATE->DEVICE_CONFIG.family.asic.core_count;
     int small_cores = GLOBAL_STATE->DEVICE_CONFIG.family.asic.small_core_count;
     int asic_count = GLOBAL_STATE->DEVICE_CONFIG.family.asic_count;
-    int asic_default_timeout_divided = GLOBAL_STATE->DEVICE_CONFIG.family.asic.default_asic_timeout / _next_power_of_two(asic_count);
-
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
             // no version-rolling so same Nonce Space is splitted between Big Cores
-            return calculate_bm_timeout_ms(freq, asic_count, small_cores, cores, GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates, 1.0, asic_default_timeout_divided);
+            // Master builds software_midstates midstates only when a version
+            // mask is in effect (construct_bm_job_from_miner_job); otherwise
+            // the job carries a single midstate.
+            return calculate_bm_timeout_ms(
+                freq, asic_count, small_cores, cores,
+                effective_version_mask != 0
+                    ? GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates
+                    : 1,
+                1.0,
+                GLOBAL_STATE->DEVICE_CONFIG.family.asic.default_asic_timeout);
         case BM1366:
         case BM1368:
         case BM1370:
-        case BM1373:
-            return asic_default_timeout_divided;
+        case BM1373: {
+            // The calculated scan already accounts for chain topology. Apply the
+            // pool-facing cap once so multi-chip chains are not restarted early.
+            double refresh_cap_ms =
+                nvs_config_get_u16(NVS_CONFIG_ASIC_JOB_INTERVAL);
+            if (refresh_cap_ms < 1000.0 || refresh_cap_ms > 60000.0) {
+                refresh_cap_ms =
+                    GLOBAL_STATE->DEVICE_CONFIG.family.asic.default_asic_timeout;
+            }
+            // These chips expose the 16 BIP320 rolling bits at positions
+            // 13..28. Ignore any echoed pool bits outside that hardware field.
+            uint32_t effective_asic_mask =
+                (effective_version_mask >> 13) & UINT32_C(0xffff);
+            size_t version_space =
+                version_mask_value_count(effective_asic_mask);
+            return calculate_bm_job_interval_ms(freq, asic_count, small_cores,
+                                                cores, version_space,
+                                                refresh_cap_ms);
+        }
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d — cannot compute job frequency", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
     return 500;
@@ -191,23 +327,40 @@ double ASIC_get_asic_job_frequency_ms(GlobalState * GLOBAL_STATE)
 
 void ASIC_read_registers(GlobalState * GLOBAL_STATE)
 {
+    if (GLOBAL_STATE == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    if (__atomic_load_n(&GLOBAL_STATE->asic_lifecycle, __ATOMIC_ACQUIRE) !=
+        ASIC_LIFECYCLE_RUNNING) {
+        pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+        return;
+    }
+
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
             BM1397_read_registers(GLOBAL_STATE);
-            break;
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return;
         case BM1366:
             BM1366_read_registers(GLOBAL_STATE);
-            break;
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return;
         case BM1368:
             BM1368_read_registers(GLOBAL_STATE);
-            break;
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return;
         case BM1370:
             BM1370_read_registers(GLOBAL_STATE);
-            break;
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return;
         case BM1373:
-            BM1373_read_registers();
-            break;
+            BM1373_read_registers(GLOBAL_STATE);
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return;
         default:
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
             ESP_LOGE(TAG, "Unknown ASIC id %d — cannot read registers", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
             break;
     }

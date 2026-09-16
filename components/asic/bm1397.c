@@ -9,8 +9,10 @@
 #include "freertos/task.h"
 #include "frequency_transition_bmXX.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "serial.h"
+#include "asic_result_task.h"
 #include "bm1397.h"
 #include "utils.h"
 #include "crc.h"
@@ -42,6 +44,8 @@
 #define PLL3_PARAMETER 0x68
 #define FAST_UART_CONFIGURATION 0x28
 #define MISC_CONTROL 0x18
+#define BM1397_MIN_FREQUENCY_MHZ 50.0f
+#define BM1397_MAX_FREQUENCY_MHZ 1200.0f
 
 static const register_type_t REGISTER_MAP[] = {
     [0x04] = REGISTER_HASHRATE,
@@ -76,24 +80,41 @@ typedef struct __attribute__((__packed__))
 
 static const char * TAG = "bm1397";
 
-static uint32_t prev_nonce = 0;
 static task_result result;
 
 static int address_interval;
+
+#define BM1397_INIT_REQUIRE_SENT(expression, step)                         \
+    do {                                                                  \
+        if (!(expression)) {                                              \
+            ESP_LOGE(TAG, "ASIC initialization TX failed at %s", step);  \
+            return 0;                                                     \
+        }                                                                 \
+    } while (0)
+
+#define BM1397_INIT_REQUIRE_OK(expression, step)                           \
+    do {                                                                  \
+        esp_err_t init_err = (expression);                                \
+        if (init_err != ESP_OK) {                                         \
+            ESP_LOGE(TAG, "ASIC initialization failed at %s: %s", step,  \
+                     esp_err_to_name(init_err));                           \
+            return 0;                                                     \
+        }                                                                 \
+    } while (0)
 
 /// @brief
 /// @param ftdi
 /// @param header
 /// @param data
 /// @param len
-static void _send_BM1397(uint8_t header, uint8_t *data, uint8_t data_len, bool debug)
+static bool _send_BM1397(uint8_t header, const uint8_t *data, uint8_t data_len, bool debug)
 {
     packet_type_t packet_type = (header & TYPE_JOB) ? JOB_PACKET : CMD_PACKET;
     uint8_t total_length = (packet_type == JOB_PACKET) ? (data_len + 6) : (data_len + 5);
 
     if (total_length > 160) {
         ESP_LOGE(TAG, "Packet length %d exceeds maximum buffer size", total_length);
-        return;
+        return false;
     }
 
     uint8_t buf[160];
@@ -123,42 +144,57 @@ static void _send_BM1397(uint8_t header, uint8_t *data, uint8_t data_len, bool d
         buf[4 + data_len] = crc5(buf + 2, data_len + 2);
     }
 
-    // send serial data
-    SERIAL_send(buf, total_length, debug);
+    return SERIAL_send(buf, total_length, debug);
 }
 
-static void _send_read_address(void)
+static bool _send_read_address(void)
 {
     unsigned char read_address[2] = {0x00, 0x00};
     // send serial data
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_READ), read_address, 2, BM1397_SERIALTX_DEBUG);
+    return _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_READ), read_address, 2,
+                        BM1397_SERIALTX_DEBUG);
 }
 
-static void _send_chain_inactive(void)
+static bool _send_chain_inactive(void)
 {
     unsigned char read_address[2] = {0x00, 0x00};
     // send serial data
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_INACTIVE), read_address, 2, BM1397_SERIALTX_DEBUG);
+    return _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_INACTIVE), read_address,
+                        2, BM1397_SERIALTX_DEBUG);
 }
 
-static void _set_chip_address(uint8_t chipAddr)
+static bool _set_chip_address(uint8_t chipAddr)
 {
     unsigned char read_address[2] = {chipAddr, 0x00};
     // send serial data
-    _send_BM1397((TYPE_CMD | GROUP_SINGLE | CMD_SETADDRESS), read_address, 2, BM1397_SERIALTX_DEBUG);
+    return _send_BM1397((TYPE_CMD | GROUP_SINGLE | CMD_SETADDRESS),
+                        read_address, 2, BM1397_SERIALTX_DEBUG);
 }
 
-void BM1397_set_version_mask(uint32_t version_mask) 
+esp_err_t BM1397_set_version_mask(uint32_t version_mask)
 {
     // placeholder
+    (void)version_mask;
+    return ESP_OK;
 }
 
-float BM1397_send_hash_frequency(float target_freq)
+esp_err_t BM1397_send_hash_frequency(float target_freq,
+                                     float *applied_frequency)
 {
+    if (applied_frequency == NULL || !isfinite(target_freq) ||
+        target_freq < BM1397_MIN_FREQUENCY_MHZ ||
+        target_freq > BM1397_MAX_FREQUENCY_MHZ) {
+        return ESP_ERR_INVALID_ARG;
+    }
     uint8_t fb_divider, refdiv, postdiv1, postdiv2;
     float frequency;
 
-    pll_get_parameters(target_freq, 60, 200, &fb_divider, &refdiv, &postdiv1, &postdiv2, &frequency);
+    esp_err_t err = pll_get_parameters(target_freq, 60, 200, &fb_divider,
+                                       &refdiv, &postdiv1, &postdiv2,
+                                       &frequency);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     uint8_t vdo_scale = 0x40;
     uint8_t postdiv = ((postdiv1 & 0x7) << 4) + (postdiv2 & 0x7);
@@ -168,25 +204,32 @@ float BM1397_send_hash_frequency(float target_freq)
     for (int i = 0; i < 2; i++)
     {
         vTaskDelay(10 / portTICK_PERIOD_MS);
-        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), prefreq1, 6, BM1397_SERIALTX_DEBUG);
+        if (!_send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), prefreq1, 6,
+                          BM1397_SERIALTX_DEBUG)) {
+            return ESP_FAIL;
+        }
     }
     for (int i = 0; i < 2; i++)
     {
         vTaskDelay(10 / portTICK_PERIOD_MS);
-        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), freqbuf, 6, BM1397_SERIALTX_DEBUG);
+        if (!_send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), freqbuf, 6,
+                          BM1397_SERIALTX_DEBUG)) {
+            return ESP_FAIL;
+        }
     }
 
     vTaskDelay(10 / portTICK_PERIOD_MS);
 
     ESP_LOGI(TAG, "Setting Frequency to %g MHz (%g)", target_freq, frequency);
 
-    return frequency;
+    *applied_frequency = frequency;
+    return ESP_OK;
 }
 
 uint8_t BM1397_init(GlobalState * GLOBAL_STATE)
 {
     // send the init command
-    _send_read_address();
+    BM1397_INIT_REQUIRE_SENT(_send_read_address(), "chip ID request");
 
     uint16_t asic_count = GLOBAL_STATE->DEVICE_CONFIG.family.asic_count;
     int chip_counter = count_asic_chips(asic_count, BM1397_CHIP_ID, BM1397_CHIP_ID_RESPONSE_LENGTH);
@@ -197,102 +240,206 @@ uint8_t BM1397_init(GlobalState * GLOBAL_STATE)
 
     // send serial data
     vTaskDelay(SLEEP_TIME / portTICK_PERIOD_MS);
-    _send_chain_inactive();
+    BM1397_INIT_REQUIRE_SENT(_send_chain_inactive(), "chain inactive");
 
     // split the chip address space evenly
     address_interval = 256 / chip_counter;
     for (uint8_t i = 0; i < chip_counter; i++) {
-        _set_chip_address(i * address_interval);
+        BM1397_INIT_REQUIRE_SENT(_set_chip_address(i * address_interval),
+                                 "chip address assignment");
     }
 
     unsigned char init[6] = {0x00, CLOCK_ORDER_CONTROL_0, 0x00, 0x00, 0x00, 0x00}; // init1 - clock_order_control0
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init, 6, BM1397_SERIALTX_DEBUG);
+    BM1397_INIT_REQUIRE_SENT(
+        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init, 6,
+                     BM1397_SERIALTX_DEBUG),
+        "clock order control 0");
 
     unsigned char init2[6] = {0x00, CLOCK_ORDER_CONTROL_1, 0x00, 0x00, 0x00, 0x00}; // init2 - clock_order_control1
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init2, 6, BM1397_SERIALTX_DEBUG);
+    BM1397_INIT_REQUIRE_SENT(
+        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init2, 6,
+                     BM1397_SERIALTX_DEBUG),
+        "clock order control 1");
 
     unsigned char init3[9] = {0x00, ORDERED_CLOCK_ENABLE, 0x00, 0x00, 0x00, 0x01}; // init3 - ordered_clock_enable
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init3, 6, BM1397_SERIALTX_DEBUG);
+    BM1397_INIT_REQUIRE_SENT(
+        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init3, 6,
+                     BM1397_SERIALTX_DEBUG),
+        "ordered clock enable");
 
     unsigned char init4[9] = {0x00, CORE_REGISTER_CONTROL, 0x80, 0x00, 0x80, 0x74}; // init4 - init_4_?
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init4, 6, BM1397_SERIALTX_DEBUG);
+    BM1397_INIT_REQUIRE_SENT(
+        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init4, 6,
+                     BM1397_SERIALTX_DEBUG),
+        "core register control");
 
     uint16_t difficulty = GLOBAL_STATE->DEVICE_CONFIG.family.asic.difficulty;
 
     //set difficulty mask
     uint8_t difficulty_mask[6];
     get_difficulty_mask(difficulty, difficulty_mask);
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), difficulty_mask, 6, BM1397_SERIALTX_DEBUG);
+    BM1397_INIT_REQUIRE_SENT(
+        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), difficulty_mask, 6,
+                     BM1397_SERIALTX_DEBUG),
+        "difficulty mask");
 
     unsigned char init5[9] = {0x00, PLL3_PARAMETER, 0xC0, 0x70, 0x01, 0x11}; // init5 - pll3_parameter
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init5, 6, BM1397_SERIALTX_DEBUG);
+    BM1397_INIT_REQUIRE_SENT(
+        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init5, 6,
+                     BM1397_SERIALTX_DEBUG),
+        "PLL3 parameter");
 
     unsigned char init6[9] = {0x00, FAST_UART_CONFIGURATION, 0x06, 0x00, 0x00, 0x0F}; // init6 - fast_uart_configuration
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init6, 6, BM1397_SERIALTX_DEBUG);
+    BM1397_INIT_REQUIRE_SENT(
+        _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), init6, 6,
+                     BM1397_SERIALTX_DEBUG),
+        "fast UART configuration");
 
-    // Baud formula = 25M/((denominator+1)*8)
-    // The denominator is 5 bits found in the misc_control (bits 9-13)
-    // default divider of 26 (11010) for 115,749
-    unsigned char baudrate[9] = {0x00, MISC_CONTROL, 0x00, 0x00, 0b01111010, 0b00110001}; // baudrate - misc_control
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), baudrate, 6, BM1397_SERIALTX_DEBUG);
+    int default_baud = 0;
+    BM1397_INIT_REQUIRE_OK(BM1397_set_default_baud(&default_baud),
+                           "default ASIC baud");
 
     //ramp up the hash frequency
-    do_frequency_transition(GLOBAL_STATE, BM1397_send_hash_frequency);
+    BM1397_INIT_REQUIRE_OK(
+        do_frequency_transition(GLOBAL_STATE, BM1397_send_hash_frequency),
+        "frequency transition");
 
     return chip_counter;
 }
 
-int BM1397_set_max_baud(void)
+// Baud formula = 25M/((denominator+1)*8)
+// The denominator is 5 bits found in the misc_control (bits 9-13)
+esp_err_t BM1397_set_default_baud(int *baud)
 {
+    if (baud == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // default divider of 26 (11010) for 115,749
+    unsigned char baudrate[9] = {0x00, MISC_CONTROL, 0x00, 0x00, 0b01111010, 0b00110001}; // baudrate - misc_control
+    if (!_send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), baudrate, 6,
+                      BM1397_SERIALTX_DEBUG)) {
+        return ESP_FAIL;
+    }
+    *baud = 115749;
+    return ESP_OK;
+}
+
+esp_err_t BM1397_set_max_baud(int *baud)
+{
+    if (baud == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     // divider of 0 for 3,125,000
     ESP_LOGI(TAG, "Setting max baud of 3125000");
     unsigned char baudrate[9] = {0x00, MISC_CONTROL, 0x00, 0x00, 0b01100000, 0b00110001};
     ; // baudrate - misc_control
-    _send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), baudrate, 6, BM1397_SERIALTX_DEBUG);
-    return 3125000;
+    if (!_send_BM1397((TYPE_CMD | GROUP_ALL | CMD_WRITE), baudrate, 6,
+                      BM1397_SERIALTX_DEBUG)) {
+        return ESP_FAIL;
+    }
+    *baud = 3125000;
+    return ESP_OK;
 }
 
 static uint8_t id = 0;
 
-void BM1397_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job)
+bool BM1397_send_work(GlobalState *GLOBAL_STATE, bm_job *next_bm_job,
+                      uint32_t expected_generation)
 {
-    job_packet job = { 0 };
+    if (GLOBAL_STATE == NULL || next_bm_job == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us == NULL ||
+        GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs == NULL) {
+        ESP_LOGE(TAG, "Cannot send job before job tracking is initialized");
+        return false;
+    }
+
+    job_packet job = {0};
     // max job number is 128
     // there is still some really weird logic with the job id bits for the asic to sort out
     // so we have it limited to 128 and it has to increment by 4
-    id = (id + 4) % 128;
-
-    job.job_id = id;
     job.num_midstates = next_bm_job->num_midstates;
     memcpy(&job.starting_nonce, &next_bm_job->starting_nonce, 4);
     memcpy(&job.nbits, &next_bm_job->target, 4);
     memcpy(&job.ntime, &next_bm_job->ntime, 4);
     memcpy(&job.merkle4, next_bm_job->merkle_root, 4);
-    memcpy(job.midstates, next_bm_job->midstates, next_bm_job->num_midstates * 32);
-
-    // Hold valid_jobs_lock across the free + reassignment so the result task
-    // (which snapshots active_jobs[job_id] under the same lock) can never observe
-    // or copy a slot we are freeing/replacing here. valid_jobs is set inside the
-    // same critical section so validity and the pointer stay consistent.
-    pthread_mutex_lock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
-    if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] != NULL)
-    {
-        free_bm_job(GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id]);
+    // Master's bm_job carries midstates as an array (see BM1397_NUM_MIDSTATES).
+    uint8_t midstate_count = next_bm_job->num_midstates;
+    if (midstate_count > BM1397_NUM_MIDSTATES) {
+        midstate_count = BM1397_NUM_MIDSTATES;
     }
-    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
-    GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs[job.job_id] = 1;
+    memcpy(job.midstates, next_bm_job->midstates, (size_t)midstate_count * 32);
+
+    // Invalidate the reused slot before TX, then publish metadata only after the
+    // UART accepted the complete packet. Holding the lock across this short
+    // enqueue makes send/publication atomic with clean-job invalidation.
+    pthread_mutex_lock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
+    if (__atomic_load_n(&GLOBAL_STATE->asic_lifecycle, __ATOMIC_ACQUIRE) !=
+        ASIC_LIFECYCLE_RUNNING) {
+        pthread_mutex_unlock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
+        ESP_LOGD(TAG, "Discarding job while ASIC is stopping");
+        return false;
+    }
+    if (ASIC_result_task_get_job_generation() != expected_generation) {
+        pthread_mutex_unlock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
+        ESP_LOGW(TAG, "Discarding job from stale generation %lu",
+                 (unsigned long)expected_generation);
+        return false;
+    }
+    const uint8_t next_id = (id + 4) % 128;
+    job.job_id = next_id;
+    bm_job *replaced_job =
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id];
+    bm_job *prior_retired_job =
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs[job.job_id];
+    int64_t replaced_dispatch_us =
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us[job.job_id];
+    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = NULL;
+    GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us[job.job_id] = 0;
+    GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs[job.job_id] = 0;
+    if (replaced_job != NULL) {
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_jobs[job.job_id] = replaced_job;
+        GLOBAL_STATE->ASIC_TASK_MODULE.retired_job_dispatch_us[job.job_id] =
+            replaced_dispatch_us;
+    }
+
+    bool sent = _send_BM1397((TYPE_JOB | GROUP_SINGLE | CMD_WRITE),
+                             (const uint8_t *)&job, sizeof(job),
+                             BM1397_DEBUG_WORK);
+    if (sent) {
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_job_dispatch_us[job.job_id] =
+            esp_timer_get_time();
+        GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs[job.job_id] = 1;
+        id = next_id;
+    }
     pthread_mutex_unlock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
+
+    if (replaced_job != NULL && prior_retired_job != NULL &&
+        prior_retired_job != replaced_job &&
+        prior_retired_job != next_bm_job) {
+        release_bm_job(prior_retired_job);
+    }
+
+    if (!sent) {
+        ESP_LOGE(TAG, "Failed to send job 0x%02X; slot remains invalid",
+                 job.job_id);
+        return false;
+    }
 
     #if BM1397_DEBUG_JOBS
     ESP_LOGI(TAG, "Send Job: %02X", job.job_id);
     #endif
 
-    _send_BM1397((TYPE_JOB | GROUP_SINGLE | CMD_WRITE), (uint8_t *)&job, sizeof(job_packet), BM1397_DEBUG_WORK);
+    return true;
 }
 
 task_result *BM1397_process_work(GlobalState * GLOBAL_STATE)
 {
     bm1397_asic_result_t asic_result = {0};
+    (void)GLOBAL_STATE;
 
     memset(&result, 0, sizeof(task_result));
 
@@ -301,7 +448,9 @@ task_result *BM1397_process_work(GlobalState * GLOBAL_STATE)
     }
 
     if (!asic_result.is_job_response) {
-        result.register_type = REGISTER_MAP[asic_result.cmd.register_address];
+        result.register_type = asic_register_map_lookup(
+            REGISTER_MAP, sizeof(REGISTER_MAP) / sizeof(REGISTER_MAP[0]),
+            asic_result.cmd.register_address);
         if (result.register_type == REGISTER_INVALID) {
             ESP_LOGW(TAG, "Unknown register read: %02x", asic_result.cmd.register_address);
             return NULL;
@@ -312,54 +461,8 @@ task_result *BM1397_process_work(GlobalState * GLOBAL_STATE)
         return &result;
     }
 
-    uint8_t nonce_found = 0;
-    uint32_t first_nonce = 0;
-
     uint8_t rx_job_id = asic_result.job.id & 0xfc;
     uint8_t rx_midstate_index = asic_result.job.id & 0x03;
-
-    // Read active_jobs[rx_job_id] under the lock: BM1397_send_work() can free and
-    // replace this slot from the create-jobs task, so dereferencing ->version /
-    // ->version_mask without the lock is a use-after-free. Snapshot both fields,
-    // then unlock and roll the version outside the critical section.
-    pthread_mutex_lock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
-    if (GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs[rx_job_id] == 0 || GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id] == NULL)
-    {
-        pthread_mutex_unlock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
-        ESP_LOGW(TAG, "Invalid job nonce found, id=%d", rx_job_id);
-        return NULL;
-    }
-    uint32_t rolled_version = GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id]->version;
-    uint32_t version_mask = GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id]->version_mask;
-    pthread_mutex_unlock(&GLOBAL_STATE->ASIC_TASK_MODULE.valid_jobs_lock);
-
-    for (int i = 0; i < rx_midstate_index; i++)
-    {
-        rolled_version = increment_bitmask(rolled_version, version_mask);
-    }
-
-    // ASIC may return the same nonce multiple times
-    // or one that was already found
-    // most of the time it behaves however
-    if (nonce_found == 0)
-    {
-        first_nonce = asic_result.job.nonce;
-        nonce_found = 1;
-    }
-    else if (asic_result.job.nonce == first_nonce)
-    {
-        // stop if we've already seen this nonce
-        return NULL;
-    }
-
-    if (asic_result.job.nonce == prev_nonce)
-    {
-        return NULL;
-    }
-    else
-    {
-        prev_nonce = asic_result.job.nonce;
-    }
 
     uint32_t nonce_h = ntohl(asic_result.job.nonce);
     uint8_t asic_nr = (uint8_t)((nonce_h >> 17) & 0xff) / address_interval;
@@ -368,7 +471,7 @@ task_result *BM1397_process_work(GlobalState * GLOBAL_STATE)
 
     result.job_id = rx_job_id;
     result.nonce = asic_result.job.nonce;
-    result.rolled_version = rolled_version;
+    result.version_rolling_index = rx_midstate_index;
     result.asic_nr = asic_nr;
     result.core_id = core_id;
     result.small_core_id = small_core_id;

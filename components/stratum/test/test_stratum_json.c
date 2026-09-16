@@ -95,6 +95,15 @@ TEST_CASE("Parse stratum set_difficulty params with fractional", "[mining.set_di
     TEST_ASSERT_EQUAL_DOUBLE(100.5, stratum_api_v1_message.new_difficulty);
 }
 
+TEST_CASE("Reject non-finite stratum difficulty", "[mining.set_difficulty]")
+{
+    const char *json_string =
+        "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[1e309]}";
+    StratumApiV1Message stratum_api_v1_message = {};
+    TEST_ASSERT_FALSE(
+        STRATUM_V1_parse(&stratum_api_v1_message, json_string));
+}
+
 TEST_CASE("Parse stratum notify params", "[mining.notify]")
 {
     memset(&stratum_api_v1_message, 0, sizeof(stratum_api_v1_message));
@@ -122,6 +131,27 @@ TEST_CASE("Test mining.subcribe result parsing", "[mining.subscribe]")
     TEST_ASSERT_TRUE(STRATUM_V1_parse(&stratum_api_v1_message, json_string));
     TEST_ASSERT_EQUAL_STRING("4de05269", stratum_api_v1_message.extranonce_str);
     TEST_ASSERT_EQUAL_INT(8, stratum_api_v1_message.extranonce_2_len);
+}
+
+TEST_CASE("Parse mining.subscribe with string or absent response id", "[mining.subscribe]")
+{
+    const char *result =
+        "{\"result\":[[[\"mining.notify\",\"695482c0\"]],\"4de05269\",8],\"id\":\"2\",\"error\":null}";
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(&message, result));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_SUBSCRIBE, message.method);
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(2, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+    STRATUM_V1_reset_message(&message);
+
+    result =
+        "{\"result\":[[[\"mining.notify\",\"695482c0\"]],\"4de05269\",8],\"id\":null,\"error\":null}";
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(&message, result));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_SUBSCRIBE, message.method);
+    TEST_ASSERT_FALSE(message.has_message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+    STRATUM_V1_reset_message(&message);
 }
 
 TEST_CASE("Parse stratum mining.subscribe result malformed", "[mining.subscribe]")
@@ -157,6 +187,36 @@ TEST_CASE("Parse stratum result success", "[stratum]")
     TEST_ASSERT_EQUAL(5, stratum_api_v1_message.message_id);
     TEST_ASSERT_EQUAL(STRATUM_RESULT, stratum_api_v1_message.method);
     TEST_ASSERT_TRUE(stratum_api_v1_message.response_success);
+}
+
+TEST_CASE("Parse response identity and shape metadata", "[stratum]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message, "{\"id\":\"3\",\"error\":null,\"result\":true}"));
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(3, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message, "{\"id\":null,\"error\":null,\"result\":true}"));
+    TEST_ASSERT_FALSE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(-1, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
+
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":2,\"method\":\"mining.unknown\",\"params\":[]}"));
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(2, message.message_id);
+    TEST_ASSERT_FALSE(message.is_response);
+
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":2,\"error\":null,\"result\":{\"unexpected\":true}}"));
+    TEST_ASSERT_TRUE(message.has_message_id);
+    TEST_ASSERT_EQUAL_INT(2, message.message_id);
+    TEST_ASSERT_TRUE(message.is_response);
 }
 
 TEST_CASE("Parse stratum result success with large id", "[stratum]")
@@ -360,17 +420,16 @@ TEST_CASE("Parse stratum set_difficulty rejects invalid values", "[mining.set_di
     TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, json_huge));
 }
 
-TEST_CASE("Parse stratum mining.set_extranonce negative length clamped", "[stratum]")
+TEST_CASE("Parse stratum mining.set_extranonce rejects out-of-range extranonce2 size", "[stratum]")
 {
     memset(&msg, 0, sizeof(msg));
+    // Clamping would mine a coinbase length the pool never agreed to, so every
+    // share would be invalid. Rejecting forces a clean reconnect instead.
     const char *json_neg_e2 = "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"deadbeef\",-1]}";
-    TEST_ASSERT_TRUE(STRATUM_V1_parse(&msg, json_neg_e2));
-    TEST_ASSERT_EQUAL(MINING_SET_EXTRANONCE, msg.method);
-    TEST_ASSERT_EQUAL_INT(0, msg.extranonce_2_len);
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, json_neg_e2));
 
     const char *json_oversized_e2 = "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"deadbeef\",64]}";
-    TEST_ASSERT_TRUE(STRATUM_V1_parse(&msg, json_oversized_e2));
-    TEST_ASSERT_EQUAL_INT(32, msg.extranonce_2_len);
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, json_oversized_e2));
 
     // Odd hex string length should be rejected
     const char *json_odd_hex = "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"deadbee\",8]}";
@@ -432,17 +491,14 @@ TEST_CASE("Parse stratum notify type confusion", "[mining.notify]")
     TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, json_int_ver));
 }
 
-TEST_CASE("Parse stratum subscribe result extranonce negative size", "[mining.subscribe]")
+TEST_CASE("Parse stratum subscribe result rejects out-of-range extranonce2 size", "[mining.subscribe]")
 {
     memset(&msg, 0, sizeof(msg));
     const char *json_sub_neg = "{\"result\":[[[\"mining.notify\",\"695482c0\"]],\"4de05269\",-1],\"id\":2,\"error\":null}";
-    TEST_ASSERT_TRUE(STRATUM_V1_parse(&msg, json_sub_neg));
-    TEST_ASSERT_EQUAL_STRING("4de05269", msg.extranonce_str);
-    TEST_ASSERT_EQUAL_INT(0, msg.extranonce_2_len);
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, json_sub_neg));
 
     const char *json_sub_oversized = "{\"result\":[[[\"mining.notify\",\"695482c0\"]],\"4de05269\",100],\"id\":2,\"error\":null}";
-    TEST_ASSERT_TRUE(STRATUM_V1_parse(&msg, json_sub_oversized));
-    TEST_ASSERT_EQUAL_INT(32, msg.extranonce_2_len);
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, json_sub_oversized));
 
     // Odd length extranonce1 in subscribe result should be rejected
     const char *json_sub_odd_e1 = "{\"result\":[[[\"mining.notify\",\"695482c0\"]],\"4de0526\",4],\"id\":2,\"error\":null}";
@@ -705,4 +761,138 @@ TEST_CASE("Reject invalid numeric and trailing JSON-RPC values", "[stratum][secu
     // Non-object JSON
     TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, "true"));
     TEST_ASSERT_FALSE(STRATUM_V1_parse(&msg, "[1, 2, 3]"));
+}
+
+TEST_CASE("Parse rejected BIP310 configure results", "[stratum][bip310]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":false},\"error\":null}"));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_CONFIGURE, message.method);
+    TEST_ASSERT_FALSE(message.response_success);
+    TEST_ASSERT_NOT_NULL(message.error_str);
+
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":\"mask unavailable\"},\"error\":null}"));
+    TEST_ASSERT_EQUAL(STRATUM_RESULT_CONFIGURE, message.method);
+    TEST_ASSERT_FALSE(message.response_success);
+    TEST_ASSERT_EQUAL_STRING("mask unavailable", message.error_str);
+    STRATUM_V1_reset_message(&message);
+}
+
+TEST_CASE("Reject malformed BIP310 masks", "[stratum][bip310]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":true},\"error\":null}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"result\":{\"version-rolling\":true,\"version-rolling.mask\":\"1fffe00z\"},\"error\":null}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":null,\"method\":\"mining.set_version_mask\",\"params\":[\"ffff\"]}"));
+    STRATUM_V1_reset_message(&message);
+}
+
+TEST_CASE("Validate Stratum extranonce fields", "[stratum][extranonce]")
+{
+    StratumApiV1Message message = {};
+    TEST_ASSERT_TRUE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"\",0]}"));
+    TEST_ASSERT_EQUAL_INT(0, message.extranonce_2_len);
+
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abc\",4]}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abcd\",-1]}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abcd\",33]}"));
+    TEST_ASSERT_FALSE(STRATUM_V1_parse(
+        &message,
+        "{\"id\":1,\"method\":\"mining.set_extranonce\",\"params\":[\"abcd\",1.5]}"));
+    STRATUM_V1_reset_message(&message);
+}
+
+TEST_CASE("Format BIP310 and legacy V1 requests", "[stratum][bip310]")
+{
+    char request[512];
+    TEST_ASSERT_GREATER_THAN(
+        0, STRATUM_V1_format_configure_request(
+               request, sizeof(request), 1, 0x1fffe000,
+               STRATUM_VERSION_ROLLING_MIN_BIT_COUNT));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":1,\"method\":\"mining.configure\",\"params\":[[\"version-rolling\"],{\"version-rolling.mask\":\"1fffe000\",\"version-rolling.min-bit-count\":2}]}\n",
+        request);
+
+    TEST_ASSERT_GREATER_THAN(
+        0, STRATUM_V1_format_submit_request(
+               request, sizeof(request), 7, "worker", "job", "01000000",
+               0x12345678, 0x90abcdef, false, 0));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":7,\"method\":\"mining.submit\",\"params\":[\"worker\",\"job\",\"01000000\",\"12345678\",\"90abcdef\"]}\n",
+        request);
+
+    TEST_ASSERT_GREATER_THAN(
+        0, STRATUM_V1_format_submit_request(
+               request, sizeof(request), 8, "worker", "job", "01000000",
+               0x12345678, 0x90abcdef, true, 0x00002000));
+    TEST_ASSERT_EQUAL_STRING(
+        "{\"id\":8,\"method\":\"mining.submit\",\"params\":[\"worker\",\"job\",\"01000000\",\"12345678\",\"90abcdef\",\"00002000\"]}\n",
+        request);
+}
+
+TEST_CASE("Oversized V1 submit is a formatting error", "[stratum][submit]")
+{
+    char oversized_job[1024];
+    memset(oversized_job, 'a', sizeof(oversized_job) - 1);
+    oversized_job[sizeof(oversized_job) - 1] = '\0';
+    uint64_t sent_time_us = UINT64_MAX;
+
+    TEST_ASSERT_EQUAL_INT(
+        STRATUM_V1_SUBMIT_FORMAT_ERROR,
+        STRATUM_V1_submit_share(
+            NULL, 9, "worker", oversized_job, "01000000", 0x12345678,
+            0x90abcdef, false, 0, &sent_time_us));
+    // The target Unity configuration has 64-bit assertions disabled.
+    TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, (uint32_t)(sent_time_us >> 32));
+    TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, (uint32_t)sent_time_us);
+}
+
+TEST_CASE("Transient BIP310 failure skips exactly one probe", "[stratum][bip310]")
+{
+    stratum_v1_bip310_state_t state =
+        STRATUM_V1_BIP310_STATE_INITIALIZER;
+
+    TEST_ASSERT_TRUE(STRATUM_V1_bip310_should_probe(&state));
+    STRATUM_V1_bip310_transient_failure(&state);
+    TEST_ASSERT_FALSE(STRATUM_V1_bip310_should_probe(&state));
+    TEST_ASSERT_TRUE(STRATUM_V1_bip310_should_probe(&state));
+}
+
+TEST_CASE("Explicit BIP310 rejection remains in legacy mode", "[stratum][bip310]")
+{
+    stratum_v1_bip310_state_t state =
+        STRATUM_V1_BIP310_STATE_INITIALIZER;
+
+    STRATUM_V1_bip310_mark_unsupported(&state);
+    TEST_ASSERT_FALSE(STRATUM_V1_bip310_should_probe(&state));
+    STRATUM_V1_bip310_transient_failure(&state);
+    TEST_ASSERT_FALSE(STRATUM_V1_bip310_should_probe(&state));
+}
+
+TEST_CASE("Successful BIP310 negotiation restores probing state", "[stratum][bip310]")
+{
+    stratum_v1_bip310_state_t state =
+        STRATUM_V1_BIP310_STATE_INITIALIZER;
+
+    STRATUM_V1_bip310_mark_unsupported(&state);
+    STRATUM_V1_bip310_mark_supported(&state);
+    TEST_ASSERT_TRUE(STRATUM_V1_bip310_should_probe(&state));
 }

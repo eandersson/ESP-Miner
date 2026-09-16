@@ -1,8 +1,9 @@
 #ifndef MINING_H_
 #define MINING_H_
 
-#include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "miner_job.h"
 
 #define BM_JOB_MAX_MIDSTATES 4
@@ -22,10 +23,21 @@ typedef struct bm_job
     double pool_diff;
     uint8_t pool_id;
     miner_job_type_t job_type;
+    // Stratum connection that issued this job. A share is only submitted on
+    // the same connection (and therefore with the same authorized user).
+    uint32_t session_id;
+    bool version_rolling_enabled;
     char *jobid;
     char *extranonce2;
 } bm_job;
 
+// Allocate a zero-initialized job with immutable metadata stored in the same
+// allocation. The returned reference is owned by the caller.
+bm_job *allocate_bm_job(const char *jobid, const char *extranonce2);
+void retain_bm_job(bm_job *job);
+void release_bm_job(bm_job *job);
+// Free a legacy independently allocated job and its metadata. Jobs returned by
+// allocate_bm_job() must instead be released with release_bm_job().
 void free_bm_job(bm_job *job);
 
 void calculate_coinbase_tx_hash_bin(const uint8_t *prefix, size_t prefix_len,
@@ -45,6 +57,19 @@ double hash_to_pdiff(const uint8_t hash[32]);
 
 double test_nonce_value(const bm_job *job, const uint32_t nonce, const uint32_t rolled_version);
 
+bool extranonce_2_generate(uint64_t extranonce_2, uint32_t length,
+                           char *dest, size_t dest_size);
+bool extranonce_2_increment(uint64_t *extranonce_2, uint32_t length);
+
+// Stratum V1 specifies that a new difficulty applies to the next job, while
+// some pools enforce increases immediately. Requiring the stricter of the
+// job snapshot and the latest announcement is safe for both behaviors and
+// keeps decreases tied to the job that introduced them.
+double mining_v1_effective_share_difficulty(double job_difficulty,
+                                            double announced_difficulty);
+
 uint32_t increment_bitmask(const uint32_t value, const uint32_t mask);
+size_t version_mask_midstate_count(uint32_t version_mask);
+size_t version_mask_value_count(uint32_t version_mask);
 
 #endif /* MINING_H_ */

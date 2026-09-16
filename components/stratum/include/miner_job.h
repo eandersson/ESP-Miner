@@ -36,6 +36,12 @@ typedef struct {
     uint8_t          extranonce1_len;
     uint8_t          extranonce2_len;
     uint8_t          pool_id;
+    // Stratum connection that produced this job (see bm_job.session_id).
+    uint32_t         session_id;
+    // Job-invalidation epoch at publication (ASIC_result_task pool
+    // generation). The scheduler drops work published before a clean job or
+    // disconnect instead of mining it for a dead session.
+    uint32_t         pool_generation;
 
     // Merkle tree branches (32-byte binary hashes)
     uint8_t          merkle_path[MAX_MERKLE_BRANCHES][32];
@@ -54,6 +60,21 @@ typedef struct {
 // Pre-allocated ring buffer pool helpers
 void miner_job_pool_init(void);
 miner_job_t *miner_job_get_slot(size_t index);
+
+// Serializes ring-slot writers (stratum clients, self-test) with the job
+// scheduler's copy-out. Hold it only while writing a slot or copying one out;
+// never across network or UART I/O.
+void miner_job_lock(void);
+void miner_job_unlock(void);
+
+// Allocate full-size coinbase buffers for a job kept outside the ring (the
+// scheduler's working copy, a client's parse buffer). Returns false on OOM.
+bool miner_job_alloc_buffers(miner_job_t *job);
+void miner_job_free_buffers(miner_job_t *job);
+
+// Copy every field and the used coinbase bytes of src into dst while keeping
+// dst's own buffers. Both jobs must own full-size coinbase buffers.
+void miner_job_copy(miner_job_t *dst, const miner_job_t *src);
 
 static inline bool miner_job_is_rollable(const miner_job_t *job)
 {

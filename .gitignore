@@ -23,6 +23,13 @@ build/config/*
 test/build/*
 test-ci/
 
+# Local build, package-manager, and IDE artifacts
+/build-*/
+/.idea/
+/.pnpm-store/
+/.tmp-pnpm/
+/test/managed_components/
+
 # HTML documentation
 html_doc/
 

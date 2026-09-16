@@ -15,8 +15,12 @@
 #include "nvs_config.h"
 #include "global_state.h"
 #include "asic.h"
+#include "asic_init.h"
 #include "asic_reset.h"
+#include "serial.h"
 #include "device_config.h"
+#include "hashrate_monitor_task.h"
+#include "asic_result_task.h"
 #include "PID.h"
 #include "self_test.h"
 #include "stratum_api.h"
@@ -546,6 +550,7 @@ void self_test_task(void * pvParameters)
 
     // 4. Mock mining.notify
     memset(&msg, 0, sizeof(msg));
+    miner_job_lock();
     uint8_t target_slot = (GLOBAL_STATE->active_job_slot_idx + 1) % 2;
     miner_job_t *job = miner_job_get_slot(target_slot);
     const char *notify_json = "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"0\",\"0c859545a3498373a57452fac22eb7113df2a465000543520000000000000000\",\"01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4b0389130cfabe6d6d5cbab26a2599e92916edec5657a94a0708ddb970f5c45b5d\",\"31650707758de07b010000000000001cfd7038212f736c7573682f000000000379ad0c2a000000001976a9147c154ed1dc59609e3d26abb2df2ea3d587cd8c4188ac00000000000000002c6a4c2952534b424c4f434b3ae725d3994b811572c1f345deb98b56b465ef8e153ecbbd27fa37bf1b005161380000000000000000266a24aa21a9ed63b06a7946b190a3fda1d76165b25c9b883bcc6621b040773050ee2a1bb18f1800000000\",[\"2b77d9e413e8121cd7a17ff46029591051d0922bd90b2b2a38811af1cb57a2b2\",\"5c8874cef00f3a233939516950e160949ef327891c9090467cead995441d22c5\",\"2d91ff8e19ac5fa69a40081f26c5852d366d608b04d2efe0d5b65d111d0d8074\",\"0ae96f609ad2264112a0b2dfb65624bedbcea3b036a59c0173394bba3a74e887\",\"e62172e63973d69574a82828aeb5711fc5ff97946db10fc7ec32830b24df7bde\",\"adb49456453aab49549a9eb46bb26787fb538e0a5f656992275194c04651ec97\",\"a7bc56d04d2672a8683892d6c8d376c73d250a4871fdf6f57019bcc737d6d2c2\",\"d94eceb8182b4f418cd071e93ec2a8993a0898d4c93bc33d9302f60dbbd0ed10\",\"5ad7788b8c66f8f50d332b88a80077ce10e54281ca472b4ed9bbbbcb6cf99083\",\"9f9d784b33df1b3ed3edb4211afc0dc1909af9758c6f8267e469f5148ed04809\",\"48fd17affa76b23e6fb2257df30374da839d6cb264656a82e34b350722b05123\",\"c4f5ab01913fc186d550c1a28f3f3e9ffaca2016b961a6a751f8cca0089df924\",\"cff737e1d00176dd6bbfa73071adbb370f227cfb5fba186562e4060fcec877e1\"],\"20000004\",\"1705ae3a\",\"647025b5\",true]}";
@@ -554,6 +559,7 @@ void self_test_task(void * pvParameters)
     if (msg.method == MINING_NOTIFY) {
         ESP_LOGI(TAG, "Activating mock work for self-test");
         job->pool_id = 0;
+        job->session_id = 0;
         job->pool_diff = mock_diff;
         job->version_mask = mock_version_mask;
         job->extranonce1_len = (uint8_t)e1_len;
@@ -561,10 +567,13 @@ void self_test_task(void * pvParameters)
             memcpy(job->extranonce1, extranonce1_bin, e1_len);
         }
         job->extranonce2_len = (uint8_t)e2_len;
+        job->pool_generation = ASIC_result_task_get_pool_generation();
+        miner_job_unlock();
         if (GLOBAL_STATE->create_jobs_task_handle) {
             xTaskNotify(GLOBAL_STATE->create_jobs_task_handle, target_slot, eSetValueWithOverwrite);
         }
     } else {
+        miner_job_unlock();
         ESP_LOGE(TAG, "Failed to parse mock mining notification");
         tests_done(GLOBAL_STATE, false);
     }
@@ -778,18 +787,27 @@ static void tests_done(GlobalState * GLOBAL_STATE, bool isTestPassed)
 {
     GLOBAL_STATE->SELF_TEST_MODULE.is_finished = true;
     self_test_stop_nonce_measurement(GLOBAL_STATE);
-    asic_hold_reset_low();
+    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPING);
+    pthread_mutex_lock(&GLOBAL_STATE->asic_command_lock);
+    (void)SERIAL_pause_tx(0);
+    if (asic_hold_reset_low() != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to hold ASIC reset low after self-test");
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
     if (VCORE_is_initialized()) {
         // Let the power monitor observe is_finished and exit before VCORE is
         // intentionally disabled, otherwise it can report the OFF status as a
         // regulator fault during self-test cleanup.
         vTaskDelay(pdMS_TO_TICKS(SELF_TEST_POWER_MONITOR_STOP_MS));
         if (VCORE_set_voltage(GLOBAL_STATE, 0.0f) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to turn off VCORE after self-test");
+            ESP_LOGE(TAG, "Unable to disable VCORE after self-test");
         }
     } else {
         ESP_LOGW(TAG, "Skipping VCORE shutdown because the regulator was not initialized");
     }
+    GLOBAL_STATE->POWER_MANAGEMENT_MODULE.expected_hashrate = 0.0f;
+    asic_lifecycle_set(GLOBAL_STATE, ASIC_LIFECYCLE_STOPPED);
+
     if (isTestPassed) {
         if (isFactoryTest) {
             ESP_LOGI(TAG, "Self-test flag cleared");

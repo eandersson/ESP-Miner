@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "websocket_api.h"
 #include "websocket.h"
@@ -12,6 +13,7 @@
 #include "cjson_utils.h"
 
 #define WEBSOCKET_API_RATE_LIMIT_MS 500
+#define WEBSOCKET_API_KEEPALIVE_MS 2000
 
 static const char *TAG = "websocket_api";
 static GlobalState *GLOBAL_STATE = NULL;
@@ -25,8 +27,10 @@ static int prebuffer_len = 256;
  * @param fd Client file descriptor (-1 for broadcast).
  * @return cJSON* The new full JSON state that should track current reality.
  */
-static cJSON* process_and_send_update(cJSON *last_state, int fd)
+static cJSON* process_and_send_update(cJSON *last_state, int fd, bool *out_sent)
 {
+    if (out_sent) *out_sent = false;
+
     cJSON *current_full = system_api_get_full_json(GLOBAL_STATE);
     if (!current_full) return last_state; // Keep last state if we failed to generate new one
 
@@ -65,6 +69,7 @@ static cJSON* process_and_send_update(cJSON *last_state, int fd)
                 } else {
                     websocket_send_to_client(fd, &ws_pkt);
                 }
+                if (out_sent) *out_sent = true;
                 free((void *)json_str);
             }
             cJSON_Delete(msg);
@@ -84,8 +89,21 @@ void websocket_api_on_connect(int fd)
     }
 
     // On connect, we diff against NULL to send the full current state
-    cJSON *full = process_and_send_update(NULL, fd);
+    cJSON *full = process_and_send_update(NULL, fd, NULL);
     cJSON_Delete(full);
+}
+
+static void send_keepalive(void)
+{
+    static const char ping[] = "{\"event\":\"ping\"}";
+
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.payload = (uint8_t *)ping;
+    ws_pkt.len = strlen(ping);
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    websocket_broadcast(WS_TYPE_API, &ws_pkt);
 }
 
 void websocket_api_task(void *pvParameters)
@@ -100,6 +118,7 @@ void websocket_api_task(void *pvParameters)
 
     // Initialize the baseline state
     cJSON *last_full_json = system_api_get_full_json(GLOBAL_STATE);
+    int64_t last_send_us = esp_timer_get_time();
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(WEBSOCKET_API_RATE_LIMIT_MS));
@@ -116,14 +135,24 @@ void websocket_api_task(void *pvParameters)
         // We have clients. If we were hibernating, initialize the baseline now
         if (last_full_json == NULL) {
             last_full_json = system_api_get_full_json(GLOBAL_STATE);
+            last_send_us = esp_timer_get_time();
         }
 
         // Process diff and rotate state
-        cJSON *new_full_json = process_and_send_update(last_full_json, -1);
-        
+        bool sent = false;
+        cJSON *new_full_json = process_and_send_update(last_full_json, -1, &sent);
+
         if (new_full_json != last_full_json) {
             cJSON_Delete(last_full_json);
             last_full_json = new_full_json;
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        if (sent) {
+            last_send_us = now_us;
+        } else if ((now_us - last_send_us) / 1000 >= WEBSOCKET_API_KEEPALIVE_MS) {
+            send_keepalive();
+            last_send_us = now_us;
         }
     }
 }

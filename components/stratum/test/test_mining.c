@@ -3,8 +3,63 @@
 #include "stratum_api.h"
 #include "utils.h"
 
+#include <float.h>
 #include <limits.h>
+#include <math.h>
 #include <string.h>
+
+TEST_CASE("Refcounted jobs retain inline metadata", "[mining]")
+{
+    bm_job *job = allocate_bm_job("pool-job-123", "01020304");
+    TEST_ASSERT_NOT_NULL(job);
+    TEST_ASSERT_EQUAL_STRING("pool-job-123", job->jobid);
+    TEST_ASSERT_EQUAL_STRING("01020304", job->extranonce2);
+
+    retain_bm_job(job);
+    release_bm_job(job);
+
+    // The queue's retained reference keeps metadata alive after an active slot
+    // releases its ownership.
+    TEST_ASSERT_EQUAL_STRING("pool-job-123", job->jobid);
+    TEST_ASSERT_EQUAL_STRING("01020304", job->extranonce2);
+    release_bm_job(job);
+}
+
+TEST_CASE("Job allocation rejects missing metadata", "[mining]")
+{
+    TEST_ASSERT_NULL(allocate_bm_job(NULL, ""));
+    TEST_ASSERT_NULL(allocate_bm_job("job", NULL));
+}
+
+TEST_CASE("Constructed jobs carry their issuing session", "[mining]")
+{
+    static miner_job_t source;
+    memset(&source, 0, sizeof(source));
+    source.type = JOB_TYPE_V1;
+    source.version = 0x20000000;
+    source.nbits = 0x1705ae3a;
+    source.ntime = 0x6470e2a1;
+    source.pool_diff = 1024.0;
+    source.pool_id = 1;
+    source.session_id = 0xdeadbeef;
+    source.version_mask = 0x1fffe000;
+
+    uint8_t merkle_root[32] = {0};
+    bm_job job = {0};
+    construct_bm_job_from_miner_job(&source, 0, merkle_root,
+                                    source.version_mask, source.pool_diff,
+                                    0, &job);
+    TEST_ASSERT_EQUAL_UINT32(0xdeadbeef, job.session_id);
+    TEST_ASSERT_EQUAL_UINT8(1, job.pool_id);
+    TEST_ASSERT_TRUE(job.version_rolling_enabled);
+
+    // Without a negotiated mask the V1 submit must omit version bits.
+    source.version_mask = 0;
+    bm_job legacy = {0};
+    construct_bm_job_from_miner_job(&source, 0, merkle_root, 0,
+                                    source.pool_diff, 0, &legacy);
+    TEST_ASSERT_FALSE(legacy.version_rolling_enabled);
+}
 
 TEST_CASE("Check coinbase tx construction", "[mining]")
 {
@@ -31,6 +86,45 @@ TEST_CASE("Check coinbase tx construction", "[mining]")
     double_sha256_bin(expected_coinbase_tx_bin, expected_coinbase_tx_len, expected_coinbase_tx_hash);
 
     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected_coinbase_tx_hash, coinbase_tx_hash, 32);
+}
+
+TEST_CASE("Streaming coinbase hash matches a contiguous hash for large coinbases", "[mining]")
+{
+    // Larger than any fixed stack buffer so the streaming path is what is
+    // being checked, not a small-input special case.
+    static uint8_t prefix[700];
+    static uint8_t suffix[1500];
+    static uint8_t contiguous[sizeof(prefix) + 4 + 8 + sizeof(suffix)];
+    const uint8_t extranonce_prefix[4] = {0xe9, 0x69, 0x57, 0x91};
+    const uint8_t extranonce_2[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    for (size_t i = 0; i < sizeof(prefix); i++) {
+        prefix[i] = (uint8_t)(i * 7u + 3u);
+    }
+    for (size_t i = 0; i < sizeof(suffix); i++) {
+        suffix[i] = (uint8_t)(i * 13u + 1u);
+    }
+
+    size_t offset = 0;
+    memcpy(contiguous + offset, prefix, sizeof(prefix));
+    offset += sizeof(prefix);
+    memcpy(contiguous + offset, extranonce_prefix, sizeof(extranonce_prefix));
+    offset += sizeof(extranonce_prefix);
+    memcpy(contiguous + offset, extranonce_2, sizeof(extranonce_2));
+    offset += sizeof(extranonce_2);
+    memcpy(contiguous + offset, suffix, sizeof(suffix));
+    offset += sizeof(suffix);
+
+    uint8_t expected[32];
+    double_sha256_bin(contiguous, offset, expected);
+
+    uint8_t actual[32];
+    calculate_coinbase_tx_hash_bin(prefix, sizeof(prefix),
+                                   extranonce_prefix, sizeof(extranonce_prefix),
+                                   extranonce_2, sizeof(extranonce_2),
+                                   suffix, sizeof(suffix), actual);
+
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, actual, sizeof(expected));
 }
 
 // Values calculated from esp-miner/components/stratum/test/verifiers/merklecalc.py
@@ -144,6 +238,158 @@ TEST_CASE("Validate version mask incrementing", "[mining]")
     TEST_ASSERT_EQUAL_UINT32(0x20000304, rolled_version);
     rolled_version = increment_bitmask(rolled_version, version_mask);
     TEST_ASSERT_EQUAL_UINT32(0x20000404, rolled_version);
+}
+
+TEST_CASE("Version mask increment carries across sparse mask gaps", "[mining]")
+{
+    const uint32_t mask = 0x00000016;  // packed bits at positions 1, 2, and 4
+    const uint32_t value = 0xa0000006; // packed value 3, plus unmasked bits
+
+    TEST_ASSERT_EQUAL_UINT32(0xa0000010,
+                             increment_bitmask(value, mask));
+}
+
+TEST_CASE("Version mask increment wraps a full-width mask", "[mining]")
+{
+    TEST_ASSERT_EQUAL_UINT32(0, increment_bitmask(UINT32_MAX, UINT32_MAX));
+}
+
+TEST_CASE("Version mask increment leaves a zero mask unchanged", "[mining]")
+{
+    TEST_ASSERT_EQUAL_UINT32(0xa5a55a5a,
+                             increment_bitmask(0xa5a55a5a, 0));
+}
+
+TEST_CASE("Version mask helpers report distinct work cardinality", "[mining]")
+{
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_midstate_count(0));
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_midstate_count(0x00002000));
+    TEST_ASSERT_EQUAL_UINT32(4, version_mask_midstate_count(0x00006000));
+    TEST_ASSERT_EQUAL_UINT32(1, version_mask_value_count(0));
+    TEST_ASSERT_EQUAL_UINT32(2, version_mask_value_count(0x00002000));
+    TEST_ASSERT_EQUAL_UINT32(4, version_mask_value_count(0x00006000));
+    TEST_ASSERT_EQUAL_UINT32(65536,
+                             version_mask_value_count(0x1fffe000));
+}
+
+// Values calculated from esp-miner/components/stratum/test/verifiers/bm1397.py
+// TEST_CASE("Validate bm job construction 2", "[mining]")
+// {
+//     const char * notify_json_str = "{\"id\":null,\"method\":\"mining.notify\","
+//     "\"params\":[\"21554471e8\",\"8bc8707eb169ad3bda101ae60c8d48bd00aff68a00006c8b0000000000000000\",\"01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4b03d8130cfabe6d6db0ba74b36edc62c9268c945b53ebf1a7865b88bcdd40235a7a63d0f5ed5b6c400100000000000000\",\"e8714455212f736c7573682f00000000033de04728000000001976a9147c154ed1dc59609e3d26abb2df2ea3d587cd8c4188ac00000000000000002c6a4c2952534b424c4f434b3ae8c3686251b5ced65b6a65ea3e0491ac2975cd87c02b0640d3ec3c20005167770000000000000000266a24aa21a9eddffbecb5ef0a46324a3dd902fa84509a38d2c91548768845db5d6c2de0e33f6100000000\","
+//     "[\"8ef6b79382a1fc5152c7e69b2dd4e3795ed758d6fe7748ef4d96e3ad8ac180b8\",\"5b6e1cfecd94050b763c2c6a08d4caabd54daee665aa8e41b53b39ec76b62707\",\"f85b768f83fffbb3927f7f440cb57a5ed386f368aae88ad9b9d92e7bc1cdce15\",\"e51b9391c39019d8a2a27becc048cc770f5d33b49a29779fdc7bed04767ca962\",\"9f5d08316ead260455ec532a58935411a3eecf3c9948a52325de495d7dd7b776\",\"57e10cad23a646ad3a87fcd34eae454567dbd44946e746ee6310a86b98afa4ac\",\"f3b65cc08b25901b657efb22f0a9a23e1a61ce1e268f801d8cfe782b4a0c5e5d\",\"648e00fe2a57dca155c7d4260bc52273b28adb42e1bceb45d5ee03f4a4c5d174\",\"43ad393f7efe4b7a29775dbbc10b3b2737e9457764a7b39bc8ac6b470b968ac8\",\"4964b9b2bf601dfb2bd62067acafe556650412b1e6fe32df48c39310f7dc255d\",\"44d354ac57fcb68b408df7f5396122195384914dd2db13d5766c334fc48c2069\",\"568514a2db82a055772218f52db2f5fa157c37a9ba16c1a239819e57f0d16218\"],"
+//     "\"20000004\",\"1705ae3a\",\"6470e2a1\",true]}";
+//     mining_notify * params = parse_mining_notify_message(notify_json_str, 512);
+//     char * coinbase_tx = construct_coinbase_tx(params->coinbase_1, params->coinbase_2, "336508070fca95", "0000000000000000");
+//     char merkle_root[65]
+//     calculate_merkle_root_hash(coinbase_tx, (uint8_t(*)[32])params->merkle_branches, params->n_merkle_branches, merkle_root);
+//     bm_job job = { 0 };
+//     construct_bm_job(params, merkle_root, 1000, &job);
+
+//     uint8_t expected_midstate_bin[32];
+//     hex2bin("5FD281AF6A1750EAEE502C04067738BD46C82FC22112FFE797CE7F035D276126", expected_midstate_bin, 32);
+//     // bytes are reversed for the midstate on the bm job command packet
+//     reverse_32bit_words(expected_midstate_bin, 32);
+//     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected_midstate_bin, job.midstate, 32);
+//     TEST_ASSERT_EQUAL_UINT32(0x1705ae3a, job.target);
+//     TEST_ASSERT_EQUAL_UINT32(0x6470e2a1, job.ntime);
+//     TEST_ASSERT_EQUAL_UINT8(0x8a, job.merkle_root[28]);
+//     TEST_ASSERT_EQUAL_UINT8(0xdd, job.merkle_root[29]);
+//     TEST_ASSERT_EQUAL_UINT8(0xa8, job.merkle_root[30]);
+//     TEST_ASSERT_EQUAL_UINT8(0x6a, job.merkle_root[31]);
+// }
+
+TEST_CASE("Test extranonce 2 generation", "[mining extranonce2]")
+{
+    char first[9];
+    TEST_ASSERT_TRUE(extranonce_2_generate(0, 4, first, sizeof(first)));
+    TEST_ASSERT_EQUAL_STRING("00000000", first);
+
+    char second[9];
+    TEST_ASSERT_TRUE(extranonce_2_generate(1, 4, second, sizeof(second)));
+    TEST_ASSERT_EQUAL_STRING("01000000", second);
+
+    char third[9];
+    TEST_ASSERT_TRUE(extranonce_2_generate(2, 4, third, sizeof(third)));
+    TEST_ASSERT_EQUAL_STRING("02000000", third);
+
+    char fourth[9];
+    TEST_ASSERT_TRUE(extranonce_2_generate(UINT_MAX - 1, 4, fourth,
+                                          sizeof(fourth)));
+    TEST_ASSERT_EQUAL_STRING("feffffff", fourth);
+
+    char fifth[13];
+    TEST_ASSERT_TRUE(extranonce_2_generate(UINT_MAX / 2, 6, fifth,
+                                          sizeof(fifth)));
+    TEST_ASSERT_EQUAL_STRING("ffffff7f0000", fifth);
+}
+
+TEST_CASE("Extranonce2 generation validates capacity", "[mining extranonce2]")
+{
+    char empty[1];
+    char too_small[8];
+
+    TEST_ASSERT_TRUE(extranonce_2_generate(0, 0, empty, sizeof(empty)));
+    TEST_ASSERT_EQUAL_STRING("", empty);
+    TEST_ASSERT_FALSE(extranonce_2_generate(1, 4, too_small,
+                                           sizeof(too_small)));
+    TEST_ASSERT_FALSE(extranonce_2_generate(
+        1, MAX_EXTRANONCE_2_LEN + 1, too_small, sizeof(too_small)));
+}
+
+static void assert_equal_uint64_without_unity64(uint64_t expected,
+                                                uint64_t actual)
+{
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)(expected >> 32),
+                             (uint32_t)(actual >> 32));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)expected, (uint32_t)actual);
+}
+
+TEST_CASE("Extranonce2 counter never wraps", "[mining extranonce2]")
+{
+    uint64_t value = 0;
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 0));
+    assert_equal_uint64_without_unity64(0, value);
+
+    value = UINT8_MAX - 1;
+    TEST_ASSERT_TRUE(extranonce_2_increment(&value, 1));
+    assert_equal_uint64_without_unity64(UINT8_MAX, value);
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 1));
+    assert_equal_uint64_without_unity64(UINT8_MAX, value);
+
+    value = UINT16_MAX;
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 2));
+    assert_equal_uint64_without_unity64(UINT16_MAX, value);
+    value = UINT64_MAX;
+    TEST_ASSERT_FALSE(extranonce_2_increment(&value, 8));
+    assert_equal_uint64_without_unity64(UINT64_MAX, value);
+    TEST_ASSERT_FALSE(extranonce_2_increment(
+        &value, MAX_EXTRANONCE_2_LEN));
+    assert_equal_uint64_without_unity64(UINT64_MAX, value);
+}
+
+TEST_CASE("V1 share threshold follows the strictest live difficulty",
+          "[mining difficulty]")
+{
+    // An increase may be enforced immediately by compatibility pools even
+    // though the V1 specification associates it with the next job.
+    TEST_ASSERT_EQUAL_DOUBLE(
+        1000.0, mining_v1_effective_share_difficulty(500.0, 1000.0));
+
+    // A decrease must not weaken a job that was issued at a higher target.
+    TEST_ASSERT_EQUAL_DOUBLE(
+        1000.0, mining_v1_effective_share_difficulty(1000.0, 500.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        100.5, mining_v1_effective_share_difficulty(100.25, 100.5));
+
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(0.0, 1000.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(1000.0, 0.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(NAN, 1000.0));
+    TEST_ASSERT_EQUAL_DOUBLE(
+        DBL_MAX, mining_v1_effective_share_difficulty(1000.0, INFINITY));
 }
 
 TEST_CASE("Test nonce diff checking", "[mining test_nonce][not-on-qemu]")

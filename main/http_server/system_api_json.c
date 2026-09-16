@@ -18,6 +18,10 @@
 #include "cjson_utils.h"
 #include "statistics_task.h"
 #include "asic.h"
+#include "asic_common.h"
+#include "asic_result_task.h"
+#include "serial.h"
+#include "asic_init.h"
 
 
 static const char *get_reset_reason_str(esp_reset_reason_t reason)
@@ -55,6 +59,17 @@ static void system_api_add_telemetry(cJSON *root, GlobalState *g) {
     cJSON_AddFloatToObject(root, "vrTemp", g->POWER_MANAGEMENT_MODULE.vr_temp);
     cJSON_AddFloatToObject(root, "coreVoltageActual", g->POWER_MANAGEMENT_MODULE.core_voltage);
     cJSON_AddFloatToObject(root, "actualFrequency", g->POWER_MANAGEMENT_MODULE.actual_frequency);
+    cJSON_AddFloatToObject(root, "requestedFrequency", g->POWER_MANAGEMENT_MODULE.requested_frequency);
+    cJSON_AddNumberToObject(root, "requestedCoreVoltage", g->POWER_MANAGEMENT_MODULE.requested_voltage_mv);
+    cJSON_AddFloatToObject(root, "thermalFrequencyCap", g->POWER_MANAGEMENT_MODULE.thermal_frequency_cap);
+    cJSON_AddNumberToObject(root, "thermalThrottled", g->POWER_MANAGEMENT_MODULE.thermal_throttled ? 1 : 0);
+    cJSON_AddNumberToObject(root, "chipTempValid", g->POWER_MANAGEMENT_MODULE.chip_temp_valid ? 1 : 0);
+    cJSON_AddNumberToObject(root, "chipTemp2Valid", g->POWER_MANAGEMENT_MODULE.chip_temp2_valid ? 1 : 0);
+    cJSON_AddNumberToObject(root, "chipTempAgeMs", g->POWER_MANAGEMENT_MODULE.chip_temp_age_ms);
+    cJSON_AddNumberToObject(root, "chipTemp2AgeMs", g->POWER_MANAGEMENT_MODULE.chip_temp2_age_ms);
+    cJSON_AddNumberToObject(root, "asicResponseAgeMs", g->POWER_MANAGEMENT_MODULE.asic_response_age_ms);
+    cJSON_AddNumberToObject(root, "asicProgressAgeMs", g->POWER_MANAGEMENT_MODULE.asic_progress_age_ms);
+    cJSON_AddNumberToObject(root, "asicLifecycle", asic_lifecycle_get(g));
     cJSON_AddFloatToObject(root, "expectedHashrate", g->POWER_MANAGEMENT_MODULE.expected_hashrate);
     cJSON_AddNumberToObject(root, "fanspeed", g->POWER_MANAGEMENT_MODULE.fan_perc);
     cJSON_AddNumberToObject(root, "fanrpm", g->POWER_MANAGEMENT_MODULE.fan_rpm);
@@ -76,6 +91,37 @@ static void system_api_add_telemetry(cJSON *root, GlobalState *g) {
     cJSON_AddNumberToObject(root, "responseShareBatch", g->SYSTEM_MODULE.response_share_batch);
     cJSON_AddFloatToObject(root, "processTime", g->SYSTEM_MODULE.process_time);
     cJSON_AddNumberToObject(root, "workReceived", g->SYSTEM_MODULE.work_received);
+
+    asic_rx_stats_t rx_stats = {0};
+    asic_result_stats_t result_stats = {0};
+    serial_stats_t serial_stats = {0};
+    get_work_rx_stats(&rx_stats);
+    ASIC_result_task_get_stats(&result_stats);
+    SERIAL_get_stats(&serial_stats);
+    cJSON_AddNumberToObject(root, "asicRxFrames", rx_stats.frames_received);
+    cJSON_AddNumberToObject(root, "asicRxCrcErrors", rx_stats.crc_errors);
+    cJSON_AddNumberToObject(root, "asicRxDiscardedBytes", rx_stats.discarded_bytes);
+    cJSON_AddNumberToObject(root, "asicRxTimeouts", rx_stats.timeouts);
+    cJSON_AddNumberToObject(root, "asicRxUartErrors", rx_stats.uart_errors);
+    cJSON_AddNumberToObject(root, "asicUartTxFailures", serial_stats.tx_failures);
+    cJSON_AddNumberToObject(root, "asicUartTxPartialWrites", serial_stats.tx_partial_writes);
+    cJSON_AddNumberToObject(root, "asicUartRxFailures", serial_stats.rx_failures);
+    cJSON_AddNumberToObject(root, "asicUartRxBufferPeak", serial_stats.rx_buffer_high_watermark);
+    cJSON_AddNumberToObject(root, "asicUartFifoOverflows", serial_stats.fifo_overflows);
+    cJSON_AddNumberToObject(root, "asicUartBufferFullEvents", serial_stats.buffer_full_events);
+    cJSON_AddNumberToObject(root, "asicUartParityErrors", serial_stats.parity_errors);
+    cJSON_AddNumberToObject(root, "asicUartFrameErrors", serial_stats.frame_errors);
+    cJSON_AddNumberToObject(root, "asicUartBaudFailures", serial_stats.baud_failures);
+    cJSON_AddNumberToObject(root, "asicRegistersProcessed", result_stats.registers_processed);
+    cJSON_AddNumberToObject(root, "asicNoncesProcessed", result_stats.nonces_processed);
+    cJSON_AddNumberToObject(root, "asicNoncesDropped", result_stats.nonces_dropped);
+    cJSON_AddNumberToObject(root, "asicNonceQueuePeak", result_stats.nonce_queue_high_watermark);
+    cJSON_AddNumberToObject(root, "asicNonceLatencyMaxMs", result_stats.nonce_max_latency_ms);
+    cJSON_AddNumberToObject(root, "asicAmbiguousResults", result_stats.ambiguous_jobs);
+    cJSON_AddNumberToObject(root, "asicSharesQueued", result_stats.shares_enqueued);
+    cJSON_AddNumberToObject(root, "asicSharesSubmitted", result_stats.shares_submitted);
+    cJSON_AddNumberToObject(root, "asicSharesDropped", result_stats.shares_dropped);
+    cJSON_AddNumberToObject(root, "asicShareQueuePeak", result_stats.share_queue_high_watermark);
 
     // Dynamic Block Info
     cJSON_AddNumberToObject(root, "blockFound", g->SYSTEM_MODULE.block_found);
@@ -168,55 +214,64 @@ static void system_api_add_config(cJSON *root, GlobalState *g) {
     cJSON *pools_arr = cJSON_CreateArray();
     cJSON_AddItemToObject(root, "pools", pools_arr);
     for (int i = 0; i < MAX_POOLS; i++) {
-        PoolConfig *p = &g->SYSTEM_MODULE.pools[i];
-        if (p->url && strlen(p->url) > 0) {
+        PoolConfig pool = {0};
+        if (!SYSTEM_get_pool_config_snapshot(g, i, &pool)) {
+            continue;
+        }
+        if (pool.url && strlen(pool.url) > 0) {
             cJSON *p_obj = cJSON_CreateObject();
             cJSON_AddNumberToObject(p_obj, "id", i);
-            cJSON_AddStringToObject(p_obj, "stratumProtocol", p->protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
-            cJSON_AddStringToObject(p_obj, "stratumURL", p->url);
-            cJSON_AddNumberToObject(p_obj, "stratumPort", p->port);
-            cJSON_AddStringToObject(p_obj, "stratumUser", p->user ? p->user : "");
+            cJSON_AddStringToObject(p_obj, "stratumProtocol", pool.protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
+            cJSON_AddStringToObject(p_obj, "stratumURL", pool.url);
+            cJSON_AddNumberToObject(p_obj, "stratumPort", pool.port);
+            cJSON_AddStringToObject(p_obj, "stratumUser", pool.user ? pool.user : "");
             cJSON_AddStringToObject(p_obj, "stratumPassword", "*****"); // hide password in GET response
-            cJSON_AddNumberToObject(p_obj, "stratumSuggestedDifficulty", p->difficulty);
-            cJSON_AddBoolToObject(p_obj, "stratumExtranonceSubscribe", p->extranonce_subscribe);
-            cJSON_AddNumberToObject(p_obj, "stratumTLS", p->tls);
-            cJSON_AddStringToObject(p_obj, "stratumCert", p->cert ? p->cert : "");
-            cJSON_AddBoolToObject(p_obj, "stratumDecodeCoinbase", p->decode_coinbase_tx);
-            cJSON_AddStringToObject(p_obj, "stratumV2ChannelType", sv2_channel_type_to_string(p->sv2_channel_type));
-            cJSON_AddStringToObject(p_obj, "stratumV2AuthorityPubkey", p->sv2_authority_pubkey ? p->sv2_authority_pubkey : "");
-            cJSON_AddBoolToObject(p_obj, "stratumV2RequireAuth", p->sv2_require_auth);
+            cJSON_AddNumberToObject(p_obj, "stratumSuggestedDifficulty", pool.difficulty);
+            cJSON_AddBoolToObject(p_obj, "stratumExtranonceSubscribe", pool.extranonce_subscribe);
+            cJSON_AddNumberToObject(p_obj, "stratumTLS", pool.tls);
+            cJSON_AddStringToObject(p_obj, "stratumCert", pool.cert ? pool.cert : "");
+            cJSON_AddBoolToObject(p_obj, "stratumDecodeCoinbase", pool.decode_coinbase_tx);
+            cJSON_AddStringToObject(p_obj, "stratumV2ChannelType", sv2_channel_type_to_string(pool.sv2_channel_type));
+            cJSON_AddStringToObject(p_obj, "stratumV2AuthorityPubkey", pool.sv2_authority_pubkey ? pool.sv2_authority_pubkey : "");
+            cJSON_AddBoolToObject(p_obj, "stratumV2RequireAuth", pool.sv2_require_auth);
 
             cJSON_AddItemToArray(pools_arr, p_obj);
         }
+        SYSTEM_release_pool_config_snapshot(&pool);
     }
 
     // Legacy fields for backwards compatibility
-    PoolConfig *prim_pool = &g->SYSTEM_MODULE.pools[prim_idx];
-    PoolConfig *sec_pool = &g->SYSTEM_MODULE.pools[sec_idx];
+    PoolConfig prim_pool = {0};
+    PoolConfig sec_pool = {0};
+    (void)SYSTEM_get_pool_config_snapshot(g, prim_idx, &prim_pool);
+    (void)SYSTEM_get_pool_config_snapshot(g, sec_idx, &sec_pool);
 
-    cJSON_AddStringToObject(root, "stratumURL", prim_pool->url ? prim_pool->url : "");
-    cJSON_AddNumberToObject(root, "stratumPort", prim_pool->port);
-    cJSON_AddStringToObject(root, "stratumUser", prim_pool->user ? prim_pool->user : "");
-    cJSON_AddNumberToObject(root, "stratumSuggestedDifficulty", prim_pool->difficulty);
-    cJSON_AddBoolToObject(root, "stratumExtranonceSubscribe", prim_pool->extranonce_subscribe);
-    cJSON_AddNumberToObject(root, "stratumTLS", prim_pool->tls);
-    cJSON_AddStringToObject(root, "stratumCert", prim_pool->cert ? prim_pool->cert : "");
-    cJSON_AddBoolToObject(root, "stratumDecodeCoinbase", prim_pool->decode_coinbase_tx);
-    cJSON_AddStringToObject(root, "stratumProtocol", prim_pool->protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
-    cJSON_AddStringToObject(root, "stratumV2AuthorityPubkey", prim_pool->sv2_authority_pubkey ? prim_pool->sv2_authority_pubkey : "");
-    cJSON_AddStringToObject(root, "stratumV2ChannelType", sv2_channel_type_to_string(prim_pool->sv2_channel_type));
+    cJSON_AddStringToObject(root, "stratumURL", prim_pool.url ? prim_pool.url : "");
+    cJSON_AddNumberToObject(root, "stratumPort", prim_pool.port);
+    cJSON_AddStringToObject(root, "stratumUser", prim_pool.user ? prim_pool.user : "");
+    cJSON_AddNumberToObject(root, "stratumSuggestedDifficulty", prim_pool.difficulty);
+    cJSON_AddBoolToObject(root, "stratumExtranonceSubscribe", prim_pool.extranonce_subscribe);
+    cJSON_AddNumberToObject(root, "stratumTLS", prim_pool.tls);
+    cJSON_AddStringToObject(root, "stratumCert", prim_pool.cert ? prim_pool.cert : "");
+    cJSON_AddBoolToObject(root, "stratumDecodeCoinbase", prim_pool.decode_coinbase_tx);
+    cJSON_AddStringToObject(root, "stratumProtocol", prim_pool.protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
+    cJSON_AddStringToObject(root, "stratumV2AuthorityPubkey", prim_pool.sv2_authority_pubkey ? prim_pool.sv2_authority_pubkey : "");
+    cJSON_AddStringToObject(root, "stratumV2ChannelType", sv2_channel_type_to_string(prim_pool.sv2_channel_type));
 
-    cJSON_AddStringToObject(root, "fallbackStratumURL", sec_pool->url ? sec_pool->url : "");
-    cJSON_AddNumberToObject(root, "fallbackStratumPort", sec_pool->port);
-    cJSON_AddStringToObject(root, "fallbackStratumUser", sec_pool->user ? sec_pool->user : "");
-    cJSON_AddNumberToObject(root, "fallbackStratumSuggestedDifficulty", sec_pool->difficulty);
-    cJSON_AddBoolToObject(root, "fallbackStratumExtranonceSubscribe", sec_pool->extranonce_subscribe);
-    cJSON_AddNumberToObject(root, "fallbackStratumTLS", sec_pool->tls);
-    cJSON_AddStringToObject(root, "fallbackStratumCert", sec_pool->cert ? sec_pool->cert : "");
-    cJSON_AddBoolToObject(root, "fallbackStratumDecodeCoinbase", sec_pool->decode_coinbase_tx);
-    cJSON_AddStringToObject(root, "fallbackStratumProtocol", sec_pool->protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
-    cJSON_AddStringToObject(root, "fallbackStratumV2AuthorityPubkey", sec_pool->sv2_authority_pubkey ? sec_pool->sv2_authority_pubkey : "");
-    cJSON_AddStringToObject(root, "fallbackStratumV2ChannelType", sv2_channel_type_to_string(sec_pool->sv2_channel_type));
+    cJSON_AddStringToObject(root, "fallbackStratumURL", sec_pool.url ? sec_pool.url : "");
+    cJSON_AddNumberToObject(root, "fallbackStratumPort", sec_pool.port);
+    cJSON_AddStringToObject(root, "fallbackStratumUser", sec_pool.user ? sec_pool.user : "");
+    cJSON_AddNumberToObject(root, "fallbackStratumSuggestedDifficulty", sec_pool.difficulty);
+    cJSON_AddBoolToObject(root, "fallbackStratumExtranonceSubscribe", sec_pool.extranonce_subscribe);
+    cJSON_AddNumberToObject(root, "fallbackStratumTLS", sec_pool.tls);
+    cJSON_AddStringToObject(root, "fallbackStratumCert", sec_pool.cert ? sec_pool.cert : "");
+    cJSON_AddBoolToObject(root, "fallbackStratumDecodeCoinbase", sec_pool.decode_coinbase_tx);
+    cJSON_AddStringToObject(root, "fallbackStratumProtocol", sec_pool.protocol == STRATUM_PROTOCOL_V2 ? STRATUM_V2 : STRATUM_V1);
+    cJSON_AddStringToObject(root, "fallbackStratumV2AuthorityPubkey", sec_pool.sv2_authority_pubkey ? sec_pool.sv2_authority_pubkey : "");
+    cJSON_AddStringToObject(root, "fallbackStratumV2ChannelType", sv2_channel_type_to_string(sec_pool.sv2_channel_type));
+
+    SYSTEM_release_pool_config_snapshot(&prim_pool);
+    SYSTEM_release_pool_config_snapshot(&sec_pool);
 
     // User Preferences
     cJSON_AddNumberToObject(root, "useCustomWWW", nvs_config_get_bool(NVS_CONFIG_USE_CUSTOM_WWW) ? 1 : 0);
@@ -233,6 +288,7 @@ static void system_api_add_config(cJSON *root, GlobalState *g) {
     cJSON_AddNumberToObject(root, "temptarget", nvs_config_get_u16(NVS_CONFIG_TEMP_TARGET));
     cJSON_AddNumberToObject(root, "coreVoltage", nvs_config_get_u16(NVS_CONFIG_ASIC_VOLTAGE));
     cJSON_AddFloatToObject(root, "frequency", nvs_config_get_float(NVS_CONFIG_ASIC_FREQUENCY));
+    cJSON_AddNumberToObject(root, "asicJobInterval", nvs_config_get_u16(NVS_CONFIG_ASIC_JOB_INTERVAL));
     cJSON_AddNumberToObject(root, "statsFrequency", nvs_config_get_u16(NVS_CONFIG_STATISTICS_FREQUENCY));
     cJSON_AddNumberToObject(root, "statsLimit", MAX_STATISTICS_COUNT);
 }

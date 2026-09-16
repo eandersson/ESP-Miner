@@ -78,8 +78,8 @@ export class EditComponent implements OnInit, OnDestroy, OnChanges {
         this.saveOverclockSetting(1);
         console.log(
           '🎉 The ancient seals have been broken!\n' +
-          '⚡ Unlimited power flows through your miner...\n' +
-          '🔧 You can now set custom frequency and voltage values.\n' +
+          '⚡ Validated custom tuning is enabled for this miner.\n' +
+          '🔧 You can now choose values within the board envelope.\n' +
           '⚠️ Remember: with great power comes great responsibility!'
         );
       } else {
@@ -182,6 +182,11 @@ export class EditComponent implements OnInit, OnDestroy, OnChanges {
           ]],
           coreVoltage: [info.coreVoltage, [Validators.required]],
           frequency: [info.frequency, [Validators.required]],
+          asicJobInterval: [info.asicJobInterval, [
+            Validators.required,
+            Validators.min(1000),
+            Validators.max(60000)
+          ]],
           autofanspeed: [info.autofanspeed == 1, [Validators.required]],
           minFanSpeed: [info.minFanSpeed, [Validators.required]],
           manualFanSpeed: [info.manualFanSpeed, [Validators.required]],
@@ -380,6 +385,7 @@ export class EditComponent implements OnInit, OnDestroy, OnChanges {
       'displayTimeout',
       'coreVoltage',
       'frequency',
+      'asicJobInterval',
       'autofanspeed',
       'minFanSpeed',
       'manualFanSpeed',
