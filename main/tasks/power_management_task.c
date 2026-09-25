@@ -865,7 +865,7 @@ void POWER_MANAGEMENT_task(void *pvParameters)
     while (1) {
         if (GLOBAL_STATE->SELF_TEST_MODULE.is_finished) {
             ESP_LOGI(TAG, "Stopped");
-            vTaskDelete(NULL);
+            vTaskDeleteWithCaps(NULL);
             return;
         }
 

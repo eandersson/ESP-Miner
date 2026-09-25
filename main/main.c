@@ -186,7 +186,10 @@ void app_main(void)
     esp_err_t system_init_ret = SYSTEM_init_peripherals(&GLOBAL_STATE);
     
     if (system_init_ret == ESP_OK) {
-        if (xTaskCreate(POWER_MANAGEMENT_task, "power management", 8192, (void *) &GLOBAL_STATE, 10, NULL) != pdPASS) {
+        // Internal RAM is kept for the ASIC tasks created after Wi-Fi is up.
+        // The power and fan tasks never access flash directly (NVS writes go
+        // through nvs_task), so their stacks can live in PSRAM.
+        if (xTaskCreateWithCaps(POWER_MANAGEMENT_task, "power management", 8192, (void *) &GLOBAL_STATE, 10, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
             ESP_LOGE(TAG, "Error creating power management task");
             fail_asic_closed("Power management task creation failed");
             __atomic_store_n(
@@ -197,7 +200,7 @@ void app_main(void)
                 true, __ATOMIC_RELEASE);
         }
         if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
-            if (xTaskCreate(FAN_CONTROLLER_task, "fan_controller", 8192, (void *) &GLOBAL_STATE, 10, NULL) != pdPASS) {
+            if (xTaskCreateWithCaps(FAN_CONTROLLER_task, "fan_controller", 8192, (void *) &GLOBAL_STATE, 10, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
                 ESP_LOGE(TAG, "Error creating fan controller task");
             }
         }

@@ -23,6 +23,7 @@
 #include "asic_init.h"
 #include "asic_result_task.h"
 #include "freertos/queue.h"
+#include "esp_heap_caps.h"
 #include <errno.h>
 
 static const char *TAG = "asic_result";
@@ -365,23 +366,35 @@ static void log_result_metrics(void)
              (unsigned long)serial_stats.baud_failures);
 }
 
+// Only tasks use these queues, so their ~7 KB of storage belongs in PSRAM:
+// they are created just before the ASIC task stacks, which must come from
+// internal RAM. Builds without PSRAM (the unit-test app) use any RAM.
+static QueueHandle_t create_result_queue(UBaseType_t length, UBaseType_t item_size)
+{
+    QueueHandle_t queue = xQueueCreateWithCaps(length, item_size, MALLOC_CAP_SPIRAM);
+    if (queue == NULL) {
+        queue = xQueueCreateWithCaps(length, item_size, MALLOC_CAP_8BIT);
+    }
+    return queue;
+}
+
 esp_err_t ASIC_result_task_init(void)
 {
     if (asic_nonce_queue != NULL && stratum_v1_share_queue != NULL) {
         return ESP_OK;
     }
 
-    asic_nonce_queue = xQueueCreate(ASIC_NONCE_QUEUE_LENGTH,
-                                    sizeof(queued_asic_result_t));
-    stratum_v1_share_queue = xQueueCreate(STRATUM_V1_SHARE_QUEUE_LENGTH,
-                                          sizeof(queued_v1_share_t));
+    asic_nonce_queue = create_result_queue(ASIC_NONCE_QUEUE_LENGTH,
+                                           sizeof(queued_asic_result_t));
+    stratum_v1_share_queue = create_result_queue(STRATUM_V1_SHARE_QUEUE_LENGTH,
+                                                 sizeof(queued_v1_share_t));
     if (asic_nonce_queue == NULL || stratum_v1_share_queue == NULL) {
         if (asic_nonce_queue != NULL) {
-            vQueueDelete(asic_nonce_queue);
+            vQueueDeleteWithCaps(asic_nonce_queue);
             asic_nonce_queue = NULL;
         }
         if (stratum_v1_share_queue != NULL) {
-            vQueueDelete(stratum_v1_share_queue);
+            vQueueDeleteWithCaps(stratum_v1_share_queue);
             stratum_v1_share_queue = NULL;
         }
         ESP_LOGE(TAG, "Failed to create ASIC nonce/share queues");
