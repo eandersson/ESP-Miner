@@ -73,8 +73,12 @@ bool miner_job_alloc_buffers(miner_job_t *job);
 void miner_job_free_buffers(miner_job_t *job);
 
 // Copy every field and the used coinbase bytes of src into dst while keeping
-// dst's own buffers. Both jobs must own full-size coinbase buffers.
-void miner_job_copy(miner_job_t *dst, const miner_job_t *src);
+// dst's own buffers. Ring slots grow on demand; false leaves dst unchanged.
+bool miner_job_copy(miner_job_t *dst, const miner_job_t *src);
+
+// Grow a ring slot's small no-PSRAM fallback before a parser writes into it.
+// Non-ring jobs are expected to own full-size buffers via miner_job_alloc_buffers.
+bool miner_job_ensure_suffix_capacity(miner_job_t *job, size_t needed);
 
 static inline bool miner_job_is_rollable(const miner_job_t *job)
 {

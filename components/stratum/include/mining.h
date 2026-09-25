@@ -68,6 +68,16 @@ bool extranonce_2_increment(uint64_t *extranonce_2, uint32_t length);
 double mining_v1_effective_share_difficulty(double job_difficulty,
                                             double announced_difficulty);
 
+// Whether a share meets the network target encoded in its job's nbits. A block
+// solution is worth submitting even below the pool's share difficulty, e.g. a
+// testnet minimum-difficulty block.
+bool mining_share_solves_block(double share_difficulty, uint32_t nbits);
+
+// Largest supported power-of-two ASIC ticket no harder than either the
+// configured ticket or the block target (minimum 1). A testnet difficulty-1
+// block must not be filtered out before the host can validate it.
+uint16_t mining_ticket_difficulty(uint16_t configured_ticket, uint32_t nbits);
+
 uint32_t increment_bitmask(const uint32_t value, const uint32_t mask);
 size_t version_mask_midstate_count(uint32_t version_mask);
 size_t version_mask_value_count(uint32_t version_mask);

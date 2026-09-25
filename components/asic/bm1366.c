@@ -182,6 +182,14 @@ esp_err_t BM1366_set_version_mask(uint32_t version_mask)
                         BM1366_SERIALTX_DEBUG) ? ESP_OK : ESP_FAIL;
 }
 
+esp_err_t BM1366_set_ticket_difficulty(uint16_t difficulty)
+{
+    uint8_t mask[6];
+    get_difficulty_mask(difficulty, mask);
+    return _send_BM1366(TYPE_CMD | GROUP_ALL | CMD_WRITE, mask,
+                        sizeof(mask), BM1366_SERIALTX_DEBUG) ? ESP_OK : ESP_FAIL;
+}
+
 static esp_err_t BM1366_set_hash_counting_number(uint32_t hcn)
 {
     if (hcn == 0) {

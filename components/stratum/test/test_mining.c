@@ -392,6 +392,35 @@ TEST_CASE("V1 share threshold follows the strictest live difficulty",
         DBL_MAX, mining_v1_effective_share_difficulty(1000.0, INFINITY));
 }
 
+TEST_CASE("Block solutions are recognized from the job's nbits",
+          "[mining difficulty]")
+{
+    // testnet4's minimum-difficulty target (nbits 0x1d00ffff) is difficulty 1,
+    // below any pool share difficulty.
+    TEST_ASSERT_TRUE(mining_share_solves_block(1.0, 0x1d00ffff));
+    TEST_ASSERT_TRUE(mining_share_solves_block(4096.0, 0x1d00ffff));
+    TEST_ASSERT_FALSE(mining_share_solves_block(0.999, 0x1d00ffff));
+
+    double mainnet = networkDifficulty(0x1705dd01);
+    TEST_ASSERT_TRUE(mining_share_solves_block(mainnet, 0x1705dd01));
+    TEST_ASSERT_FALSE(mining_share_solves_block(mainnet * 0.999, 0x1705dd01));
+    TEST_ASSERT_FALSE(mining_share_solves_block(1e12, 0x1705dd01));
+
+    // A missing target or an unusable share difficulty is never a block.
+    TEST_ASSERT_FALSE(mining_share_solves_block(DBL_MAX, 0));
+    TEST_ASSERT_FALSE(mining_share_solves_block(NAN, 0x1d00ffff));
+}
+
+TEST_CASE("ASIC ticket is no harder than a low network target",
+          "[mining difficulty]")
+{
+    TEST_ASSERT_EQUAL_UINT16(1024, mining_ticket_difficulty(1024, 0x1705dd01));
+    TEST_ASSERT_EQUAL_UINT16(1, mining_ticket_difficulty(1024, 0x1d00ffff));
+    TEST_ASSERT_EQUAL_UINT16(2, mining_ticket_difficulty(1024, 0x1d007fff));
+    TEST_ASSERT_EQUAL_UINT16(256, mining_ticket_difficulty(256, 0x1705dd01));
+    TEST_ASSERT_EQUAL_UINT16(0, mining_ticket_difficulty(0, 0x1d00ffff));
+}
+
 TEST_CASE("Test nonce diff checking", "[mining test_nonce][not-on-qemu]")
 {
     static miner_job_t mjob;

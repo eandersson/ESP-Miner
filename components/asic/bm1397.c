@@ -178,6 +178,14 @@ esp_err_t BM1397_set_version_mask(uint32_t version_mask)
     return ESP_OK;
 }
 
+esp_err_t BM1397_set_ticket_difficulty(uint16_t difficulty)
+{
+    uint8_t mask[6];
+    get_difficulty_mask(difficulty, mask);
+    return _send_BM1397(TYPE_CMD | GROUP_ALL | CMD_WRITE, mask,
+                        sizeof(mask), BM1397_SERIALTX_DEBUG) ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t BM1397_send_hash_frequency(float target_freq,
                                      float *applied_frequency)
 {

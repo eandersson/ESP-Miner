@@ -480,7 +480,11 @@ static bool parse_mining_notify(cJSON *json, miner_job_t *job)
     }
     if (!job->coinbase_suffix) {
         job->coinbase_suffix = heap_caps_calloc(1, MAX_COINBASE_SUFFIX_LEN, MALLOC_CAP_SPIRAM);
-        if (!job->coinbase_suffix) job->coinbase_suffix = calloc(1, 2048);
+        if (!job->coinbase_suffix) job->coinbase_suffix = calloc(1, MAX_COINBASE_SUFFIX_LEN);
+    }
+    if (!job->coinbase_prefix || !job->coinbase_suffix) {
+        ESP_LOGE(TAG, "Unable to allocate mining.notify coinbase buffers");
+        return false;
     }
     uint8_t *p_buf = job->coinbase_prefix;
     uint8_t *s_buf = job->coinbase_suffix;
@@ -508,8 +512,8 @@ static bool parse_mining_notify(cJSON *json, miner_job_t *job)
     job->coinbase_prefix_len = (uint16_t)c1_len;
 
     size_t c2_len = c2_str_len / 2;
-    if (c2_len > MAX_COINBASE_SUFFIX_LEN) {
-        ESP_LOGE(TAG, "coinbase_2 length %zu exceeds maximum %d in mining.notify", c2_len, MAX_COINBASE_SUFFIX_LEN);
+    if (!miner_job_ensure_suffix_capacity(job, c2_len)) {
+        ESP_LOGE(TAG, "Cannot buffer %zu-byte coinbase_2 in mining.notify", c2_len);
         return false;
     }
     hex2bin(c2_item->valuestring, job->coinbase_suffix, c2_len);

@@ -65,6 +65,26 @@ static void queue_job_response(const bm13xx_harness_driver_t *driver,
     bm13xx_harness_queue_response(response);
 }
 
+TEST_CASE("BM13xx ticket register accepts difficulty one",
+          "[asic][ticket]")
+{
+    for (size_t d = 0; d < BM13XX_HARNESS_DRIVER_COUNT; d++) {
+        bm13xx_harness_begin();
+        TEST_ASSERT_EQUAL_INT(ESP_OK,
+                              bm13xx_harness_drivers[d].set_ticket_difficulty(1));
+        TEST_ASSERT_EQUAL_UINT(1, bm13xx_harness_packet_count());
+        const bm13xx_harness_packet_t *packet = bm13xx_harness_packet(0);
+        TEST_ASSERT_EQUAL_UINT(11, packet->length);
+        TEST_ASSERT_EQUAL_HEX8(0x14, packet->bytes[5]);
+        const uint8_t unfiltered_mask[4] = {0};
+        TEST_ASSERT_EQUAL_UINT8_ARRAY(unfiltered_mask, packet->bytes + 6, 4);
+        bm13xx_harness_fail_writes(1);
+        TEST_ASSERT_EQUAL_INT(ESP_FAIL,
+                              bm13xx_harness_drivers[d].set_ticket_difficulty(1024));
+        bm13xx_harness_end();
+    }
+}
+
 TEST_CASE("BM13xx version mask register command remains byte exact",
           "[asic][version-rolling][characterization]")
 {

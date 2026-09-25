@@ -502,8 +502,8 @@ int sv2_parse_new_extended_mining_job(const uint8_t *payload, uint32_t len,
     }
     job_out->coinbase_prefix_len = prefix_len;
 
-    if (suffix_len > MAX_COINBASE_SUFFIX_LEN || (suffix_len > 0 && !job_out->coinbase_suffix)) {
-        ESP_LOGE(TAG, "SV2 coinbase suffix length %u exceeds maximum %d", suffix_len, MAX_COINBASE_SUFFIX_LEN);
+    if (!miner_job_ensure_suffix_capacity(job_out, suffix_len)) {
+        ESP_LOGE(TAG, "SV2 coinbase suffix length %u exceeds available capacity", suffix_len);
         return -1;
     }
     if (suffix_len > 0) {

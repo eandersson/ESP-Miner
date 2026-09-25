@@ -25,6 +25,9 @@
 
 enum { JOB_SLOTS = 128, JOB_ID = 8, MAX_EVENTS = 4 };
 
+// nbits for a target just below 2^256: almost every hash solves the block.
+#define EASIEST_NBITS 0x2100ffffu
+
 static jmp_buf loop_exit;
 static GlobalState fixture_state;
 static bm_job *fixture_active[JOB_SLOTS];
@@ -47,6 +50,7 @@ static unsigned fixture_v1_submissions;
 static unsigned fixture_sv2_submissions;
 static unsigned fixture_scores;
 static unsigned fixture_notifications;
+static unsigned fixture_blocks;
 static unsigned fixture_self_tests;
 static const bm_job *fixture_submitted_job;
 static uint32_t fixture_submitted_version;
@@ -153,13 +157,20 @@ void result_task_spy_record_nonce(GlobalState *state, double difficulty)
     fixture_self_tests++;
 }
 
-void result_task_spy_notify_found_nonce(GlobalState *state, double difficulty,
-                                        uint32_t target)
+void result_task_spy_notify_found_nonce(GlobalState *state, double difficulty)
 {
     TEST_ASSERT_EQUAL_PTR(&fixture_state, state);
     TEST_ASSERT_TRUE(difficulty > 0);
-    TEST_ASSERT_EQUAL_HEX32(0x1705dd01, target);
     fixture_notifications++;
+}
+
+void result_task_spy_block_submitted(GlobalState *state, double difficulty,
+                                     uint32_t target)
+{
+    TEST_ASSERT_EQUAL_PTR(&fixture_state, state);
+    TEST_ASSERT_TRUE(difficulty > 0);
+    TEST_ASSERT_EQUAL_HEX32(EASIEST_NBITS, target);
+    fixture_blocks++;
 }
 
 esp_err_t result_task_spy_scoreboard_add(
@@ -277,6 +288,7 @@ static void fixture_begin(void)
     fixture_sv2_submissions = 0;
     fixture_scores = 0;
     fixture_notifications = 0;
+    fixture_blocks = 0;
     fixture_self_tests = 0;
     fixture_submitted_job = NULL;
     fixture_submitted_version = 0;
@@ -359,6 +371,8 @@ TEST_CASE("result pipeline submits V1 shares from an owned job reference",
     TEST_ASSERT_EQUAL_UINT32(0, fixture_sv2_submissions);
     TEST_ASSERT_EQUAL_UINT32(1, fixture_scores);
     TEST_ASSERT_EQUAL_UINT32(1, fixture_notifications);
+    // An ordinary share is far from the mainnet target.
+    TEST_ASSERT_EQUAL_UINT32(0, fixture_blocks);
     TEST_ASSERT_EQUAL_STRING("42", fixture_submitted_id);
     // BIP310 V1 submits carry the masked field of the rolled version.
     TEST_ASSERT_EQUAL_HEX32(0x00002000, fixture_submitted_version);
@@ -464,6 +478,33 @@ TEST_CASE("result pipeline enforces share thresholds and drops repeated results"
     TEST_ASSERT_EQUAL_UINT32(1, fixture_scores);
     TEST_ASSERT_EQUAL_UINT32(1, after.duplicate_results - before.duplicate_results);
     fixture_end();
+}
+
+TEST_CASE("result pipeline submits block solutions below the share difficulty",
+          "[asic][result][block]")
+{
+    // The pool asks for an unreachable share difficulty, but the nonce meets
+    // the network target, as with a testnet minimum-difficulty block. Every
+    // job type submits it, and the block counts only once it is on the wire.
+    for (int type = JOB_TYPE_V1; type <= JOB_TYPE_SV2_EXTENDED; ++type) {
+        for (int fails = 0; fails <= 1; ++fails) {
+            fixture_begin();
+            fixture_announced_difficulty = DBL_MAX;
+            fixture_submit_result = fails ? -1 : 1;
+            bm_job *job = make_job((miner_job_type_t)type, DBL_MAX);
+            job->target = EASIEST_NBITS;
+            TEST_ASSERT_TRUE(mining_share_solves_block(
+                test_nonce_value(job, 7, 0x20002004), job->target));
+            install_job(job, 500);
+            queue_nonce_event();
+            run_pipeline();
+
+            TEST_ASSERT_EQUAL_UINT32(
+                1, fixture_v1_submissions + fixture_sv2_submissions);
+            TEST_ASSERT_EQUAL_UINT32(fails ? 0 : 1, fixture_blocks);
+            fixture_end();
+        }
+    }
 }
 
 TEST_CASE("result pipeline resolves late nonces to the retired slot owner",

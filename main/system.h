@@ -25,7 +25,9 @@ void SYSTEM_clean_jobs_queue(GlobalState * GLOBAL_STATE);
 
 void SYSTEM_notify_accepted_share(GlobalState * GLOBAL_STATE);
 void SYSTEM_notify_rejected_share(GlobalState * GLOBAL_STATE, char * error_msg);
-void SYSTEM_notify_found_nonce(GlobalState * GLOBAL_STATE, double diff, uint32_t target);
+void SYSTEM_notify_found_nonce(GlobalState * GLOBAL_STATE, double diff);
+// Count a found block. Called only once its share was written to the pool.
+void SYSTEM_notify_block_submitted(GlobalState * GLOBAL_STATE, double diff, uint32_t target);
 void SYSTEM_notify_new_ntime(GlobalState * GLOBAL_STATE, uint32_t ntime);
 
 // Reset decoded coinbase UI fields (scriptsig, coinbase values, outputs, block signals).

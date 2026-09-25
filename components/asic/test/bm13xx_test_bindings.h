@@ -26,6 +26,7 @@ uint32_t bm13xx_stub_job_generation(void);
 #define BM1366_init bm1366_test_init
 #define BM1366_send_work bm1366_test_send_work
 #define BM1366_set_version_mask bm1366_test_set_version_mask
+#define BM1366_set_ticket_difficulty bm1366_test_set_ticket_difficulty
 #define BM1366_set_max_baud bm1366_test_set_max_baud
 #define BM1366_send_hash_frequency bm1366_test_send_hash_frequency
 #define BM1366_process_work bm1366_test_process_work
@@ -36,6 +37,7 @@ uint32_t bm13xx_stub_job_generation(void);
 #define BM1368_init bm1368_test_init
 #define BM1368_send_work bm1368_test_send_work
 #define BM1368_set_version_mask bm1368_test_set_version_mask
+#define BM1368_set_ticket_difficulty bm1368_test_set_ticket_difficulty
 #define BM1368_set_max_baud bm1368_test_set_max_baud
 #define BM1368_send_hash_frequency bm1368_test_send_hash_frequency
 #define BM1368_process_work bm1368_test_process_work
@@ -46,6 +48,7 @@ uint32_t bm13xx_stub_job_generation(void);
 #define BM1370_init bm1370_test_init
 #define BM1370_send_work bm1370_test_send_work
 #define BM1370_set_version_mask bm1370_test_set_version_mask
+#define BM1370_set_ticket_difficulty bm1370_test_set_ticket_difficulty
 #define BM1370_set_max_baud bm1370_test_set_max_baud
 #define BM1370_send_hash_frequency bm1370_test_send_hash_frequency
 #define BM1370_process_work bm1370_test_process_work
@@ -56,6 +59,7 @@ uint32_t bm13xx_stub_job_generation(void);
 #define BM1373_init bm1373_test_init
 #define BM1373_send_work bm1373_test_send_work
 #define BM1373_set_version_mask bm1373_test_set_version_mask
+#define BM1373_set_ticket_difficulty bm1373_test_set_ticket_difficulty
 #define BM1373_set_max_baud bm1373_test_set_max_baud
 #define BM1373_send_hash_frequency bm1373_test_send_hash_frequency
 #define BM1373_process_work bm1373_test_process_work

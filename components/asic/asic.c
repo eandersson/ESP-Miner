@@ -15,12 +15,17 @@
 #include "nvs_config.h"
 #include "frequency_transition_bmXX.h"
 #include "utils.h"
+#include "asic_result_task.h"
 
 static const char *TAG = "asic";
 static uint32_t effective_version_mask = BIP320_VERSION_ROLLING_MASK;
+static uint16_t applied_ticket_difficulty;
 
 uint8_t ASIC_init(GlobalState * GLOBAL_STATE)
 {
+    // Chip init restores the configured ticket. Force the first job to verify
+    // the runtime ticket again, including after a stop/restart epoch.
+    applied_ticket_difficulty = 0;
     ESP_LOGI(TAG, "Initializing %dx %s", GLOBAL_STATE->DEVICE_CONFIG.family.asic_count, GLOBAL_STATE->DEVICE_CONFIG.family.asic.name);
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
         case BM1397:
@@ -36,6 +41,20 @@ uint8_t ASIC_init(GlobalState * GLOBAL_STATE)
     }
     ESP_LOGE(TAG, "Unknown ASIC id %d", GLOBAL_STATE->DEVICE_CONFIG.family.asic.id);
     return 0;
+}
+
+// Called only under asic_command_lock, immediately before sending a job.
+static esp_err_t set_ticket_difficulty_locked(GlobalState *GLOBAL_STATE,
+                                              uint16_t difficulty)
+{
+    switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {
+        case BM1397: return BM1397_set_ticket_difficulty(difficulty);
+        case BM1366: return BM1366_set_ticket_difficulty(difficulty);
+        case BM1368: return BM1368_set_ticket_difficulty(difficulty);
+        case BM1370: return BM1370_set_ticket_difficulty(difficulty);
+        case BM1373: return BM1373_set_ticket_difficulty(difficulty);
+        default: return ESP_ERR_NOT_SUPPORTED;
+    }
 }
 
 task_result * ASIC_process_work(GlobalState * GLOBAL_STATE)
@@ -80,7 +99,7 @@ esp_err_t ASIC_set_max_baud(GlobalState *GLOBAL_STATE, int *baud)
 bool ASIC_send_work(GlobalState * GLOBAL_STATE, bm_job * next_job,
                     uint32_t expected_generation)
 {
-    if (GLOBAL_STATE == NULL) {
+    if (GLOBAL_STATE == NULL || next_job == NULL) {
         return false;
     }
 
@@ -90,6 +109,29 @@ bool ASIC_send_work(GlobalState * GLOBAL_STATE, bm_job * next_job,
         pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
         ESP_LOGD(TAG, "Discarding work while ASIC is not running");
         return false;
+    }
+
+    if (ASIC_result_task_get_job_generation() != expected_generation) {
+        pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+        return false;
+    }
+    uint16_t requested_ticket = mining_ticket_difficulty(
+        GLOBAL_STATE->DEVICE_CONFIG.family.asic.difficulty, next_job->target);
+    if (requested_ticket == 0) {
+        requested_ticket = 1;
+    }
+    if (requested_ticket != applied_ticket_difficulty) {
+        esp_err_t err = set_ticket_difficulty_locked(GLOBAL_STATE,
+                                                      requested_ticket);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set ASIC ticket difficulty %u: %s",
+                     requested_ticket, esp_err_to_name(err));
+            pthread_mutex_unlock(&GLOBAL_STATE->asic_command_lock);
+            return false;
+        }
+        ESP_LOGI(TAG, "ASIC ticket difficulty %u for job target %08lx",
+                 requested_ticket, (unsigned long)next_job->target);
+        applied_ticket_difficulty = requested_ticket;
     }
 
     switch (GLOBAL_STATE->DEVICE_CONFIG.family.asic.id) {

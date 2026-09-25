@@ -244,6 +244,33 @@ double mining_v1_effective_share_difficulty(double job_difficulty,
                : announced_difficulty;
 }
 
+bool mining_share_solves_block(double share_difficulty, uint32_t nbits)
+{
+    // Both sides are truediffone divided by a 256-bit value, so this is
+    // hash <= target. Without a target (nbits 0) nothing is a block.
+    double network_difficulty = networkDifficulty(nbits);
+    return isfinite(network_difficulty) && network_difficulty > 0.0 &&
+           share_difficulty >= network_difficulty;
+}
+
+uint16_t mining_ticket_difficulty(uint16_t configured_ticket, uint32_t nbits)
+{
+    if (configured_ticket == 0) {
+        return 0;
+    }
+    uint16_t ticket = 1;
+    while (ticket <= configured_ticket / 2) {
+        ticket <<= 1;
+    }
+    double network_difficulty = networkDifficulty(nbits);
+    if (isfinite(network_difficulty) && network_difficulty > 0.0) {
+        while (ticket > 1 && (double)ticket > network_difficulty) {
+            ticket >>= 1;
+        }
+    }
+    return ticket;
+}
+
 double hash_to_pdiff(const uint8_t hash[32])
 {
     if (!hash) return (double)UINT32_MAX;

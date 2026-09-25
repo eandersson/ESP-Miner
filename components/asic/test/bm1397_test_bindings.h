@@ -23,6 +23,7 @@ uint32_t bm1397_stub_job_generation(void);
 #define BM1397_init bm1397_test_init
 #define BM1397_send_work bm1397_test_send_work
 #define BM1397_set_version_mask bm1397_test_set_version_mask
+#define BM1397_set_ticket_difficulty bm1397_test_set_ticket_difficulty
 #define BM1397_set_max_baud bm1397_test_set_max_baud
 #define BM1397_send_hash_frequency bm1397_test_send_hash_frequency
 #define BM1397_process_work bm1397_test_process_work

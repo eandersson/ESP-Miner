@@ -41,6 +41,20 @@ static void queue_bm1397_job_response(uint8_t job_id, uint8_t midstate_index,
     bm1397_harness_queue_response(response);
 }
 
+TEST_CASE("BM1397 ticket register accepts difficulty one", "[asic][ticket]")
+{
+    bm1397_harness_begin();
+    TEST_ASSERT_EQUAL_INT(ESP_OK,
+                          bm1397_harness_driver.set_ticket_difficulty(1));
+    TEST_ASSERT_EQUAL_UINT(1, bm1397_harness_packet_count());
+    const bm1397_harness_packet_t *packet = bm1397_harness_packet(0);
+    TEST_ASSERT_EQUAL_UINT(11, packet->length);
+    TEST_ASSERT_EQUAL_HEX8(0x14, packet->bytes[5]);
+    const uint8_t unfiltered_mask[4] = {0};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(unfiltered_mask, packet->bytes + 6, 4);
+    bm1397_harness_end();
+}
+
 TEST_CASE("BM13xx work packets preserve complete header fields byte exact",
           "[asic][job-packet][characterization]")
 {

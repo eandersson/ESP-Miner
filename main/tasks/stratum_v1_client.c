@@ -26,6 +26,8 @@
 #define PROBE_RECV_BUFFER_SIZE 2048
 #define CONFIGURE_RESPONSE_TIMEOUT_US 10000000LL
 #define SETUP_RESPONSE_TIMEOUT_US 10000000LL
+#define FIRST_JOB_TIMEOUT_US 120000000LL
+#define JOB_FRESHNESS_TIMEOUT_US 1800000000LL
 
 static const char *TAG = "stratum_v1";
 
@@ -79,6 +81,8 @@ typedef struct
     int configure_message_id;
     bool configure_pending;
     int64_t configure_sent_us;
+    int64_t connected_us;
+    int64_t last_job_us;
 } v1_session_t;
 
 typedef enum
@@ -206,13 +210,29 @@ static bool v1_publish_latest(v1_session_t *session)
 
     miner_job_lock();
     uint8_t slot = (uint8_t)((GLOBAL_STATE->active_job_slot_idx + 1) % 2);
-    miner_job_copy(miner_job_get_slot(slot), job);
+    bool copied = miner_job_copy(miner_job_get_slot(slot), job);
     miner_job_unlock();
+    if (!copied) {
+        ESP_LOGE(TAG, "Unable to buffer mining job %s", job->job_id);
+        return false;
+    }
 
     if (GLOBAL_STATE->create_jobs_task_handle) {
         xTaskNotify(GLOBAL_STATE->create_jobs_task_handle, slot, eSetValueWithOverwrite);
     }
+    // The pool is producing usable work again. Recovery must release the
+    // power-management stop even if the reconnect request skipped probing.
+    GLOBAL_STATE->SYSTEM_MODULE.pools_unavailable = false;
     return true;
+}
+
+static v1_line_result_t v1_republish_latest(v1_session_t *session)
+{
+    if (s_latest_job_valid && session->setup.extranonce_ready &&
+        !v1_publish_latest(session)) {
+        return V1_LINE_FAIL;
+    }
+    return V1_LINE_CONTINUE;
 }
 
 // A BIP310 change applies immediately. Invalidate every job built with the old
@@ -308,6 +328,7 @@ static v1_line_result_t v1_handle_notify(v1_session_t *session)
     s_latest_job = s_parse_job;
     s_parse_job = previous;
     s_latest_job_valid = true;
+    session->last_job_us = esp_timer_get_time();
 
     if (s_latest_job.clean_jobs) {
         // A clean notification invalidates the work running on the ASIC and
@@ -315,6 +336,9 @@ static v1_line_result_t v1_handle_notify(v1_session_t *session)
         SYSTEM_clean_jobs_queue(GLOBAL_STATE);
     }
     if (!v1_publish_latest(session)) {
+        if (session->setup.extranonce_ready) {
+            return V1_LINE_FAIL;
+        }
         ESP_LOGW(TAG, "Holding job %s until the pool provides an extranonce", s_latest_job.job_id);
     }
     return V1_LINE_CONTINUE;
@@ -351,7 +375,9 @@ static v1_line_result_t v1_handle_extranonce(v1_session_t *session)
         !v1_mark_authorized(session, "Treating an id-less successful response as implicit authorization")) {
         return V1_LINE_FAIL;
     }
-    v1_publish_latest(session);
+    if (s_latest_job_valid && !v1_publish_latest(session)) {
+        return V1_LINE_FAIL;
+    }
     return V1_LINE_CONTINUE;
 }
 
@@ -373,8 +399,7 @@ static v1_line_result_t v1_handle_version_mask(v1_session_t *session)
         ESP_LOGW(TAG, "Pool version mask does not satisfy the negotiated minimum bit count; disabling version rolling");
         STRATUM_V1_bip310_mark_unsupported(&s_bip310.state);
         v1_set_rolling_state(session, false, 0);
-        v1_publish_latest(session);
-        return V1_LINE_CONTINUE;
+        return v1_republish_latest(session);
     }
     if (updated_mask == s_v1_conn->version_mask) {
         // Some pools re-broadcast the active mask. Nothing observable changes,
@@ -385,8 +410,7 @@ static v1_line_result_t v1_handle_version_mask(v1_session_t *session)
 
     ESP_LOGI(TAG, "Set version mask: %08lx", (unsigned long)updated_mask);
     v1_set_rolling_state(session, true, updated_mask);
-    v1_publish_latest(session);
-    return V1_LINE_CONTINUE;
+    return v1_republish_latest(session);
 }
 
 static v1_line_result_t v1_handle_configure(v1_session_t *session)
@@ -416,15 +440,13 @@ static v1_line_result_t v1_handle_configure(v1_session_t *session)
                  (unsigned int)STRATUM_VERSION_ROLLING_MIN_BIT_COUNT);
         STRATUM_V1_bip310_mark_unsupported(&s_bip310.state);
         v1_set_rolling_state(session, false, 0);
-        v1_publish_latest(session);
-        return V1_LINE_CONTINUE;
+        return v1_republish_latest(session);
     }
 
     ESP_LOGI(TAG, "Configure result accepted, version mask: %08lx", (unsigned long)negotiated_mask);
     STRATUM_V1_bip310_mark_supported(&s_bip310.state);
     v1_set_rolling_state(session, true, negotiated_mask);
-    v1_publish_latest(session);
-    return V1_LINE_CONTINUE;
+    return v1_republish_latest(session);
 }
 
 static v1_line_result_t v1_handle_result(v1_session_t *session, int64_t receive_time_us)
@@ -615,7 +637,8 @@ int stratum_v1_submit_share_checked(GlobalState *GLOBAL_STATE, const bm_job *job
 
     double required_difficulty =
         mining_v1_effective_share_difficulty(job->pool_diff, conn->pool_difficulty);
-    if (!(share_difficulty >= required_difficulty)) {
+    if (!(share_difficulty >= required_difficulty) &&
+        !mining_share_solves_block(share_difficulty, job->target)) {
         pthread_mutex_unlock(&GLOBAL_STATE->transport_mutex);
         return STRATUM_V1_SUBMIT_FILTERED;
     }
@@ -804,6 +827,7 @@ static esp_err_t v1_open_session(GlobalState *GLOBAL_STATE, uint16_t pool_idx,
             .authorize_message_id = -1,
         },
         .configure_message_id = -1,
+        .connected_us = esp_timer_get_time(),
     };
     return ESP_OK;
 }
@@ -898,6 +922,18 @@ static esp_err_t v1_session_loop(v1_session_t *session)
             ESP_LOGE(TAG, "Stratum V1 subscription/authorization timed out; reconnecting");
             v1_negotiation_interrupted(session);
             return ESP_FAIL;
+        }
+        if (session->setup.complete) {
+            int64_t job_anchor_us = session->last_job_us > 0
+                                        ? session->last_job_us
+                                        : session->connected_us;
+            int64_t timeout_us = session->last_job_us > 0
+                                     ? JOB_FRESHNESS_TIMEOUT_US
+                                     : FIRST_JOB_TIMEOUT_US;
+            if (now_us - job_anchor_us >= timeout_us) {
+                ESP_LOGE(TAG, "Pool stopped providing fresh work; reconnecting");
+                return ESP_ERR_TIMEOUT;
+            }
         }
     }
 }

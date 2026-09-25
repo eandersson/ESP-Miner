@@ -8,6 +8,7 @@
 #include "esp_heap_caps.h"
 
 static miner_job_t s_job_pool[MINER_JOB_POOL_SIZE];
+static size_t s_job_pool_suffix_capacity[MINER_JOB_POOL_SIZE];
 static pthread_mutex_t s_job_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void miner_job_lock(void)
@@ -59,10 +60,44 @@ void miner_job_free_buffers(miner_job_t *job)
     job->coinbase_suffix_len = 0;
 }
 
-void miner_job_copy(miner_job_t *dst, const miner_job_t *src)
+bool miner_job_ensure_suffix_capacity(miner_job_t *job, size_t needed)
+{
+    if (job == NULL || needed > MAX_COINBASE_SUFFIX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < MINER_JOB_POOL_SIZE; i++) {
+        if (job != &s_job_pool[i]) {
+            continue;
+        }
+        if (needed == 0 || (job->coinbase_suffix != NULL &&
+                            needed <= s_job_pool_suffix_capacity[i])) {
+            return true;
+        }
+        // Only the no-PSRAM fallback is small. Its calloc buffer can grow
+        // on demand without reserving 8 * 63 KiB of internal RAM at boot.
+        uint8_t *larger = realloc(job->coinbase_suffix, needed);
+        if (larger == NULL) {
+            return false;
+        }
+        job->coinbase_suffix = larger;
+        s_job_pool_suffix_capacity[i] = needed;
+        return true;
+    }
+    return needed == 0 || job->coinbase_suffix != NULL;
+}
+
+bool miner_job_copy(miner_job_t *dst, const miner_job_t *src)
 {
     if (dst == NULL || src == NULL || dst == src) {
-        return;
+        return false;
+    }
+
+    if (src->coinbase_prefix_len > MAX_COINBASE_PREFIX_LEN ||
+        (src->coinbase_prefix_len > 0 &&
+         (src->coinbase_prefix == NULL || dst->coinbase_prefix == NULL)) ||
+        (src->coinbase_suffix_len > 0 && src->coinbase_suffix == NULL) ||
+        !miner_job_ensure_suffix_capacity(dst, src->coinbase_suffix_len)) {
+        return false;
     }
 
     uint8_t *prefix = dst->coinbase_prefix;
@@ -89,6 +124,7 @@ void miner_job_copy(miner_job_t *dst, const miner_job_t *src)
     }
     dst->coinbase_prefix_len = prefix_len;
     dst->coinbase_suffix_len = suffix_len;
+    return true;
 }
 
 void miner_job_pool_init(void)
@@ -104,6 +140,11 @@ void miner_job_pool_init(void)
             s_job_pool[i].coinbase_suffix = heap_caps_calloc(1, MAX_COINBASE_SUFFIX_LEN, MALLOC_CAP_SPIRAM);
             if (!s_job_pool[i].coinbase_suffix) {
                 s_job_pool[i].coinbase_suffix = calloc(1, 2048);
+                if (s_job_pool[i].coinbase_suffix) {
+                    s_job_pool_suffix_capacity[i] = 2048;
+                }
+            } else {
+                s_job_pool_suffix_capacity[i] = MAX_COINBASE_SUFFIX_LEN;
             }
         }
         uint8_t *p_buf = s_job_pool[i].coinbase_prefix;

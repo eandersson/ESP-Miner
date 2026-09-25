@@ -221,6 +221,7 @@ static void stratum_v2_publish_slot(GlobalState *GLOBAL_STATE, miner_job_t *job,
     if (GLOBAL_STATE->create_jobs_task_handle) {
         xTaskNotify(GLOBAL_STATE->create_jobs_task_handle, slot, eSetValueWithOverwrite);
     }
+    GLOBAL_STATE->SYSTEM_MODULE.pools_unavailable = false;
 }
 
 static void stratum_v2_handle_new_extended_mining_job_locked(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,

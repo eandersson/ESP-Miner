@@ -13,7 +13,8 @@
 #include "unity.h"
 
 const bm1397_harness_driver_t bm1397_harness_driver = {
-    BM1397_init, BM1397_send_work, BM1397_process_work,
+    BM1397_init, BM1397_send_work, BM1397_set_ticket_difficulty,
+    BM1397_process_work,
 };
 
 enum { MAX_PACKETS = 32, JOB_SLOTS = 128 };

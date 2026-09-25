@@ -28,6 +28,7 @@ uint8_t BM1370_init(GlobalState * GLOBAL_STATE);
 bool BM1370_send_work(GlobalState * GLOBAL_STATE, bm_job * next_bm_job,
                       uint32_t expected_generation);
 esp_err_t BM1370_set_version_mask(uint32_t version_mask);
+esp_err_t BM1370_set_ticket_difficulty(uint16_t difficulty);
 esp_err_t BM1370_set_max_baud(int *baud);
 esp_err_t BM1370_set_default_baud(int *baud);
 esp_err_t BM1370_send_hash_frequency(float frequency,

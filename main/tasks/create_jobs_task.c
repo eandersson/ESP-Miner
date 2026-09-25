@@ -331,9 +331,14 @@ static bool work_is_buildable(const miner_job_t *job)
 static void take_work(GlobalState *GLOBAL_STATE, job_scheduler_t *scheduler, uint32_t slot)
 {
     miner_job_lock();
-    miner_job_copy(&scheduler->incoming, miner_job_get_slot(slot));
-    GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot % MINER_JOB_POOL_SIZE);
+    bool copied = miner_job_copy(&scheduler->incoming, miner_job_get_slot(slot));
     miner_job_unlock();
+    if (!copied) {
+        ESP_LOGE(TAG, "Unable to copy mining job from ring slot %lu",
+                 (unsigned long)slot);
+        return;
+    }
+    GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot % MINER_JOB_POOL_SIZE);
 
     if (scheduler->incoming.pool_generation != ASIC_result_task_get_pool_generation()) {
         ESP_LOGD(TAG, "Discarding invalidated work %s", scheduler->incoming.job_id);

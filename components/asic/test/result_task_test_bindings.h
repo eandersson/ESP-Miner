@@ -23,6 +23,7 @@
 #define stratum_v1_get_current_difficulty result_task_stub_current_difficulty
 #define self_test_record_nonce result_task_spy_record_nonce
 #define SYSTEM_notify_found_nonce result_task_spy_notify_found_nonce
+#define SYSTEM_notify_block_submitted result_task_spy_block_submitted
 #define scoreboard_add result_task_spy_scoreboard_add
 #define hashrate_monitor_register_read result_task_spy_register_read
 

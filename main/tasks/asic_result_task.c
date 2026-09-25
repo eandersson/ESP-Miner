@@ -52,6 +52,7 @@ typedef struct
     uint32_t version_bits;
     double difficulty;
     uint64_t result_timestamp_us;
+    bool solves_block;
 } queued_v1_share_t;
 
 typedef struct
@@ -113,6 +114,15 @@ static void free_queued_v1_share(queued_v1_share_t *share)
     }
 }
 
+// A found block is counted only once its share is written to the pool, so a
+// block solution that never gets there must not disappear silently.
+static void log_unsubmitted_block(const bm_job *job, double difficulty,
+                                  const char *reason)
+{
+    ESP_LOGE(TAG, "Block solution for job %s (difficulty %.1f) was not submitted: %s",
+             job->jobid, difficulty, reason);
+}
+
 static void drain_result_queue(void)
 {
     if (asic_nonce_queue == NULL) {
@@ -134,6 +144,9 @@ static void drain_share_queue(void)
     queued_v1_share_t share;
     uint32_t drained = 0;
     while (xQueueReceive(stratum_v1_share_queue, &share, 0) == pdTRUE) {
+        if (share.solves_block) {
+            log_unsubmitted_block(share.job, share.difficulty, "job invalidated");
+        }
         free_queued_v1_share(&share);
         drained++;
     }
@@ -255,8 +268,8 @@ static bool resolve_delayed_job_result(GlobalState *GLOBAL_STATE,
     bm_job *current = queued_result->job;
     bm_job *retired = queued_result->alternate_job;
 
-    double ticket_difficulty =
-        (double)GLOBAL_STATE->DEVICE_CONFIG.family.asic.difficulty;
+    uint16_t configured_ticket =
+        GLOBAL_STATE->DEVICE_CONFIG.family.asic.difficulty;
     uint32_t current_version = 0;
     uint32_t retired_version = 0;
     double current_difficulty = 0.0;
@@ -270,7 +283,8 @@ static bool resolve_delayed_job_result(GlobalState *GLOBAL_STATE,
             GLOBAL_STATE, &queued_result->result, current);
         current_difficulty = test_nonce_value(
             current, queued_result->result.nonce, current_version);
-        current_valid = current_difficulty >= ticket_difficulty;
+        current_valid = current_difficulty >=
+            (double)mining_ticket_difficulty(configured_ticket, current->target);
     }
 
     if (retired != NULL && result_after_dispatch(
@@ -287,7 +301,8 @@ static bool resolve_delayed_job_result(GlobalState *GLOBAL_STATE,
                 GLOBAL_STATE, &queued_result->result, retired);
             retired_difficulty = test_nonce_value(
                 retired, queued_result->result.nonce, retired_version);
-            retired_valid = retired_difficulty >= ticket_difficulty;
+            retired_valid = retired_difficulty >=
+                (double)mining_ticket_difficulty(configured_ticket, retired->target);
         }
     }
 
@@ -578,7 +593,8 @@ void ASIC_result_rx_task(void *pvParameters)
 }
 
 static bool enqueue_v1_share(const queued_asic_result_t *queued_result,
-                             uint32_t version_bits, double difficulty)
+                             uint32_t version_bits, double difficulty,
+                             bool solves_block)
 {
     queued_v1_share_t share = {
         .job = queued_result->job,
@@ -587,6 +603,7 @@ static bool enqueue_v1_share(const queued_asic_result_t *queued_result,
         .version_bits = version_bits,
         .difficulty = difficulty,
         .result_timestamp_us = queued_result->result.timestamp_us,
+        .solves_block = solves_block,
     };
 
     if (share.job == NULL) {
@@ -678,8 +695,13 @@ void ASIC_result_task(void *pvParameters)
             is_v1_job
                 ? (asic_result->rolled_version & active_job->version_mask)
                 : (asic_result->rolled_version ^ active_job->version);
+        bool solves_block =
+            mining_share_solves_block(nonce_diff, active_job->target);
         if (queued_result.generation != (uint32_t)atomic_load(&job_generation)) {
             atomic_fetch_add(&stale_result_count, 1);
+            if (solves_block) {
+                log_unsubmitted_block(active_job, nonce_diff, "job invalidated");
+            }
             free_queued_result(&queued_result);
             continue;
         }
@@ -692,7 +714,9 @@ void ASIC_result_task(void *pvParameters)
                     stratum_v1_get_current_difficulty(GLOBAL_STATE));
         }
 
-        if (nonce_diff >= required_share_difficulty)
+        // A block solution is submitted even when the network target is
+        // easier than the pool's share difficulty.
+        if (nonce_diff >= required_share_difficulty || solves_block)
         {
             if (!is_v1_job) {
                 // SV2: the client derives the extranonce from the job metadata
@@ -715,12 +739,28 @@ void ASIC_result_task(void *pvParameters)
                             (sent_time_us - asic_result->timestamp_us) / 1000.0f;
                     }
                 }
+                if (solves_block) {
+                    if (ret >= 0) {
+                        SYSTEM_notify_block_submitted(GLOBAL_STATE, nonce_diff,
+                                                      active_job->target);
+                    } else {
+                        log_unsubmitted_block(active_job, nonce_diff,
+                                              ret == STRATUM_V2_SUBMIT_STALE
+                                                  ? "stale"
+                                                  : "submit failed");
+                    }
+                }
             } else {
                 // Network backpressure must not block nonce validation or allow
                 // register traffic to evict valid shares. A dedicated bounded
                 // worker owns V1 submissions and rechecks the generation.
-                if (!enqueue_v1_share(&queued_result, version_bits, nonce_diff)) {
+                if (!enqueue_v1_share(&queued_result, version_bits, nonce_diff,
+                                      solves_block)) {
                     ESP_LOGW(TAG, "Unable to queue valid Stratum V1 share");
+                    if (solves_block) {
+                        log_unsubmitted_block(active_job, nonce_diff,
+                                              "share queue full");
+                    }
                 }
             }
         }
@@ -728,7 +768,7 @@ void ASIC_result_task(void *pvParameters)
         //log the ASIC response
         ESP_LOGD(TAG, "ID: %s, ASIC nr: %d, Core: %d/%d, ver: %08" PRIX32 " Nonce %08" PRIX32 " diff %.1f of %g.", active_job->jobid, asic_result->asic_nr, asic_result->core_id, asic_result->small_core_id, asic_result->rolled_version, asic_result->nonce, nonce_diff, required_share_difficulty);
 
-        SYSTEM_notify_found_nonce(GLOBAL_STATE, nonce_diff, active_job->target);
+        SYSTEM_notify_found_nonce(GLOBAL_STATE, nonce_diff);
 
         scoreboard_add(&GLOBAL_STATE->SYSTEM_MODULE.scoreboard, nonce_diff, active_job->jobid, active_job->extranonce2, active_job->ntime, asic_result->nonce, version_bits);
 
@@ -749,6 +789,9 @@ void ASIC_v1_share_submit_task(void *pvParameters)
 
         if (share.generation != (uint32_t)atomic_load(&job_generation)) {
             atomic_fetch_add(&stale_share_count, 1);
+            if (share.solves_block) {
+                log_unsubmitted_block(share.job, share.difficulty, "job invalidated");
+            }
             free_queued_v1_share(&share);
             continue;
         }
@@ -798,6 +841,18 @@ void ASIC_v1_share_submit_task(void *pvParameters)
                     (sent_time_us - share.result_timestamp_us) / 1000.0f;
                 GLOBAL_STATE->SYSTEM_MODULE.process_time = process_time;
                 ESP_LOGD(TAG, "Processing time: %0.1f ms", process_time);
+            }
+        }
+
+        if (share.solves_block) {
+            if (ret >= 0) {
+                SYSTEM_notify_block_submitted(GLOBAL_STATE, share.difficulty,
+                                              share.job->target);
+            } else {
+                log_unsubmitted_block(share.job, share.difficulty,
+                                      ret == STRATUM_V1_SUBMIT_STALE
+                                          ? "stale"
+                                          : "submit failed");
             }
         }
 

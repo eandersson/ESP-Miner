@@ -16,6 +16,7 @@
 #define extranonce_2_generate mining_test_extranonce_2_generate
 #define extranonce_2_increment mining_test_extranonce_2_increment
 #define mining_v1_effective_share_difficulty mining_test_v1_effective_share_difficulty
+#define mining_share_solves_block mining_test_share_solves_block
 #define hash_to_pdiff mining_test_hash_to_pdiff
 #define test_nonce_value mining_test_nonce_value
 #define increment_bitmask mining_test_increment_bitmask

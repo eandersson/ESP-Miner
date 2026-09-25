@@ -10,6 +10,7 @@
 #include "stratum_api.h"
 #include "connect.h"
 #include "system.h"
+#include "esp_timer.h"
 #include <sys/socket.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #define HEARTBEAT_INTERVAL_MS 60000
 #define INITIAL_HEARTBEAT_DELAY_MS 10000
 #define RECOVERY_PROBE_INTERVAL_MS 30000
+#define MIN_HEALTHY_SESSION_US 60000000LL
 
 static GlobalState *s_global_state = NULL;
 static volatile bool s_should_reconnect = false;
@@ -210,7 +212,18 @@ void stratum_task(void *pvParameters)
         if (consecutive_pool_failures >= threshold) {
             GLOBAL_STATE->SYSTEM_MODULE.pools_unavailable = true;
             ESP_LOGW(TAG, "All configured pools unreachable, pausing mining to conserve power.");
-            vTaskDelay(pdMS_TO_TICKS(RECOVERY_PROBE_INTERVAL_MS));
+            for (int waited_ms = 0; waited_ms < RECOVERY_PROBE_INTERVAL_MS;
+                 waited_ms += 1000) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (s_should_reconnect) {
+                    break;
+                }
+            }
+
+            // A pool edit invalidates the indices captured before the delay.
+            // Let the next iteration snapshot the new selection instead of
+            // probing stale slots and keeping the miner parked.
+            if (s_should_reconnect) continue;
 
             if (!wifi_is_connected()) continue;
 
@@ -243,6 +256,8 @@ void stratum_task(void *pvParameters)
 
         s_running_pool_idx = active_idx;
         s_should_reconnect = false;
+        uint64_t work_before_session = GLOBAL_STATE->SYSTEM_MODULE.work_received;
+        int64_t session_started_us = esp_timer_get_time();
         esp_err_t err;
 
         if (protocol == STRATUM_PROTOCOL_V2) {
@@ -251,8 +266,13 @@ void stratum_task(void *pvParameters)
             err = stratum_v1_run(GLOBAL_STATE, active_idx);
         }
 
-        if (err == ESP_OK || s_should_reconnect || GLOBAL_STATE->SYSTEM_MODULE.work_received > 0) {
-            // Clean disconnect, mode switch, reconnect requested, or was actively mining
+        bool healthy_session =
+            err != ESP_ERR_TIMEOUT &&
+            GLOBAL_STATE->SYSTEM_MODULE.work_received > work_before_session &&
+            esp_timer_get_time() - session_started_us >= MIN_HEALTHY_SESSION_US;
+        if (err == ESP_OK || s_should_reconnect || healthy_session) {
+            // A single job followed by an immediate disconnect is a failure:
+            // otherwise a flapping primary can prevent fallback forever.
             consecutive_pool_failures = 0;
             retry_attempts = 0;
             GLOBAL_STATE->SYSTEM_MODULE.pools_unavailable = false;

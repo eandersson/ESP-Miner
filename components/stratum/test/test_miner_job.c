@@ -1,5 +1,6 @@
 #include "unity.h"
 #include "miner_job.h"
+#include <string.h>
 
 TEST_CASE("miner_job_get_slot indexing and buffer validity", "[stratum]")
 {
@@ -48,4 +49,21 @@ TEST_CASE("miner_job_is_rollable validation", "[stratum]")
     job->extranonce2_len = 4;
     job->coinbase_prefix_len = 10;
     TEST_ASSERT_TRUE(miner_job_is_rollable(job));
+}
+
+TEST_CASE("ring slot copies coinbase suffix beyond two kilobytes", "[stratum]")
+{
+    miner_job_t *slot = miner_job_get_slot(0);
+    miner_job_t source = {0};
+    TEST_ASSERT_TRUE(miner_job_alloc_buffers(&source));
+    source.coinbase_suffix_len = 4096;
+    memset(source.coinbase_suffix, 0x42, source.coinbase_suffix_len);
+
+    TEST_ASSERT_TRUE(miner_job_copy(slot, &source));
+    TEST_ASSERT_EQUAL_UINT16(4096, slot->coinbase_suffix_len);
+    TEST_ASSERT_EQUAL_HEX8(0x42, slot->coinbase_suffix[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x42, slot->coinbase_suffix[4095]);
+    TEST_ASSERT_FALSE(miner_job_ensure_suffix_capacity(
+        slot, MAX_COINBASE_SUFFIX_LEN + 1U));
+    miner_job_free_buffers(&source);
 }
