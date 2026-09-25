@@ -1,4 +1,4 @@
-import { ChangeDetectorRef, Component, Host, HostBinding, Input, OnDestroy, OnInit } from '@angular/core';
+import { ChangeDetectorRef, Component, Host, HostBinding, Input, OnDestroy, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { NavigationEnd, Router } from '@angular/router';
 import { animate, state, style, transition, trigger } from '@angular/animations';
 import { Subscription, Subject, takeUntil } from 'rxjs';
@@ -21,6 +21,7 @@ import { LayoutService } from './service/app.layout.service';
             transition('collapsed <=> expanded', animate('400ms cubic-bezier(0.86, 0, 0.07, 1)'))
         ])
     ],
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class AppMenuitemComponent implements OnInit, OnDestroy {

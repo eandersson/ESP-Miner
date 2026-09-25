@@ -6,7 +6,7 @@ import { CommonModule } from '@angular/common';
 import { LocalStorageService } from 'src/app/local-storage.service';
 import { LoadingService } from 'src/app/services/loading.service';
 import { SystemApiService } from 'src/app/services/system.service';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withXhr } from '@angular/common/http';
 import { ScoreboardComponent } from './scoreboard.component';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 
@@ -20,7 +20,7 @@ describe('ScoreboardComponent', () => {
       imports: [CommonModule, TooltipDirective, DiffSuffixPipe, DateAgoPipe],
       providers: [
         provideRouter([]),
-        provideHttpClient(),
+        provideHttpClient(withXhr()),
         SystemApiService,
         LoadingService,
         LocalStorageService

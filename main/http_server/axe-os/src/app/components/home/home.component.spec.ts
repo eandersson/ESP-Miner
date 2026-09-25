@@ -1,7 +1,7 @@
 import 'chartjs-adapter-moment';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { HomeComponent } from './home.component';
-import { HttpErrorResponse, provideHttpClient } from '@angular/common/http';
+import { HttpErrorResponse, provideHttpClient, withXhr } from '@angular/common/http';
 import { provideToastr } from 'ngx-toastr';
 import { ReactiveFormsModule, FormsModule } from '@angular/forms';
 import { NoopAnimationsModule } from '@angular/platform-browser/animations';
@@ -221,7 +221,7 @@ describe('HomeComponent', () => {
       ],
       providers: [
         provideRouter([]),
-        provideHttpClient(),
+        provideHttpClient(withXhr()),
         provideToastr(),
         { provide: SystemApiService, useValue: mockSystemApiService },
         { provide: LiveDataService, useValue: mockLiveDataService },

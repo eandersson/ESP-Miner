@@ -1,21 +1,23 @@
-import { 
-  Directive, 
-  ElementRef, 
-  Input, 
-  HostListener, 
+import {
+  Directive,
+  ElementRef,
+  Input,
+  HostListener,
   OnChanges,
-  OnDestroy, 
+  OnDestroy,
   SimpleChanges,
-  Component, 
-  ComponentRef, 
-  ViewContainerRef, 
-  EmbeddedViewRef 
+  Component,
+  ComponentRef,
+  ViewContainerRef,
+  EmbeddedViewRef,
+  ChangeDetectionStrategy
 } from '@angular/core';
 
 @Component({
   selector: 'app-tooltip-content',
   standalone: true,
   template: `{{ text }}`,
+  changeDetection: ChangeDetectionStrategy.Eager,
   host: {
     'class': 'fixed z-[99999] bg-[#2b2b2b] text-[#ffffff] app-tooltip-text px-2.5 py-1.5 rounded shadow-xl pointer-events-none border border-neutral-700 max-w-[250px] whitespace-normal text-center'
   }

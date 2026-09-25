@@ -1,9 +1,10 @@
-import { Component } from '@angular/core';
+import { Component, ChangeDetectionStrategy } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { TooltipDirective } from './tooltip.directive';
 
 @Component({
   template: `<span [appTooltip]="tooltipText" tooltipPosition="bottom">Test Work</span>`,
+  changeDetection: ChangeDetectionStrategy.Eager,
   imports: [TooltipDirective]
 })
 class TestHostComponent {

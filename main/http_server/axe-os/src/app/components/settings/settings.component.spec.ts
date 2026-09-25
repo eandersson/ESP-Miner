@@ -2,7 +2,7 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 
 import { SettingsComponent } from './settings.component';
 import { EditComponent } from '../edit/edit.component';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withXhr } from '@angular/common/http';
 import { provideToastr } from 'ngx-toastr';
 import { provideRouter } from '@angular/router';
 
@@ -13,7 +13,7 @@ describe('SettingsComponent', () => {
   beforeEach(() => {
     TestBed.configureTestingModule({
       imports: [SettingsComponent, EditComponent],
-      providers: [provideHttpClient(), provideToastr(), provideRouter([])]
+      providers: [provideHttpClient(withXhr()), provideToastr(), provideRouter([])]
     });
     fixture = TestBed.createComponent(SettingsComponent);
     component = fixture.componentInstance;

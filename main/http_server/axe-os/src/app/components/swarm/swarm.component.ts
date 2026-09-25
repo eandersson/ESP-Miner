@@ -1,6 +1,6 @@
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { isFrequencyLow } from 'src/app/utils/common-functions';
-import { Component, OnDestroy, OnInit, ViewChild, HostListener } from '@angular/core';
+import { Component, OnDestroy, OnInit, ViewChild, HostListener, ChangeDetectionStrategy } from '@angular/core';
 import { AbstractControl, FormBuilder, FormGroup, Validators, FormControl, ValidationErrors } from '@angular/forms';
 import { ToastrService } from 'ngx-toastr';
 import { forkJoin, catchError, from, map, mergeMap, of, take, timeout, toArray, Observable, Subscription } from 'rxjs';
@@ -59,6 +59,7 @@ type SwarmDevice = {
     selector: 'app-swarm',
     templateUrl: './swarm.component.html',
     styleUrls: ['./swarm.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class SwarmComponent implements OnInit, OnDestroy {
@@ -109,7 +110,7 @@ export class SwarmComponent implements OnInit, OnDestroy {
     this.sortBy(value.sortField, this.selectedSort.sortDirection);
   }
 
-  @HostListener('document:keydown.esc', ['$event'])
+  @HostListener('document:keydown.esc')
   onEscKey() {
     if (this.filterText) {
       this.filterText = '';

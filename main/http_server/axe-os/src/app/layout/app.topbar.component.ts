@@ -1,4 +1,4 @@
-import { Component, ElementRef, Input, ViewChild, OnInit, OnDestroy } from '@angular/core';
+import { Component, ElementRef, Input, ViewChild, OnInit, OnDestroy, ChangeDetectionStrategy } from '@angular/core';
 import { Observable, Subject, takeUntil } from 'rxjs';
 import { ToastrService } from 'ngx-toastr';
 import { SystemApiService } from 'src/app/services/system.service';
@@ -11,6 +11,7 @@ import { SystemInfo as ISystemInfo } from 'src/app/generated/models';
 @Component({
     selector: 'app-topbar',
     templateUrl: './app.topbar.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class AppTopBarComponent implements OnInit, OnDestroy {

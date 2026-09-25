@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy } from '@angular/core';
 import { Observable, Subject, combineLatest, shareReplay, first, takeUntil, map } from 'rxjs';
 import { HttpErrorResponse } from '@angular/common/http';
 import { getHttpErrorMessage } from 'src/app/utils/error-handler';
@@ -29,6 +29,7 @@ type CombinedData = {
 @Component({
     selector: 'app-system',
     templateUrl: './system.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class SystemComponent implements OnInit, OnDestroy {

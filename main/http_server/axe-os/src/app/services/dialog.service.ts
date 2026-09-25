@@ -1,4 +1,4 @@
-import { Component, Injectable } from '@angular/core';
+import { Component, Injectable, ChangeDetectionStrategy } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { Observable, Subject } from 'rxjs';
 
@@ -73,6 +73,7 @@ export class DialogService {
       </app-modal>
     }
     `,
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class DialogListComponent {

@@ -1,4 +1,4 @@
-import { AfterViewChecked, Component, Input, OnInit, ElementRef, OnDestroy, ViewChild, HostListener } from '@angular/core';
+import { AfterViewChecked, Component, Input, OnInit, ElementRef, OnDestroy, ViewChild, HostListener, ChangeDetectionStrategy } from '@angular/core';
 import { FormBuilder, FormGroup, Validators } from '@angular/forms';
 import { Subscription } from 'rxjs';
 import { ToastrService } from 'ngx-toastr';
@@ -9,6 +9,7 @@ import { SystemApiService } from 'src/app/services/system.service';
     selector: 'app-logs',
     templateUrl: './logs.component.html',
     styleUrl: './logs.component.scss',
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class LogsComponent implements OnInit, OnDestroy, AfterViewChecked {

@@ -1,7 +1,7 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 
 import { SystemComponent } from './system.component';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withXhr } from '@angular/common/http';
 import { provideToastr } from 'ngx-toastr';
 
 describe('SystemComponent', () => {
@@ -11,7 +11,7 @@ describe('SystemComponent', () => {
   beforeEach(async () => {
     await TestBed.configureTestingModule({
       declarations: [SystemComponent],
-      providers: [provideHttpClient(), provideToastr()]
+      providers: [provideHttpClient(withXhr()), provideToastr()]
     })
     .compileComponents();
 

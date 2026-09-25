@@ -1,6 +1,6 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
-import { HttpClient, provideHttpClient } from '@angular/common/http';
+import { HttpClient, provideHttpClient, withXhr } from '@angular/common/http';
 import { provideToastr } from 'ngx-toastr';
 import { of } from 'rxjs';
 
@@ -43,7 +43,7 @@ describe('SwarmComponent', () => {
         SatsPipe
       ],
       providers: [
-        provideHttpClient(),
+        provideHttpClient(withXhr()),
         provideToastr()
       ]
     });

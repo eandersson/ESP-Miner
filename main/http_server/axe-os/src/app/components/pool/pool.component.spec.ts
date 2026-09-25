@@ -2,7 +2,7 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { PoolComponent } from './pool.component';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withXhr } from '@angular/common/http';
 import { provideToastr } from 'ngx-toastr';
 import { provideRouter } from '@angular/router';
 import { By } from '@angular/platform-browser';
@@ -85,7 +85,7 @@ describe('PoolComponent', () => {
       ],
       schemas: [NO_ERRORS_SCHEMA],
       providers: [
-        provideHttpClient(),
+        provideHttpClient(withXhr()),
         provideToastr(),
         provideRouter([]),
         { provide: LiveDataService, useValue: liveDataMock },

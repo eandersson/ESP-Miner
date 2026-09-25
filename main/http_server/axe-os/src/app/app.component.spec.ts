@@ -5,7 +5,7 @@ import { provideRouter, RouterModule } from '@angular/router';
 import { LayoutService } from './layout/service/app.layout.service';
 import { ThemeService } from './services/theme.service';
 import { LocalStorageService } from './local-storage.service';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withXhr } from '@angular/common/http';
 import { provideToastr } from 'ngx-toastr';
 import { DialogListComponent } from './services/dialog.service';
 
@@ -18,7 +18,7 @@ describe('AppComponent', () => {
       LayoutService,
       ThemeService,
       LocalStorageService,
-      provideHttpClient(),
+      provideHttpClient(withXhr()),
       provideToastr()
     ]
   }));

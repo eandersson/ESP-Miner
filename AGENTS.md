@@ -27,7 +27,7 @@ The project uses the standard ESP-IDF build system. Ensure you are using ESP-IDF
 
 **Prerequisites:**
 - ESP-IDF v6.1 environment sourced.
-- Node.js (v22+) and npm for the frontend bundle.
+- Node.js 22.22.3+ or 24.15+ (CI uses 24.19.0) and npm for the frontend bundle.
 
 **Commands:**
 ```bash

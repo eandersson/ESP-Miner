@@ -418,7 +418,7 @@
     </form>
   }
 
-  <app-modal [headline]="selectedAxeOs?.address">
+  <app-modal [headline]="$safeNavigationMigration(selectedAxeOs?.address)">
     @if (selectedAxeOs) {
       <app-edit [uri]="'http://' + selectedAxeOs.connectionAddress"></app-edit>
     }

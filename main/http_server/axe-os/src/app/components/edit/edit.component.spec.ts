@@ -1,7 +1,7 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 
 import { EditComponent } from './edit.component';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withXhr } from '@angular/common/http';
 import { provideToastr } from 'ngx-toastr';
 import { provideRouter } from '@angular/router';
 import { FormControl, FormGroup } from '@angular/forms';
@@ -13,7 +13,7 @@ describe('EditComponent', () => {
   beforeEach(() => {
     TestBed.configureTestingModule({
       imports: [EditComponent],
-      providers: [provideHttpClient(), provideToastr(), provideRouter([])]
+      providers: [provideHttpClient(withXhr()), provideToastr(), provideRouter([])]
     });
     fixture = TestBed.createComponent(EditComponent);
     component = fixture.componentInstance;

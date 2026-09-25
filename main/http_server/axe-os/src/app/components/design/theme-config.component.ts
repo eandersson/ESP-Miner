@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy } from '@angular/core';
 import { Subject } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
 import { LayoutService } from '../../layout/service/app.layout.service';
@@ -13,6 +13,7 @@ interface ThemeOption {
   selector: 'app-theme-config',
   templateUrl: './theme-config.component.html',
   styleUrls: ['./design-component.scss'],
+  changeDetection: ChangeDetectionStrategy.Eager,
   standalone: false
 })
 export class ThemeConfigComponent implements OnInit {

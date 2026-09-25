@@ -1,4 +1,4 @@
-import { Component, ViewChild, AfterViewInit } from '@angular/core';
+import { Component, ViewChild, AfterViewInit, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormGroup } from '@angular/forms';
 import { Observable } from 'rxjs';
@@ -8,6 +8,7 @@ import { EditComponent } from '../edit/edit.component';
     selector: 'app-settings',
     templateUrl: './settings.component.html',
     standalone: true,
+    changeDetection: ChangeDetectionStrategy.Eager,
     imports: [CommonModule, EditComponent]
 })
 export class SettingsComponent implements AfterViewInit {

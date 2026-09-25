@@ -1,4 +1,4 @@
-import { Component, ViewChild, AfterViewInit } from '@angular/core';
+import { Component, ViewChild, AfterViewInit, ChangeDetectionStrategy } from '@angular/core';
 import { FormGroup } from '@angular/forms';
 import { Observable } from 'rxjs';
 import { NetworkEditComponent } from '../network-edit/network.edit.component';
@@ -7,6 +7,7 @@ import { NetworkEditComponent } from '../network-edit/network.edit.component';
     selector: 'app-network',
     templateUrl: './network.component.html',
     styleUrls: ['./network.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class NetworkComponent implements AfterViewInit {

@@ -1,8 +1,9 @@
-import { Component, Input, OnChanges, SimpleChanges } from '@angular/core';
+import { Component, Input, OnChanges, SimpleChanges, ChangeDetectionStrategy } from '@angular/core';
 
 @Component({
     selector: 'tooltip-text-icon',
     templateUrl: './tooltip-text-icon.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class TooltipTextIconComponent implements OnChanges {

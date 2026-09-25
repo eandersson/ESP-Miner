@@ -1,4 +1,4 @@
-import { Component, ElementRef, HostListener, Input, NgZone, OnChanges, OnDestroy, SimpleChanges, ViewChild } from '@angular/core';
+import { Component, ElementRef, HostListener, Input, NgZone, OnChanges, OnDestroy, SimpleChanges, ViewChild, ChangeDetectionStrategy } from '@angular/core';
 import { Chart, registerables } from 'chart.js';
 
 Chart.register(...registerables);
@@ -14,6 +14,7 @@ Chart.register(...registerables);
       height: 100%;
     }
   `],
+  changeDetection: ChangeDetectionStrategy.Eager,
   standalone: true
 })
 export class AppChartComponent implements OnChanges, OnDestroy {

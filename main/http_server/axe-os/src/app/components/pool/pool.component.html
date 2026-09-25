@@ -45,7 +45,7 @@
                 <i class="pi mr-1 text-secondary transition-transform duration-200" [ngClass]="activeCardIndex === i ? 'pi-chevron-up' : 'pi-chevron-down'" style="font-size: 0.9rem;"></i>
                 <span class="font-bold text-lg text-main">Pool {{ poolControl.get('id')?.value + 1 }}</span>
                 <!-- Status / Protocol Badges -->
-                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-blue-500 text-white">{{ getProtocolLabel(poolControl.get('stratumProtocol')?.value) }}</span>
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-blue-500 text-white">{{ getProtocolLabel($safeNavigationMigration(poolControl.get('stratumProtocol')?.value)) }}</span>
                 @if (poolControl.get('id')?.value === form.get('primaryPoolIndex')?.value) {
                   <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-green-500 text-white">Primary</span>
                 }
@@ -66,7 +66,7 @@
                 }
               </div>
               <div>
-                <button type="button" class="btn btn-secondary border-none p-1 text-red-500 hover:text-red-700 bg-transparent disabled:opacity-50" [disabled]="isDeleteDisabled(poolControl.get('id')?.value)" (click)="deletePool(i); $event.stopPropagation();" appTooltip="Delete Pool" tooltipPosition="left">
+                <button type="button" class="btn btn-secondary border-none p-1 text-red-500 hover:text-red-700 bg-transparent disabled:opacity-50" [disabled]="isDeleteDisabled($safeNavigationMigration(poolControl.get('id')?.value))" (click)="deletePool(i); $event.stopPropagation();" appTooltip="Delete Pool" tooltipPosition="left">
                   <i class="pi pi-trash text-lg"></i>
                 </button>
               </div>
@@ -76,23 +76,23 @@
             <div [hidden]="activeCardIndex !== i" class="p-4 flex flex-col gap-4">
               <!-- Stratum Host -->
               <div class="flex flex-col md:flex-row md:items-center gap-2">
-                <label [htmlFor]="'stratumURL_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">Stratum Host</label>
+                <label [htmlFor]="'stratumURL_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">Stratum Host</label>
                 <div class="w-full md:w-10/12">
-                  <input class="input-text" type="text" [id]="'stratumURL_' + poolControl.get('id')?.value" formControlName="stratumURL" (change)="onUrlChange(i)" />
+                  <input class="input-text" type="text" [id]="'stratumURL_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumURL" (change)="onUrlChange(i)" />
                 </div>
               </div>
 
               <!-- Stratum Port -->
               <div class="flex flex-col md:flex-row md:items-center gap-2">
-                <label [htmlFor]="'stratumPort_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">Stratum Port</label>
+                <label [htmlFor]="'stratumPort_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">Stratum Port</label>
                 <div class="w-full md:w-10/12">
-                  <input class="input-text" [id]="'stratumPort_' + poolControl.get('id')?.value" formControlName="stratumPort" type="number" />
+                  <input class="input-text" [id]="'stratumPort_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumPort" type="number" />
                 </div>
               </div>
 
               <!-- Stratum Protocol -->
               <div class="flex flex-col md:flex-row md:items-center gap-2">
-                <label [htmlFor]="'stratumProtocol_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">
+                <label [htmlFor]="'stratumProtocol_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">
                   <tooltip-text-icon
                     text="Stratum Protocol"
                     tooltip="Select Stratum protocol version. Note: Not all pools support Stratum V2."
@@ -105,12 +105,12 @@
                         <app-radio-button
                           name="stratumProtocol_{{poolControl.get('id')?.value}}"
                           [value]="option.value"
-                          [ngModel]="poolControl.get('stratumProtocol')?.value"
+                          [ngModel]="$safeNavigationMigration(poolControl.get('stratumProtocol')?.value)"
                           [ngModelOptions]="{standalone: true}"
                           (ngModelChange)="poolControl.get('stratumProtocol')?.setValue($event); poolControl.get('stratumProtocol')?.markAsDirty()"
-                          [inputId]="'stratumProtocol_' + poolControl.get('id')?.value + '_' + option.value">
+                          [inputId]="'stratumProtocol_' + $safeNavigationMigration(poolControl.get('id')?.value) + '_' + option.value">
                         </app-radio-button>
-                        <label [for]="'stratumProtocol_' + poolControl.get('id')?.value + '_' + option.value" class="ml-2 cursor-pointer">
+                        <label [for]="'stratumProtocol_' + $safeNavigationMigration(poolControl.get('id')?.value) + '_' + option.value" class="ml-2 cursor-pointer">
                           {{ option.label }}
                         </label>
                       </div>
@@ -121,18 +121,18 @@
 
               <!-- User -->
               <div class="flex flex-col md:flex-row md:items-center gap-2">
-                <label [htmlFor]="'stratumUser_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">User</label>
+                <label [htmlFor]="'stratumUser_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">User</label>
                 <div class="w-full md:w-10/12">
-                  <input class="input-text" [id]="'stratumUser_' + poolControl.get('id')?.value" formControlName="stratumUser" sensitive-data type="text" />
+                  <input class="input-text" [id]="'stratumUser_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumUser" sensitive-data type="text" />
                 </div>
               </div>
 
               <!-- Password -->
               <div class="flex flex-col md:flex-row md:items-center gap-2">
-                <label [htmlFor]="'stratumPassword_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">Password</label>
+                <label [htmlFor]="'stratumPassword_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">Password</label>
                 <div class="w-full md:w-10/12">
                   <div class="relative w-full">
-                    <input class="input-text pr-10" [id]="'stratumPassword_' + poolControl.get('id')?.value" formControlName="stratumPassword"
+                    <input class="input-text pr-10" [id]="'stratumPassword_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumPassword"
                       [type]="showPassword[poolControl.get('id')?.value] ? 'text' : 'password'" autocomplete="off" />
                     @if (poolControl.get('stratumPassword')?.dirty) {
                       <span class="absolute inset-y-0 right-0 flex items-center pr-3 cursor-pointer text-secondary hover:text-main"
@@ -161,12 +161,12 @@
                           <app-radio-button
                             name="stratumV2ChannelType_{{poolControl.get('id')?.value}}"
                             [value]="option.value"
-                            [ngModel]="poolControl.get('stratumV2ChannelType')?.value"
+                            [ngModel]="$safeNavigationMigration(poolControl.get('stratumV2ChannelType')?.value)"
                             [ngModelOptions]="{standalone: true}"
                             (ngModelChange)="poolControl.get('stratumV2ChannelType')?.setValue($event); poolControl.get('stratumV2ChannelType')?.markAsDirty()"
-                            [inputId]="'stratumV2ChannelType_' + poolControl.get('id')?.value + '_' + option.value">
+                            [inputId]="'stratumV2ChannelType_' + $safeNavigationMigration(poolControl.get('id')?.value) + '_' + option.value">
                           </app-radio-button>
-                          <label [for]="'stratumV2ChannelType_' + poolControl.get('id')?.value + '_' + option.value"
+                          <label [for]="'stratumV2ChannelType_' + $safeNavigationMigration(poolControl.get('id')?.value) + '_' + option.value"
                             class="ml-2 cursor-pointer">
                             {{ option.label }}
                           </label>
@@ -188,7 +188,7 @@
 
                 <!-- SV2 Authority Pubkey -->
                 <div class="flex flex-col md:flex-row md:items-start gap-2">
-                  <label [htmlFor]="'stratumV2AuthorityPubkey_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium flex items-center">
+                  <label [htmlFor]="'stratumV2AuthorityPubkey_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium flex items-center">
                     <tooltip-text-icon
                       text="SV2 Authority Pubkey"
                       tooltip="The pool operator provides this key to prove you are connecting to the real pool and not an impersonator. Without it, the connection is still encrypted but a man-in-the-middle attack could redirect your hashrate."
@@ -198,7 +198,7 @@
                     <input
                       class="input-text font-mono"
                       type="text"
-                      [id]="'stratumV2AuthorityPubkey_' + poolControl.get('id')?.value"
+                      [id]="'stratumV2AuthorityPubkey_' + $safeNavigationMigration(poolControl.get('id')?.value)"
                       formControlName="stratumV2AuthorityPubkey"
                       placeholder="Enter base58-encoded authority public key (optional, e.g., 9auqWEzQ...)" />
                     @if (poolControl.get('stratumV2AuthorityPubkey')?.errors?.['invalidBase58']) {
@@ -216,14 +216,14 @@
 
                 <!-- SV2 Require Authentication -->
                 <div class="flex flex-col md:flex-row md:items-center gap-2">
-                  <label [htmlFor]="'stratumV2RequireAuth_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium cursor-pointer select-none">
+                  <label [htmlFor]="'stratumV2RequireAuth_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium cursor-pointer select-none">
                     <tooltip-text-icon
                       text="Require Authentication"
                       tooltip="Refuse to connect unless the server certificate is verified against the Authority Pubkey above. Protects against the man-in-the-middle redirect described for the Authority Pubkey. When enabled without a key set, the miner will not connect."
                     />
                   </label>
                   <div class="w-full md:w-10/12 flex items-center">
-                    <app-checkbox [name]="'stratumV2RequireAuth_' + poolControl.get('id')?.value" [inputId]="'stratumV2RequireAuth_' + poolControl.get('id')?.value" formControlName="stratumV2RequireAuth"
+                    <app-checkbox [name]="'stratumV2RequireAuth_' + $safeNavigationMigration(poolControl.get('id')?.value)" [inputId]="'stratumV2RequireAuth_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumV2RequireAuth"
                       [binary]="true"></app-checkbox>
                   </div>
                 </div>
@@ -243,34 +243,34 @@
                   @if (!isPoolV2Enabled(i)) {
                     <!-- Suggested Difficulty -->
                     <div class="flex flex-col md:flex-row md:items-center gap-2">
-                      <label [htmlFor]="'stratumSuggestedDifficulty_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">
+                      <label [htmlFor]="'stratumSuggestedDifficulty_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">
                         <tooltip-text-icon
                           text="Suggested Difficulty"
                           tooltip="Used to indicate a preference for share difficulty to the pool. Servers are not required to honour this request, even if they support the stratum method. (0 to disable)"
                         />
                       </label>
                       <div class="w-full md:w-10/12">
-                        <input class="input-text" [id]="'stratumSuggestedDifficulty_' + poolControl.get('id')?.value" formControlName="stratumSuggestedDifficulty" type="number" />
+                        <input class="input-text" [id]="'stratumSuggestedDifficulty_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumSuggestedDifficulty" type="number" />
                       </div>
                     </div>
 
                     <!-- Extranonce Subscribe -->
                     <div class="flex flex-col md:flex-row md:items-center gap-2">
-                      <label [htmlFor]="'stratumExtranonceSubscribe_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium cursor-pointer select-none">
+                      <label [htmlFor]="'stratumExtranonceSubscribe_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium cursor-pointer select-none">
                         <tooltip-text-icon
                           text="Enable Extranonce Subscribe"
                           tooltip="Indicates to the server that the client supports the mining.set_extranonce method. Required by some pools, check the pool documentation."
                         />
                       </label>
                       <div class="w-full md:w-10/12 flex items-center">
-                        <app-checkbox [name]="'stratumExtranonceSubscribe_' + poolControl.get('id')?.value" [inputId]="'stratumExtranonceSubscribe_' + poolControl.get('id')?.value" formControlName="stratumExtranonceSubscribe"
+                        <app-checkbox [name]="'stratumExtranonceSubscribe_' + $safeNavigationMigration(poolControl.get('id')?.value)" [inputId]="'stratumExtranonceSubscribe_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumExtranonceSubscribe"
                           [binary]="true"></app-checkbox>
                       </div>
                     </div>
 
                     <!-- Connection Security -->
                     <div class="flex flex-col md:flex-row md:items-center gap-2">
-                      <label [htmlFor]="'stratumTLS_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">Connection Security</label>
+                      <label [htmlFor]="'stratumTLS_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">Connection Security</label>
                       <div class="w-full md:w-10/12">
                         <div class="flex flex-wrap gap-4">
                           @for (option of tlsOptions; track option.value) {
@@ -278,12 +278,12 @@
                               <app-radio-button
                                 name="stratumTLS_{{poolControl.get('id')?.value}}"
                                 [value]="option.value"
-                                [ngModel]="poolControl.get('stratumTLS')?.value"
+                                [ngModel]="$safeNavigationMigration(poolControl.get('stratumTLS')?.value)"
                                 [ngModelOptions]="{standalone: true}"
                                 (ngModelChange)="poolControl.get('stratumTLS')?.setValue($event); poolControl.get('stratumTLS')?.markAsDirty()"
-                                [inputId]="'stratumTLS_' + poolControl.get('id')?.value + '_' + option.value">
+                                [inputId]="'stratumTLS_' + $safeNavigationMigration(poolControl.get('id')?.value) + '_' + option.value">
                               </app-radio-button>
-                              <label [for]="'stratumTLS_' + poolControl.get('id')?.value + '_' + option.value" class="ml-2 cursor-pointer">
+                              <label [for]="'stratumTLS_' + $safeNavigationMigration(poolControl.get('id')?.value) + '_' + option.value" class="ml-2 cursor-pointer">
                                 {{ option.label }}
                               </label>
                             </div>
@@ -295,11 +295,11 @@
                     <!-- Certificate File -->
                     @if (poolControl.get('stratumTLS')?.value === 2) {
                       <div class="flex flex-col md:flex-row md:items-start gap-2">
-                        <label [htmlFor]="'stratumCert_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium">Certificate</label>
+                        <label [htmlFor]="'stratumCert_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium">Certificate</label>
                         <div class="w-full md:w-10/12">
                           <div class="flex items-stretch">
                             <textarea
-                              [id]="'stratumCert_' + poolControl.get('id')?.value"
+                              [id]="'stratumCert_' + $safeNavigationMigration(poolControl.get('id')?.value)"
                               formControlName="stratumCert"
                               rows="6"
                               class="w-full p-2 text-sm font-mono bg-transparent text-main border border-surface rounded-l outline-none focus:border-primary"
@@ -330,14 +330,14 @@
                   <!-- Decode Coinbase Tx -->
                   @if (!isPoolV2Enabled(i) || isPoolV2Extended(i)) {
                     <div class="flex flex-col md:flex-row md:items-center gap-2">
-                      <label [htmlFor]="'stratumDecodeCoinbase_' + poolControl.get('id')?.value" class="w-full md:w-2/12 font-medium cursor-pointer select-none">
+                      <label [htmlFor]="'stratumDecodeCoinbase_' + $safeNavigationMigration(poolControl.get('id')?.value)" class="w-full md:w-2/12 font-medium cursor-pointer select-none">
                         <tooltip-text-icon
                           text="Decode Coinbase Tx"
                           tooltip="Enable decoding of the coinbase transaction to show payout addresses. Disable when mining on non-Bitcoin chains."
                         />
                       </label>
                       <div class="w-full md:w-10/12 flex items-center">
-                        <app-checkbox [name]="'stratumDecodeCoinbase_' + poolControl.get('id')?.value" [inputId]="'stratumDecodeCoinbase_' + poolControl.get('id')?.value" formControlName="stratumDecodeCoinbase"
+                        <app-checkbox [name]="'stratumDecodeCoinbase_' + $safeNavigationMigration(poolControl.get('id')?.value)" [inputId]="'stratumDecodeCoinbase_' + $safeNavigationMigration(poolControl.get('id')?.value)" formControlName="stratumDecodeCoinbase"
                           [binary]="true"></app-checkbox>
                       </div>
                     </div>

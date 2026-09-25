@@ -1,4 +1,4 @@
-import { Component, OnInit } from '@angular/core';
+import { Component, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { Observable } from 'rxjs';
 import { LiveDataService } from '../services/live-data.service';
 import { LayoutService } from './service/app.layout.service';
@@ -7,6 +7,7 @@ import { SystemInfo as ISystemInfo } from 'src/app/generated/models';
 @Component({
     selector: 'app-menu',
     templateUrl: './app.menu.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class AppMenuComponent implements OnInit {

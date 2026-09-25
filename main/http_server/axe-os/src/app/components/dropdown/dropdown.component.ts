@@ -1,4 +1,4 @@
-import { Component, ElementRef, EventEmitter, HostListener, Input, Output, forwardRef } from '@angular/core';
+import { Component, ElementRef, EventEmitter, HostListener, Input, Output, forwardRef, ChangeDetectionStrategy } from '@angular/core';
 import { ControlValueAccessor, NG_VALUE_ACCESSOR } from '@angular/forms';
 import { CommonModule } from '@angular/common';
 import { SelectOption } from '../../models/select-option.model';
@@ -53,6 +53,7 @@ import { SelectOption } from '../../models/select-option.model';
     }
   ],
   standalone: true,
+  changeDetection: ChangeDetectionStrategy.Eager,
   imports: [CommonModule]
 })
 export class DropdownComponent implements ControlValueAccessor {

@@ -14,8 +14,8 @@ RUN apt-get update \
   libpixman-1-dev \
   && rm -rf /var/lib/apt/lists/*
 
-# Node.js and npm (v20 is required)
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+# Node.js and npm (Angular 22 needs 22.22.3+ or 24.15+; CI uses 24)
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
   && apt-get install -y nodejs
 
 # Common environment setup

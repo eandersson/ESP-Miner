@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, ChangeDetectionStrategy } from '@angular/core';
 import { Observable, Subject, merge, switchMap, map, shareReplay, timer, takeUntil, finalize } from 'rxjs';
 import { SystemApiService } from 'src/app/services/system.service';
 import { LoadingService } from 'src/app/services/loading.service';
@@ -11,6 +11,7 @@ const SWARM_SORTING = 'SCOREBOARD_SORTING';
   selector: 'app-scoreboard',
   templateUrl: './scoreboard.component.html',
   styleUrls: ['./scoreboard.component.scss'],
+  changeDetection: ChangeDetectionStrategy.Eager,
   standalone: false
 })
 export class ScoreboardComponent implements OnInit, OnDestroy {

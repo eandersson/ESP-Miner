@@ -1,7 +1,7 @@
 import 'chartjs-adapter-moment';
 
 import { CommonModule, HashLocationStrategy, LocationStrategy } from '@angular/common';
-import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClient, withXhr } from '@angular/common/http';
 import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { BrowserModule } from '@angular/platform-browser';
@@ -106,7 +106,7 @@ const components = [
     { provide: ApiConfiguration, useValue: { rootUrl: '' } },
     Api,
     DialogService,
-    provideHttpClient()
+    provideHttpClient(withXhr())
   ],
   bootstrap: [AppComponent]
 })

@@ -1,4 +1,4 @@
-import { Component, ViewChild, ElementRef } from '@angular/core';
+import { Component, ViewChild, ElementRef, ChangeDetectionStrategy } from '@angular/core';
 import { Observable, map } from 'rxjs';
 import { HttpErrorResponse, HttpEventType } from '@angular/common/http';
 import { getHttpErrorMessage } from 'src/app/utils/error-handler';
@@ -16,6 +16,7 @@ const IGNORE_RELEASE_CHECK_WARNING = 'IGNORE_RELEASE_CHECK_WARNING';
     selector: 'app-update',
     templateUrl: './update.component.html',
     styleUrls: ['./update.component.scss'],
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class UpdateComponent {

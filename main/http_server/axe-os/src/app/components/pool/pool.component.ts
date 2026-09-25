@@ -1,6 +1,6 @@
 import { HttpErrorResponse } from '@angular/common/http';
 import { getHttpErrorMessage } from 'src/app/utils/error-handler';
-import { Component, Input, OnInit } from '@angular/core';
+import { Component, Input, OnInit, ChangeDetectionStrategy } from '@angular/core';
 import { FormBuilder, FormGroup, FormArray, Validators, ValidatorFn, ValidationErrors, AbstractControl } from '@angular/forms';
 import { ToastrService } from 'ngx-toastr';
 import { LoadingService } from 'src/app/services/loading.service';
@@ -31,6 +31,7 @@ interface IPoolDropdownOption {
 @Component({
     selector: 'app-pool',
     templateUrl: './pool.component.html',
+    changeDetection: ChangeDetectionStrategy.Eager,
     standalone: false
 })
 export class PoolComponent implements OnInit {
